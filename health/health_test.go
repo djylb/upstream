@@ -760,8 +760,11 @@ func TestTCP(t *testing.T) {
 		defer close(done)
 		for {
 			conn, err := ln.Accept()
-			if err != nil {
+			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			if err != nil {
+				continue // a connection reset before it was taken, as on Windows
 			}
 			// The check must send nothing: the first read sees the
 			// end of the stream (or a reset).
@@ -786,8 +789,17 @@ func TestTCP(t *testing.T) {
 		if obs.Addr != ln.Addr().String() || obs.Latency < 0 {
 			t.Fatalf("observation %+v", obs)
 		}
-		if n := <-received; n != 0 {
-			t.Fatalf("the check sent %d bytes", n)
+		select {
+		case n := <-received:
+			if n != 0 {
+				t.Fatalf("the check sent %d bytes", n)
+			}
+		case <-time.After(5 * time.Second):
+			// A connection reset at once may never reach Accept, as on
+			// Windows; one closed normally always does.
+			if !o.Reset {
+				t.Fatal("the listener never saw the check's connection")
+			}
 		}
 	}
 	addr := ln.Addr().String()
