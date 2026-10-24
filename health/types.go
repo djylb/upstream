@@ -221,7 +221,9 @@ type Result struct {
 
 	// Latency is the time the target took to answer; for the default TCP
 	// check, the time from starting the connection to the address that
-	// answered until it was established, excluding name resolution.
+	// answered until it was established, excluding name resolution. Its
+	// resolution is that of the platform's monotonic clock, which is coarse
+	// on Windows, so a local target may read as zero.
 	Latency time.Duration
 
 	// Reason classifies Err.

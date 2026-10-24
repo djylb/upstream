@@ -770,6 +770,10 @@ func TestTCP(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
+	defer func() {
+		_ = ln.Close()
+		<-done
+	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	target := Target{Address: ln.Addr().String()}
@@ -778,7 +782,8 @@ func TestTCP(t *testing.T) {
 		if err != nil {
 			t.Fatalf("check of a listening port (%+v): %v", o, err)
 		}
-		if obs.Addr != ln.Addr().String() || obs.Latency <= 0 {
+		// Zero is possible where the clock is coarse, as on Windows.
+		if obs.Addr != ln.Addr().String() || obs.Latency < 0 {
 			t.Fatalf("observation %+v", obs)
 		}
 		if n := <-received; n != 0 {
