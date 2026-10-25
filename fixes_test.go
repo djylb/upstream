@@ -35,7 +35,7 @@ func TestPickFallsBackWhenBalancerInsists(t *testing.T) {
 		clk := fakeclock.New()
 		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
 		defer p.Close()
-		if err := p.Update([]Target[string]{{ID: "heavy", Weight: 50}, {ID: "light"}}); err != nil {
+		if err := p.Sync([]Target[string]{{ID: "heavy", Weight: 50}, {ID: "light"}}); err != nil {
 			t.Fatal(err)
 		}
 		ejectToHalfOpen(t, p, clk, "heavy")
@@ -66,7 +66,7 @@ func TestPickFallsBackWhenBalancerInsists(t *testing.T) {
 func TestTrialsBelongToTheirPeriod(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
-		d := NewOutlierDetector(OutlierConfig{Clock: clk, ConsecutiveFailures: 1, BaseEjection: time.Second, HalfOpenRequests: 2, HalfOpenSuccesses: 2}, nil)
+		d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second, HalfOpenRequests: 2, HalfOpenSuccesses: 2}, clk, nil)
 		defer d.Close()
 		fail(t, d, 1)
 		clk.Advance(time.Second)
@@ -100,7 +100,7 @@ func TestTrialsBelongToTheirPeriod(t *testing.T) {
 func TestSubscriberPanicLeaksNothing(t *testing.T) {
 	p := New[string](Config{Outlier: OutlierConfig{ConsecutiveFailures: 1}})
 	defer p.Close()
-	if err := p.Update(targets("a", "b")); err != nil {
+	if err := p.Sync(targets("a", "b")); err != nil {
 		t.Fatal(err)
 	}
 	var log eventLog
@@ -191,9 +191,9 @@ func TestActiveHealthUnknown(t *testing.T) {
 func TestWindowNeverMovesBack(t *testing.T) {
 	var w window
 	size := 10 * time.Second
-	w.add(65*time.Second, size, true)
-	w.add(55*time.Second, size, true) // a late writer with an older time
-	total, failed := w.add(66*time.Second, size, false)
+	w.add(65*time.Second, size, windowTotal|windowPart)
+	w.add(55*time.Second, size, windowTotal|windowPart) // a late writer with an older time
+	total, failed := w.add(66*time.Second, size, windowTotal)
 	if total < 3 || failed < 2 {
 		t.Fatalf("window lost counts: %v requests, %v failures", total, failed)
 	}
@@ -208,7 +208,7 @@ func TestSlowStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
 		p := New[string](Config{Clock: clk, SlowStart: 16 * time.Second, Outlier: OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second}})
-		if err := p.Update(targets("a")); err != nil {
+		if err := p.Sync(targets("a")); err != nil {
 			t.Fatal(err)
 		}
 		advance := func(d time.Duration) {
@@ -262,7 +262,7 @@ func TestSlowStartToleratesLaterStart(t *testing.T) {
 	clk := fakeclock.New()
 	p := New[string](Config{Clock: clk, SlowStart: time.Minute})
 	defer p.Close()
-	if err := p.Update(targets("a", "b")); err != nil {
+	if err := p.Sync(targets("a", "b")); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := p.Backend("b")

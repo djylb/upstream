@@ -49,6 +49,8 @@ func ConsistentHash(cfg HashConfig) Balancer {
 
 type consistentHash struct{ cfg HashConfig }
 
+func (consistentHash) String() string { return "consistent-hash" }
+
 type ringPoint struct {
 	hash  uint64
 	owner int32

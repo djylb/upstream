@@ -35,9 +35,6 @@ var (
 // HalfOpenSuccesses successful trials restore it and reset the ejection
 // time; one failed trial ejects it again.
 type OutlierConfig struct {
-	// Clock is the time source. Nil means SystemClock.
-	Clock Clock
-
 	// Window is the span over which FailurePercent is measured. The
 	// default is 10s. The rate is a sliding estimate over the current and
 	// the previous window.
@@ -92,9 +89,9 @@ type outlierParams struct {
 	trialsOK int32
 }
 
-func newOutlierParams(c OutlierConfig) outlierParams {
+func newOutlierParams(c OutlierConfig, clock Clock) outlierParams {
 	p := outlierParams{
-		clock:    clockOrSystem(c.Clock),
+		clock:    clockOrSystem(clock),
 		window:   c.Window,
 		base:     c.BaseEjection,
 		max:      c.MaxEjection,
@@ -165,6 +162,9 @@ func (s OutlierState) String() string {
 	return "OutlierState(" + strconv.Itoa(int(s)) + ")"
 }
 
+// MarshalText encodes the state as its name.
+func (s OutlierState) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
+
 // OutlierStatus is a snapshot of an OutlierDetector.
 type OutlierStatus struct {
 	// EjectedUntil is when the current ejection ends; it is zero unless
@@ -188,8 +188,9 @@ type OutlierStatus struct {
 // A Ticket is the admission returned by OutlierDetector.Admit. Pass it back
 // to Record exactly once when the request ends.
 type Ticket struct {
-	gen   uint32
-	trial bool
+	gen      uint32
+	trial    bool
+	reported bool // used by Lease, which embeds the ticket of its pick
 }
 
 // An OutlierDetector tracks the passive health of one backend. Callers ask
@@ -217,17 +218,17 @@ type OutlierDetector struct {
 	closed bool        // guarded by mu
 }
 
-// NewOutlierDetector returns a detector for one backend. onChange, if not
-// nil, is called after every state transition, without any lock held, from
+// NewOutlierDetector returns a detector for one backend that reads time
+// from clock; nil means SystemClock. onChange, if not nil, is called after every state transition, without any lock held, from
 // the goroutine that caused the transition: one calling Record, Reset or
 // Close, or the detector's timer goroutine. Calls may overlap, so onChange
 // should read State instead of assuming an order.
 //
 // A detector whose configuration is not Enabled admits everything and never
 // ejects.
-func NewOutlierDetector(cfg OutlierConfig, onChange func()) *OutlierDetector {
+func NewOutlierDetector(cfg OutlierConfig, clock Clock, onChange func()) *OutlierDetector {
 	d := new(OutlierDetector)
-	d.init(newOutlierParams(cfg), onChange)
+	d.init(newOutlierParams(cfg, clock), onChange)
 	return d
 }
 
@@ -314,7 +315,7 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 			d.consec.Store(0)
 		}
 		if p.percent > 0 {
-			d.win.add(p.clock.Now().Sub(p.epoch), p.window, false)
+			d.win.add(p.clock.Now().Sub(p.epoch), p.window, windowTotal)
 		}
 	case Failure:
 		if OutlierState(d.state.Load()) != OutlierOK {
@@ -325,7 +326,7 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 			return
 		}
 		if p.percent > 0 {
-			total, failed := d.win.add(p.clock.Now().Sub(p.epoch), p.window, true)
+			total, failed := d.win.add(p.clock.Now().Sub(p.epoch), p.window, windowTotal|windowPart)
 			if total >= p.minReq && failed*100 >= p.percent*total {
 				d.eject(OutlierOK, 0, ErrFailureRate)
 			}
@@ -499,18 +500,38 @@ func (d *OutlierDetector) notify() {
 
 func (p *outlierParams) enabled() bool { return p.consec > 0 || p.percent > 0 }
 
-// window estimates request and failure counts over a sliding window from
-// two fixed buckets: the current one, and the previous one weighted by how
-// much of it still overlaps the sliding window. Each bucket packs the
-// request count in the high 32 bits and the failure count in the low 32
-// bits so one atomic add updates both.
+// window estimates two counts over a sliding window, a total (such as
+// requests) and a part of it or a second count (such as failures or
+// retries), from two fixed buckets: the current one, and the previous one
+// weighted by how much of it still overlaps the sliding window. Each bucket
+// packs the total in the high 32 bits and the part in the low 32 bits so
+// one atomic add updates both.
 type window struct {
 	idx  atomic.Int64
 	cur  atomic.Uint64
 	prev atomic.Uint64
 }
 
-func (w *window) add(now, size time.Duration, fail bool) (total, failed float64) {
+// Deltas for window.add.
+const (
+	windowTotal uint64 = 1 << 32
+	windowPart  uint64 = 1
+)
+
+// add adds delta, a sum of windowTotal and windowPart, to the bucket of
+// now and returns the estimates after it.
+func (w *window) add(now, size time.Duration, delta uint64) (total, part float64) {
+	w.rotate(now, size)
+	c := w.cur.Add(delta)
+	prev := w.prev.Load()
+	weight := 1 - float64(now%size)/float64(size)
+	total = float64(c>>32) + float64(prev>>32)*weight
+	part = float64(uint32(c)) + float64(uint32(prev))*weight
+	return total, part
+}
+
+// rotate moves the buckets on to the one of now.
+func (w *window) rotate(now, size time.Duration) {
 	i := int64(now / size)
 	if old := w.idx.Load(); i > old && w.idx.CompareAndSwap(old, i) {
 		c := w.cur.Swap(0)
@@ -520,16 +541,37 @@ func (w *window) add(now, size time.Duration, fail bool) (total, failed float64)
 			w.prev.Store(0)
 		}
 	}
-	delta := uint64(1) << 32
-	if fail {
-		delta |= 1
-	}
-	c := w.cur.Add(delta)
-	prev := w.prev.Load()
+}
+
+// addPartWithin adds one to the part if the estimate of the part then
+// stays within base plus ratio times the total, and reports whether it
+// did. The check and the add are one atomic step.
+func (w *window) addPartWithin(now, size time.Duration, base, ratio float64) bool {
+	w.rotate(now, size)
 	weight := 1 - float64(now%size)/float64(size)
-	total = float64(c>>32) + float64(prev>>32)*weight
-	failed = float64(uint32(c)) + float64(uint32(prev))*weight
-	return total, failed
+	for {
+		c := w.cur.Load()
+		prev := w.prev.Load()
+		total := float64(c>>32) + float64(prev>>32)*weight
+		part := float64(uint32(c)) + float64(uint32(prev))*weight
+		if part+1 > base+ratio*total {
+			return false
+		}
+		if w.cur.CompareAndSwap(c, c+windowPart) {
+			return true
+		}
+	}
+}
+
+// removePart takes back one from the part of the current bucket, if it
+// has any.
+func (w *window) removePart() {
+	for {
+		c := w.cur.Load()
+		if uint32(c) == 0 || w.cur.CompareAndSwap(c, c-windowPart) {
+			return
+		}
+	}
 }
 
 func (w *window) reset() {

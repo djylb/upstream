@@ -5,15 +5,19 @@
   (`GOOS=js GOARCH=wasm go test ./...` with `$(go env GOROOT)/lib/wasm` on
   `PATH`) must pass.
 - Standard library only, also for tests. The root package imports neither
-  net nor net/http; register every new package in `deps_test.go`.
+  net nor net/http, and `upnet` not net/http; register every new package in
+  `deps_test.go`.
 - Picks are lock-free and allocation-free: membership and health changes
   publish a new immutable view atomically.
 - Callbacks (subscribers, `OnResult`, `OnChange`, `OnRemove`, balancer hooks,
-  probes) never run under a lock, and every method is safe to call from
-  them. `Close` never blocks; callers wait on `Done`.
-- After `Remove`, `RemoveGroup` or `SyncGroup` returns, no callback for a
-  removed target starts. Reports carry the target's `Generation`.
-- A lease is released once; in-flight counts never leak.
+  probes, target functions of `Watch` and `Attach`) never run under a lock,
+  and every method is safe to call from them. `Close` never blocks; callers
+  wait on `Done`.
+- After `Remove`, `RemoveFromGroup`, `RemoveGroup` or `SyncGroup` returns, no
+  callback for a removed target starts. Reports carry the target's
+  `Generation`. A checker that stops driving a pool resets the health it set.
+- A lease is released once and reports one outcome; in-flight counts never
+  leak. Retries never return a backend the request already tried.
 - The default health check only connects over TCP and closes again: it
   sends no bytes. Never invent probes for protocols without a generic check,
   such as UDP; such targets stay unknown.

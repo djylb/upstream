@@ -1,11 +1,13 @@
 package upstream
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,19 +64,40 @@ const (
 	FallbackAll
 )
 
+// String returns the name of the fallback, as ParseFallback accepts it.
+func (f Fallback) String() string {
+	switch f {
+	case FallbackNone:
+		return "none"
+	case FallbackAll:
+		return "all"
+	}
+	return "Fallback(" + strconv.Itoa(int(f)) + ")"
+}
+
+// MarshalText encodes the fallback as its name.
+func (f Fallback) MarshalText() ([]byte, error) { return []byte(f.String()), nil }
+
+// ParseFallback returns the Fallback named s: "none" or "all".
+func ParseFallback(s string) (Fallback, error) { return parseName(s, FallbackAll+1, "fallback") }
+
 // Config configures a Pool. The zero value is a pool with smooth weighted
-// round-robin, no passive health checking, no slow start and FallbackNone.
+// round-robin, no passive health checking, no slow start, no retries and
+// FallbackNone.
 type Config struct {
 	// Balancer chooses backends. Nil means WeightedRoundRobin.
 	Balancer Balancer
 
-	// Clock is the time source. Nil means SystemClock. Outlier.Clock, if
-	// set, takes precedence for passive health checking.
+	// Clock is the time source. Nil means SystemClock.
 	Clock Clock
 
 	// Outlier configures passive health checking, which is disabled by
 	// default.
 	Outlier OutlierConfig
+
+	// Retry configures how Do, DoKey and Attempts retry on other
+	// backends. There are no retries by default.
+	Retry RetryConfig
 
 	// SlowStart, if positive, ramps up the traffic of a backend that joins
 	// the pool or becomes healthy again: its weight grows linearly from a
@@ -115,6 +138,8 @@ type Pool[T any] struct {
 	balancer  Balancer
 	clock     Clock
 	outlier   outlierParams
+	retry     retryParams
+	budget    window // retry budget: first attempts and retries
 	slowStart time.Duration
 	isClosed  atomic.Bool
 	rampArmed atomic.Bool
@@ -165,10 +190,8 @@ func New[T any](cfg Config) *Pool[T] {
 	if p.balancer == nil {
 		p.balancer = WeightedRoundRobin()
 	}
-	if cfg.Outlier.Clock == nil {
-		cfg.Outlier.Clock = p.clock
-	}
-	p.outlier = newOutlierParams(cfg.Outlier)
+	p.outlier = newOutlierParams(cfg.Outlier, p.clock)
+	p.retry = newRetryParams(cfg.Retry, p.clock)
 	p.view.Store(&view[T]{err: ErrNoBackends})
 	return p
 }
@@ -197,13 +220,13 @@ func (p *Pool[T]) newBackend(t Target[T], c *core) *Backend[T] {
 	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), value: t.Value}
 }
 
-// Update replaces the pool's membership with targets, in order. Members
+// Sync replaces the pool's membership with targets, in order. Members
 // whose ID is in targets keep their health state and counters and take
 // the new weight and value; new IDs join as healthy; members missing from
 // targets are removed gracefully: they take no new picks while their
-// leases finish. Update emits EventRemoved, then EventAdded or
+// leases finish. Sync emits EventRemoved, then EventAdded or
 // EventUpdated for each target in order. On error nothing changes.
-func (p *Pool[T]) Update(targets []Target[T]) error {
+func (p *Pool[T]) Sync(targets []Target[T]) error {
 	seen := make(map[string]struct{}, len(targets))
 	for _, t := range targets {
 		if err := validate(t); err != nil {
@@ -519,8 +542,14 @@ func (p *Pool[T]) Pick() (Lease[T], error) { return p.PickHash(rand.Uint64()) }
 
 // PickKey leases a backend chosen for key, such as a client address or a
 // session ID. With ConsistentHash the same key keeps mapping to the same
-// backend while it is eligible; other balancers ignore the key.
-func (p *Pool[T]) PickKey(key string) (Lease[T], error) { return p.PickHash(hashString(key)) }
+// backend while it is eligible; other balancers ignore the key. An empty
+// key carries no affinity: PickKey("") is Pick.
+func (p *Pool[T]) PickKey(key string) (Lease[T], error) {
+	if key == "" {
+		return p.PickHash(rand.Uint64())
+	}
+	return p.PickHash(hashString(key))
+}
 
 // PickHash is like PickKey for callers that hash keys themselves.
 func (p *Pool[T]) PickHash(hash uint64) (Lease[T], error) {
@@ -529,14 +558,14 @@ func (p *Pool[T]) PickHash(hash uint64) (Lease[T], error) {
 	if n == 0 {
 		return Lease[T]{}, v.err
 	}
+	// pickFrom without tried, written out: a call to it here costs every
+	// pick a larger frame.
 	for attempt := range n {
 		b := v.members[v.picker.Pick(hash, attempt)]
 		if t, ok := b.core.acquire(v.ignoreHealth); ok {
 			return Lease[T]{b: b, t: t}, nil
 		}
 	}
-	// The balancer kept choosing backends that could not take the request,
-	// such as a half-open one out of trial slots: try every member once.
 	start := int(hash % uint64(n))
 	for k := range n {
 		b := v.members[(start+k)%n]
@@ -547,24 +576,83 @@ func (p *Pool[T]) PickHash(hash uint64) (Lease[T], error) {
 	return Lease[T]{}, ErrUnavailable
 }
 
-// Do picks a backend, calls fn with it and releases the lease with
-// OutcomeOf of fn's error, also when fn panics, in which case the outcome
-// is Failure and the panic continues. It returns Pick's error or fn's.
-func (p *Pool[T]) Do(fn func(*Backend[T]) error) error {
-	l, err := p.Pick()
-	if err != nil {
-		return err
+func keyHash(key string) uint64 {
+	if key == "" {
+		return rand.Uint64()
 	}
-	return l.run(fn)
+	return hashString(key)
 }
 
-// DoKey is like Do with PickKey.
-func (p *Pool[T]) DoKey(key string, fn func(*Backend[T]) error) error {
-	l, err := p.PickKey(key)
-	if err != nil {
-		return err
+// pickFrom leases a member of v that is not in tried, which may be nil.
+// The view has members.
+func pickFrom[T any](v *view[T], hash uint64, tried *Attempts[T]) (Lease[T], bool) {
+	n := len(v.members)
+	for attempt := range n {
+		b := v.members[v.picker.Pick(hash, attempt)]
+		if tried != nil && tried.has(b.core) {
+			continue
+		}
+		if t, ok := b.core.acquire(v.ignoreHealth); ok {
+			return Lease[T]{b: b, t: t}, true
+		}
 	}
-	return l.run(fn)
+	return scanFrom(v, hash, tried)
+}
+
+// scanFrom tries every member of v not in tried once, for when the
+// balancer kept choosing backends that could not take the request, such
+// as a half-open one out of trial slots or ones already tried.
+func scanFrom[T any](v *view[T], hash uint64, tried *Attempts[T]) (Lease[T], bool) {
+	n := len(v.members)
+	start := int(hash % uint64(n))
+	for k := range n {
+		b := v.members[(start+k)%n]
+		if tried != nil && tried.has(b.core) {
+			continue
+		}
+		if t, ok := b.core.acquire(v.ignoreHealth); ok {
+			return Lease[T]{b: b, t: t}, true
+		}
+	}
+	return Lease[T]{}, false
+}
+
+// Do picks a backend, calls fn with it and releases the lease with
+// OutcomeOf of fn's error, also when fn panics, in which case the outcome
+// is Failure and the panic continues. When the outcome is Failure and ctx
+// is not done, Do retries on another backend as Config.Retry allows. It
+// returns nil once fn succeeds, fn's last error if fn failed, and
+// otherwise ctx's or the first pick's error.
+func (p *Pool[T]) Do(ctx context.Context, fn func(*Backend[T]) error) error {
+	return p.do(ctx, p.Attempts(""), fn)
+}
+
+// DoKey is like Do with backends picked for key, as with PickKey.
+func (p *Pool[T]) DoKey(ctx context.Context, key string, fn func(*Backend[T]) error) error {
+	return p.do(ctx, p.Attempts(key), fn)
+}
+
+func (p *Pool[T]) do(ctx context.Context, a Attempts[T], fn func(*Backend[T]) error) error {
+	var last error
+	for {
+		if err := ctx.Err(); err != nil {
+			if last != nil {
+				return last
+			}
+			return err
+		}
+		l, err := a.Next()
+		if err != nil {
+			if last != nil {
+				return last
+			}
+			return err
+		}
+		if err = l.run(fn); err == nil || OutcomeOf(err) != Failure {
+			return err
+		}
+		last = err
+	}
 }
 
 // Backend returns the member with the given ID.
@@ -589,6 +677,20 @@ func (p *Pool[T]) Len() int {
 	return len(p.order)
 }
 
+// Available returns the number of members that are eligible for new
+// picks now, as the routing view sees them. It is zero while the pool is
+// empty or closed, and while no member is eligible: then Pick fails with
+// ErrUnavailable, or, under FallbackAll, still succeeds in panic mode,
+// picking among members that are not eligible. A readiness check that
+// should fail in panic mode tests Available() > 0.
+func (p *Pool[T]) Available() int {
+	v := p.view.Load()
+	if v.ignoreHealth {
+		return 0
+	}
+	return len(v.members)
+}
+
 // Status returns a snapshot of every member, in order.
 func (p *Pool[T]) Status() []Status {
 	bs := p.Backends()
@@ -599,10 +701,11 @@ func (p *Pool[T]) Status() []Status {
 	return s
 }
 
-// Closed returns a channel that is closed when Close is called, so that
+// Done returns a channel that is closed when Close is called. The pool
+// starts no goroutines, so nothing of it runs user code after that, and
 // helpers attached to the pool, such as a health checker started with
-// health.Watch, can stop with it.
-func (p *Pool[T]) Closed() <-chan struct{} { return p.closedCh }
+// health.Watch, stop with it.
+func (p *Pool[T]) Done() <-chan struct{} { return p.closedCh }
 
 // Close stops the passive health and slow-start timers and ends all
 // subscriptions: no subscriber call starts once Close has begun, and one

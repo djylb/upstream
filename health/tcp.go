@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -9,16 +10,13 @@ import (
 	"time"
 )
 
-// A DialFunc opens a connection, like net.Dialer.DialContext.
-type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
-
 // TCPOptions configure the TCP check.
 type TCPOptions struct {
 	// Dial replaces the default dialer, for example to use a custom
 	// resolver, bind a source address or reach targets through a tunnel.
 	// With a custom Dial, Latency covers the whole call, name resolution
-	// included.
-	Dial DialFunc
+	// included. (*net.Dialer).DialContext has this type.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
 
 	// Reset closes each check connection with a reset instead of the
 	// normal close. A normal close lets the target see a clean end of
@@ -51,6 +49,9 @@ func TCP(o TCPOptions) Probe {
 		case o.Dial != nil:
 			conn, err = o.Dial(ctx, network, t.Address)
 			obs.Latency = time.Since(begin)
+			if err == nil && conn == nil {
+				err = errNoConn
+			}
 		case !controlHooks:
 			conn, err = new(net.Dialer).DialContext(ctx, network, t.Address)
 			obs.Latency = time.Since(begin)
@@ -70,7 +71,7 @@ func TCP(o TCPOptions) Probe {
 			start := begin
 			if err == nil {
 				mu.Lock()
-				if s, ok := starts[conn.RemoteAddr().String()]; ok {
+				if s, ok := starts[addrString(conn.RemoteAddr())]; ok {
 					start = s
 				}
 				mu.Unlock()
@@ -80,13 +81,25 @@ func TCP(o TCPOptions) Probe {
 		if err != nil {
 			return obs, err
 		}
-		obs.Addr = conn.RemoteAddr().String()
+		obs.Addr = addrString(conn.RemoteAddr())
 		if tc, ok := conn.(*net.TCPConn); ok && o.Reset {
 			_ = tc.SetLinger(0)
 		}
 		_ = conn.Close() // the target was reachable; a close error changes nothing
 		return obs, nil
 	}
+}
+
+// errNoConn is the error of a TCP check whose Dial returned neither a
+// connection nor an error.
+var errNoConn = errors.New("health: dial returned no connection")
+
+// addrString formats a, which may be nil for a connection of a custom Dial.
+func addrString(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
 }
 
 // controlHooks reports whether dialers call their Control hooks; the

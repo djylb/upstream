@@ -16,7 +16,7 @@ var errnoCases = []struct {
 	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNRESET)}, ReasonReset},
 	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EHOSTUNREACH)}, ReasonUnreachable},
 	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)}, ReasonTimeout},
-	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", errHostDown)}, ReasonUnreachable},
+	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.Errno(errHostDown))}, ReasonUnreachable},
 	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ENETDOWN)}, ReasonUnreachable},
 	{&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EADDRNOTAVAIL)}, ReasonUnreachable},
 }

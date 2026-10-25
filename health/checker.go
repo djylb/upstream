@@ -13,11 +13,11 @@ import (
 // A Checker checks targets held under keys of type K, which may belong to
 // groups of type G.
 //
-// Ownership: a key is held by a direct Set and by every group it was added
+// Ownership: a key is held by a direct Put and by every group it was added
 // to. It is checked once however many owners it has, and it leaves the
 // Checker when Remove is called or when its last owner lets go of it. Two
 // owners that give different Targets for one key share one target: the
-// latest Set, Add or SyncGroup wins. Removing a key cancels its check in
+// latest Put, AddToGroup or SyncGroup wins. Removing a key cancels its check in
 // progress and discards that check's result, stops its timer, releases its
 // concurrency slot and forgets its state; adding the key again starts a
 // new generation.
@@ -50,8 +50,7 @@ type Checker[K, G comparable] struct {
 	mu      sync.Mutex
 	cfg     Config[K]            // guarded by mu; Options not defaulted
 	tcp     Probe                // the default check for cfg; guarded by mu
-	sink    func(Report[K])      // Watch's reporter; set before any target
-	detach  func()               // ends Watch's subscription; guarded by mu
+	sinks   []*sink[K]           // reporters of Attach; copy on write, guarded by mu
 	entries map[K]*entry[K, G]   // guarded by mu
 	groups  map[G]map[K]struct{} // guarded by mu
 	queue   []*delivery[K, G]    // callbacks to run, in order; guarded by mu
@@ -82,7 +81,14 @@ type entry[K, G comparable] struct {
 	health     upstream.Health
 	direct     bool
 	running    bool // a check is in progress
+	now        bool // CheckNow asked for the next check at once
 	gone       bool
+}
+
+// A sink receives every report after the Config's callbacks, on the
+// dispatching goroutine. Attach registers one per attached pool.
+type sink[K comparable] struct {
+	fn func(Report[K])
 }
 
 // A delivery is a queued callback: a report, or the removal of e.
@@ -90,6 +96,7 @@ type delivery[K, G comparable] struct {
 	rep     Report[K]
 	e       *entry[K, G]
 	removed bool
+	replay  bool // the entry's current state, for the sinks only
 }
 
 // New returns a Checker that runs until ctx is done or Close is called.
@@ -209,13 +216,13 @@ func (c *Checker[K, G]) enqueueLocked(d *delivery[K, G]) {
 	if c.closed {
 		return
 	}
-	if !d.removed {
-		if !d.rep.Changed && d.e.queued != nil {
+	if !d.removed && !d.replay {
+		if !d.rep.Changed() && d.e.queued != nil {
 			d.e.queued.rep = d.rep
 			return
 		}
 		d.e.queued = nil
-		if !d.rep.Changed {
+		if !d.rep.Changed() {
 			d.e.queued = d
 		}
 	}
@@ -252,7 +259,10 @@ func (c *Checker[K, G]) dispatch() {
 		}
 		run := d.removed || !d.e.gone
 		rep := d.rep
-		onResult, onChange, onRemove, sink := c.cfg.OnResult, c.cfg.OnChange, c.cfg.OnRemove, c.sink
+		if d.replay {
+			rep = c.currentLocked(d.e)
+		}
+		onResult, onChange, onRemove, sinks := c.cfg.OnResult, c.cfg.OnChange, c.cfg.OnRemove, c.sinks
 		c.mu.Unlock()
 		if !run {
 			continue
@@ -266,22 +276,36 @@ func (c *Checker[K, G]) dispatch() {
 			}
 			continue
 		}
-		// Watch's sink comes last: it reports to a pool, which may deliver
+		if d.replay {
+			for _, s := range sinks {
+				s.fn(rep)
+			}
+			continue
+		}
+		// The sinks come last: they report to pools, which may deliver
 		// pool events that remove the key.
 		if onResult != nil {
 			onResult(rep)
 		}
-		if rep.Changed && onChange != nil {
+		if rep.Changed() && onChange != nil {
 			onChange(rep)
 		}
-		if sink != nil {
-			sink(rep)
+		for _, s := range sinks {
+			s.fn(rep)
 		}
 	}
 }
 
+// currentLocked returns a report of e's current state that changes
+// nothing.
+func (c *Checker[K, G]) currentLocked(e *entry[K, G]) Report[K] {
+	r := e.last
+	r.Health, r.Previous = e.health, e.health
+	return Report[K]{Result: r, Stats: e.lat.stats(), Target: e.target, Key: e.key, Generation: e.generation}
+}
+
 func (c *Checker[K, G]) reportLocked(e *entry[K, G], r Result) {
-	c.enqueueLocked(&delivery[K, G]{rep: Report[K]{Result: r, Target: e.target, Key: e.key, Generation: e.generation}, e: e})
+	c.enqueueLocked(&delivery[K, G]{rep: Report[K]{Result: r, Stats: e.lat.stats(), Target: e.target, Key: e.key, Generation: e.generation}, e: e})
 }
 
 func (c *Checker[K, G]) newEntryLocked(key K, groups map[G]struct{}) *entry[K, G] {
@@ -304,7 +328,7 @@ func (c *Checker[K, G]) putLocked(key K, t Target, w *work[K, G]) *entry[K, G] {
 		e.direct = old.direct
 		e.target = t
 		if old.health != upstream.HealthUnknown {
-			c.reportLocked(e, Result{Health: upstream.HealthUnknown, Changed: true}) // timed by the dispatcher
+			c.reportLocked(e, Result{Health: upstream.HealthUnknown, Previous: old.health}) // timed by the dispatcher
 		}
 	}
 	if e == nil {
@@ -355,10 +379,10 @@ func (c *Checker[K, G]) releaseLocked(g G, e *entry[K, G], w *work[K, G]) {
 	}
 }
 
-// Set adds a target under key, or updates the target held under key, and
+// Put adds a target under key, or updates the target held under key, and
 // holds it directly: it stays until Remove, whatever its groups do. It
 // returns the target's generation, or 0 if the Checker is closed.
-func (c *Checker[K, G]) Set(key K, t Target) uint64 {
+func (c *Checker[K, G]) Put(key K, t Target) uint64 {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -373,10 +397,10 @@ func (c *Checker[K, G]) Set(key K, t Target) uint64 {
 	return gen
 }
 
-// Add adds a target under key to group g, or updates the target held
-// under key. It returns the target's generation, or 0 if the Checker is
-// closed.
-func (c *Checker[K, G]) Add(g G, key K, t Target) uint64 {
+// AddToGroup adds a target under key to group g, or updates the target
+// held under key. It returns the target's generation, or 0 if the Checker
+// is closed.
+func (c *Checker[K, G]) AddToGroup(g G, key K, t Target) uint64 {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -440,9 +464,65 @@ func (c *Checker[K, G]) Remove(key K) bool {
 	return true
 }
 
-// RemoveFrom drops group g's hold on key, removing key if nothing else
-// holds it. It reports false if key is not in g.
-func (c *Checker[K, G]) RemoveFrom(g G, key K) bool {
+// CheckNow starts a check of the target held under key at once instead of
+// at its scheduled time, for example after real traffic to it failed. It
+// does nothing if a check of the target is already running, and reports
+// false if there is no such key or the target is not checked.
+func (c *Checker[K, G]) CheckNow(key K) bool {
+	c.mu.Lock()
+	e := c.entries[key]
+	if c.closed || e == nil || !c.checkableLocked(e) {
+		c.mu.Unlock()
+		return false
+	}
+	if e.running {
+		c.mu.Unlock()
+		return true
+	}
+	e.now = true
+	c.mu.Unlock()
+	c.schedule(e)
+	return true
+}
+
+// addSink registers s unless the Checker is closed, and then also
+// announces a goroutine that will call enter.
+func (c *Checker[K, G]) addSink(s *sink[K]) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	c.sinks = append(slices.Clone(c.sinks), s)
+	c.pending++
+	return true
+}
+
+// replay passes the current state of key to the sinks, in order with the
+// reports: a pool member that joins a key, such as one of a pool attached
+// after the key's first check, learns its verdict now rather than at the
+// next check.
+func (c *Checker[K, G]) replay(key K) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e := c.entries[key]; e != nil {
+		c.enqueueLocked(&delivery[K, G]{e: e, replay: true})
+	}
+}
+
+func (c *Checker[K, G]) removeSink(s *sink[K]) {
+	c.mu.Lock()
+	if i := slices.Index(c.sinks, s); i >= 0 {
+		sinks := make([]*sink[K], 0, len(c.sinks)-1)
+		sinks = append(sinks, c.sinks[:i]...)
+		c.sinks = append(sinks, c.sinks[i+1:]...)
+	}
+	c.mu.Unlock()
+}
+
+// RemoveFromGroup drops group g's hold on key, removing key if nothing
+// else holds it. It reports false if key is not in g.
+func (c *Checker[K, G]) RemoveFromGroup(g G, key K) bool {
 	c.mu.Lock()
 	e := c.entries[key]
 	if _, in := c.groups[g][key]; !in || e == nil {
@@ -471,8 +551,8 @@ func (c *Checker[K, G]) RemoveGroup(g G) int {
 	return n
 }
 
-// Keys returns the keys of group g, in no particular order.
-func (c *Checker[K, G]) Keys(g G) []K {
+// GroupKeys returns the keys of group g, in no particular order.
+func (c *Checker[K, G]) GroupKeys(g G) []K {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	keys := make([]K, 0, len(c.groups[g]))
@@ -541,7 +621,7 @@ func (c *Checker[K, G]) Statuses() []Status[K] {
 func (c *Checker[K, G]) statusLocked(e *entry[K, G]) Status[K] {
 	return Status[K]{
 		Last:       e.last,
-		Latency:    e.lat.stats(),
+		Stats:      e.lat.stats(),
 		Target:     e.target,
 		Key:        e.key,
 		Generation: e.generation,
@@ -595,18 +675,14 @@ func (c *Checker[K, G]) shutdown() {
 	}
 	clear(c.groups)
 	c.queue = nil
-	detach := c.detach
-	c.detach = nil
+	c.sinks = nil
 	c.mu.Unlock()
 	select {
 	case c.notify <- struct{}{}:
 	default:
 	}
-	c.cancel()
+	c.cancel() // also ends the attachments of Attach
 	c.finish(&w)
-	if detach != nil {
-		detach()
-	}
 	c.mu.Lock()
 	c.endLocked()
 	c.mu.Unlock()
@@ -661,8 +737,9 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 	timer := e.timer
 	if !c.checkableLocked(e) {
 		if e.health != upstream.HealthUnknown {
+			prev := e.health
 			e.health, e.ok, e.fail = upstream.HealthUnknown, 0, 0
-			c.reportLocked(e, Result{Time: now, Health: upstream.HealthUnknown, Changed: true})
+			c.reportLocked(e, Result{Time: now, Health: upstream.HealthUnknown, Previous: prev})
 		}
 		c.mu.Unlock()
 		if old != nil && old() {
@@ -692,7 +769,7 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 }
 
 func (c *Checker[K, G]) delayLocked(e *entry[K, G], now time.Time) time.Duration {
-	if e.lastEnd.IsZero() {
+	if e.lastEnd.IsZero() || e.now {
 		return 0
 	}
 	o := c.optionsLocked(e)
@@ -716,6 +793,7 @@ func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 	}
 	e.stop = nil
 	e.running = true
+	e.now = false
 	t := e.target
 	o := c.optionsLocked(e)
 	probe := c.probeLocked(t)
@@ -737,10 +815,11 @@ func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 		} else {
 			e.lat.add(r.Latency, c.window)
 		}
-		r.Health, r.Changed = e.observe(r.Err == nil, o.Rise, o.Fall)
+		r.Previous = e.health
+		r.Health = e.observe(r.Err == nil, o.Rise, o.Fall)
 		e.last = r
 		e.lastEnd = end
-		c.enqueueLocked(&delivery[K, G]{rep: Report[K]{Result: r, Target: t, Key: e.key, Generation: e.generation}, e: e})
+		c.enqueueLocked(&delivery[K, G]{rep: Report[K]{Result: r, Stats: e.lat.stats(), Target: t, Key: e.key, Generation: e.generation}, e: e})
 	}
 	c.mu.Unlock()
 	c.schedule(e)
@@ -770,23 +849,21 @@ func (c *Checker[K, G]) check(ctx context.Context, probe Probe, t Target, o Opti
 // observe applies one result to the rise and fall counters. Health changes
 // only when a run of results reaches its threshold while the target is in
 // the opposite state, so a long run of failures changes it once.
-func (e *entry[K, G]) observe(pass bool, rise, fall int) (h upstream.Health, changed bool) {
+func (e *entry[K, G]) observe(pass bool, rise, fall int) upstream.Health {
 	if pass {
 		e.fail = 0
 		e.ok++
 		if e.health == upstream.HealthUnknown || (e.health == upstream.HealthDown && e.ok >= rise) {
-			changed = e.health != upstream.HealthUp
 			e.health = upstream.HealthUp
 		}
 	} else {
 		e.ok = 0
 		e.fail++
 		if e.health == upstream.HealthUnknown || (e.health == upstream.HealthUp && e.fail >= fall) {
-			changed = e.health != upstream.HealthDown
 			e.health = upstream.HealthDown
 		}
 	}
-	return e.health, changed
+	return e.health
 }
 
 // latencyWindow keeps the latency statistics of one target.
@@ -813,11 +890,11 @@ func (w *latencyWindow) add(d time.Duration, size int) {
 	}
 }
 
-func (w *latencyWindow) stats() Latency {
+func (w *latencyWindow) stats() LatencyStats {
 	if len(w.ring) == 0 {
-		return Latency{}
+		return LatencyStats{}
 	}
-	return Latency{
+	return LatencyStats{
 		Last:    w.last,
 		Average: w.average,
 		Min:     slices.Min(w.ring),

@@ -60,11 +60,58 @@ func Example() {
 func ExampleWatch() {
 	pool := upstream.New[string](upstream.Config{Balancer: upstream.LeastConn()})
 	defer pool.Close()
-	_ = pool.Update([]upstream.Target[string]{{ID: "db-1", Value: "10.0.0.1:5432"}, {ID: "db-2", Value: "10.0.0.2:5432"}})
+	_ = pool.Sync([]upstream.Target[string]{{ID: "db-1", Value: "192.0.2.11:5432"}, {ID: "db-2", Value: "192.0.2.12:5432"}})
 
-	// Balance locally across the targets that pass a TCP check.
-	checker := health.Watch(context.Background(), pool,
-		func(b *upstream.Backend[string]) health.Target { return health.Target{Address: b.Value()} },
+	// Balance locally across the members that pass a TCP check of their
+	// value; the watcher closes with the pool.
+	watcher, err := health.Watch(context.Background(), pool, nil,
 		health.Config[string]{Options: health.Options{Interval: 5 * time.Second, Rise: 2, Fall: 2}})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer watcher.Close()
+}
+
+// A tunnel client keeps one pool per tunnel to balance new connections
+// over the tunnel's healthy targets, and one checker for all of them, so
+// that a target that several tunnels use is checked once.
+func ExampleAttach() {
+	checker := health.New[string, int](context.Background(), health.Config[string]{
+		Options: health.Options{Interval: 10 * time.Second, Timeout: 3 * time.Second},
+		OnChange: func(r health.Report[string]) {
+			// Report reachability upstream: r.Key, r.Previous -> r.Health,
+			// r.Reason, r.Stats.Average.
+		},
+	})
 	defer checker.Close()
+
+	tunnels := map[int]*upstream.Pool[string]{}
+	push := func(tunnel int, addrs []string) { // a configuration push
+		pool := tunnels[tunnel]
+		if pool == nil {
+			pool = upstream.New[string](upstream.Config{Retry: upstream.RetryConfig{Attempts: 3}})
+			tunnels[tunnel] = pool
+			// TCP check of each address; nil needs a pool of strings.
+			if _, err := health.Attach(checker, tunnel, pool, nil); err != nil {
+				panic(err)
+			}
+		}
+		ts := make([]upstream.Target[string], len(addrs))
+		for i, a := range addrs {
+			ts[i] = upstream.Target[string]{ID: a, Value: a}
+		}
+		_ = pool.Sync(ts)
+	}
+	push(7, []string{"192.0.2.5:22", "192.0.2.6:22"})
+	push(8, []string{"192.0.2.6:22"})
+	fmt.Println(checker.Len())
+
+	// Deleting a tunnel: closing its pool ends its checks.
+	tunnels[7].Close()
+	delete(tunnels, 7)
+	for _, p := range tunnels {
+		p.Close()
+	}
+	// Output: 2
 }

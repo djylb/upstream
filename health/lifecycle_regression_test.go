@@ -28,8 +28,8 @@ func TestConcurrentCloseFromTwoProbes(t *testing.T) {
 		return Observation{}, nil
 	}
 	c = New[string, string](context.Background(), Config[string]{Concurrency: 4})
-	c.Set("a", Target{Probe: probe, Address: "a"})
-	c.Set("b", Target{Probe: probe, Address: "b"})
+	c.Put("a", Target{Probe: probe, Address: "a"})
+	c.Put("b", Target{Probe: probe, Address: "b"})
 	for range 2 {
 		select {
 		case <-done:
@@ -70,8 +70,8 @@ func TestCloseFromCallbackAndProbe(t *testing.T) {
 			done <- struct{}{}
 		}
 	}})
-	c.Set("slow", Target{Probe: probe, Address: "slow"})
-	c.Set("fast", Target{Probe: probe, Address: "fast"})
+	c.Put("slow", Target{Probe: probe, Address: "slow"})
+	c.Put("fast", Target{Probe: probe, Address: "fast"})
 	for range 2 {
 		select {
 		case <-done:
@@ -88,7 +88,7 @@ func TestCloseFromCallbackAndProbe(t *testing.T) {
 func TestPerTargetIntervalDefaults(t *testing.T) {
 	c := New[string, string](context.Background(), Config[string]{Options: Options{Interval: 10 * time.Second, Disabled: true}})
 	defer c.Close()
-	c.Set("a", Target{Address: "x:1", Options: Options{Interval: time.Second}})
+	c.Put("a", Target{Address: "x:1", Options: Options{Interval: time.Second}})
 	c.mu.Lock()
 	o := c.optionsLocked(c.entries["a"])
 	c.mu.Unlock()
@@ -111,7 +111,7 @@ func TestDoneAndWait(t *testing.T) {
 			return Observation{}, nil
 		}
 		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New()})
-		c.Set("a", Target{Probe: probe})
+		c.Put("a", Target{Probe: probe})
 		synctest.Wait()
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
@@ -151,7 +151,7 @@ func TestConcurrentCloseEverywhere(t *testing.T) {
 		}
 		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: func(Report[string]) { c.Close() }})
 		for _, k := range []string{"a", "b", "c", "d"} {
-			c.Set(k, Target{Probe: probe})
+			c.Put(k, Target{Probe: probe})
 		}
 		var wg sync.WaitGroup
 		for range 3 {
@@ -165,18 +165,18 @@ func TestConcurrentCloseEverywhere(t *testing.T) {
 func TestWatchEndsWithPool(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := upstream.New[string](upstream.Config{})
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "a"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "a"}}); err != nil {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
 		clk := fakeclock.New()
-		c := Watch(t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: clk})
 		synctest.Wait()
 		p.Close()
 		<-c.Done()
-		if c.Len() != 0 || clk.Pending() != 0 {
-			t.Fatalf("checker of a closed pool: %d targets, %d timers", c.Len(), clk.Pending())
+		if len(c.Statuses()) != 0 || clk.Pending() != 0 {
+			t.Fatalf("checker of a closed pool: %d targets, %d timers", len(c.Statuses()), clk.Pending())
 		}
 	})
 }
@@ -185,11 +185,11 @@ func TestWatchMatchesGenerations(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := upstream.New[string](upstream.Config{})
 		defer p.Close()
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "x"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "x"}}); err != nil {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
-		c := Watch(t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: fakeclock.New()})
 		defer c.Close()
 		synctest.Wait()
@@ -204,10 +204,10 @@ func TestWatchMatchesGenerations(t *testing.T) {
 		if cur.Generation == old.Generation {
 			t.Fatal("re-added member kept its generation")
 		}
-		c.mu.Lock()
-		sink := c.sink
-		c.mu.Unlock()
-		sink(Report[string]{Result: Result{Health: down, Changed: true}, Key: "a", Target: old.Target, Generation: old.Generation})
+		c.c.mu.Lock()
+		sink := c.c.sinks[0].fn
+		c.c.mu.Unlock()
+		sink(Report[string]{Result: Result{Health: down, Previous: up}, Key: "a", Target: old.Target, Generation: old.Generation})
 		if b, _ := p.Backend("a"); b.Status().Health == down {
 			t.Fatal("a report of the old generation reached the re-added member")
 		}

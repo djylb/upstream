@@ -17,6 +17,8 @@ the state of every backend.
 - Active health: TCP connect checks by default, HTTP checks or any function on
   request; rise/fall thresholds, jitter, bounded concurrency, latency
   statistics and failure classification.
+- Retries on backends not tried yet, bounded by attempts and a retry budget;
+  a dialer and an `http.RoundTripper` over a pool.
 - Slow start for backends that join or recover, explicit all-down behaviour,
   edge-triggered events.
 - Standard library only. Each piece works on its own: balancers without the
@@ -27,25 +29,28 @@ the state of every backend.
 go get github.com/djylb/upstream
 ```
 
-| Package  | Contents                                                                        |
-|----------|---------------------------------------------------------------------------------|
-| `upstream` | `Pool`, balancers, `OutlierDetector`, `Clock`                                 |
-| `health`   | `Checker` for active health checks, TCP check, `Watch` to drive a `Pool`      |
-| `uphttp`   | HTTP health check and a per-backend `http.Transport` cache                    |
+| Package    | Contents                                                                         |
+|------------|----------------------------------------------------------------------------------|
+| `upstream` | `Pool`, balancers, retries, `OutlierDetector`, `Clock`                           |
+| `health`   | `Checker` for active health checks, TCP check, `Watch` and `Attach` to drive pools |
+| `uphttp`   | HTTP health check, per-backend `http.Transport` cache, `RoundTripper` over a pool |
+| `upnet`    | `Dialer` that connects to a pool's backends                                      |
 
-The root package does not import `net` or `net/http`.
+The root package does not import `net` or `net/http`; `upnet` does not
+import `net/http`.
 
 ## Picking backends
 
 ```go
 pool := upstream.New[string](upstream.Config{
-	Balancer: upstream.PowerOfTwo(),
-	Outlier:  upstream.OutlierConfig{ConsecutiveFailures: 5},
+	Balancer:  upstream.PowerOfTwo(),
+	Outlier:   upstream.OutlierConfig{ConsecutiveFailures: 5},
+	Retry:     upstream.RetryConfig{Attempts: 3, Budget: 0.2},
 	SlowStart: 30 * time.Second,
 })
 defer pool.Close()
 
-err := pool.Update([]upstream.Target[string]{
+err := pool.Sync([]upstream.Target[string]{
 	{ID: "a", Value: "10.0.0.1:8080", Weight: 2},
 	{ID: "b", Value: "10.0.0.2:8080"},
 })
@@ -60,13 +65,79 @@ lease.Release(upstream.OutcomeOf(err))
 
 A `Lease` holds one in-flight slot of its backend until it is released, with
 `Success`, `Failure` or `Neutral` (for example when the client went away).
-Release every lease exactly once; `Pool.Do` does it for you, even if the
-function panics. Releasing the same lease variable twice is a no-op.
+Release every lease exactly once. Releasing the same lease variable twice is a
+no-op. When the outcome is known long before the lease ends, as for a
+connection that stays open, `Report` records it at once and `Release` later
+only returns the slot; a half-open backend's trial then ends with the report.
 
-`Update` replaces the membership in one step; `Put` adds or replaces one
+`Sync` replaces the membership in one step; `Put` adds or replaces one
 backend. A backend keeps its counters and health across updates as long as its
 ID stays the same. Leases keep the version of the backend they were issued
-with.
+with. An empty key carries no affinity: `PickKey("")` is `Pick`.
+
+### Retries
+
+```go
+err := pool.Do(ctx, func(b *upstream.Backend[string]) error {
+	conn, err = net.Dial("tcp", b.Value())
+	return err
+})
+```
+
+`Do` and `DoKey` pick a backend, run the function and release the lease with
+its outcome, even if the function panics. A `Failure` is retried on a backend
+not tried yet, up to `RetryConfig.Attempts` backends, while the context is not
+done; the last error is returned. `WithOutcome(err, upstream.Neutral)` marks an
+error that is not the backend's fault, which is neither counted against it nor
+retried.
+
+With `RetryConfig.Budget`, retries within any `Window` number at most
+`MinRetries` plus `Budget` times the requests started, so retries cannot
+multiply the load when many requests fail at once.
+
+`Attempts` is the same for leases that outlive a function: each `Next` leases
+a backend not returned before, or fails with `ErrRetryLimit`,
+`ErrRetryBudget` or `ErrUnavailable`.
+
+### Dialing and HTTP
+
+`upnet.Dialer` dials a pool's backends with retries and returns a `Conn` that
+holds the backend's lease until it is closed, so least-connections balancing
+and drains follow real connections. The dial reports the outcome; with
+`DeferReport`, the caller reports it with `Conn.Report` after a handshake such
+as TLS, so handshake failures count against the backend. The `Conn` forwards
+`CloseWrite`, `CloseRead`, `ReadFrom` and `WriteTo` so that relays keep
+half-close and the zero-copy paths of `io.Copy`.
+
+```go
+dialer := &upnet.Dialer[string]{Pool: pool}
+conn, err := dialer.DialKey(ctx, clientIP)
+```
+
+`uphttp.RoundTripper` balances an `http.Client` or a reverse proxy over a pool:
+it points each request at a picked backend, takes an affinity key from the
+request, judges responses (5xx is a failure by default) and retries on another
+backend when the request can be sent again: its body can be replayed and its
+method is idempotent, or the connection was never established. The lease lasts
+until the response body is read to the end or closed; for an upgraded
+connection (101), until it is closed, since the client may still be writing.
+The outgoing request keeps the incoming `Host`; with `https`, the TLS server
+name and certificate check use the backend's address unless the transport's
+`TLSClientConfig.ServerName` says otherwise.
+
+A panic in a function given to `Do`, `upnet.Dialer` or `uphttp.RoundTripper`
+releases the backend's lease and goes on. Where a pool's values cannot serve
+as addresses and no function says how to use them, `health.Watch` and
+`health.Attach` return `health.ErrNoTarget`, `upnet` returns `ErrNoAddress`
+and `uphttp` returns `ErrNoRewrite`.
+
+```go
+client := &http.Client{Transport: &uphttp.RoundTripper[string]{
+	Pool:      pool,
+	Transport: func(b *upstream.Backend[string]) http.RoundTripper { return cache.Get(b.ID()) },
+	Key:       func(r *http.Request) string { return sessionCookie(r) },
+}}
+```
 
 ### Balancers
 
@@ -120,30 +191,51 @@ however many failures follow.
 `OutlierDetector` is the same logic for a single target, usable without a pool:
 `Admit` before a request, `Record` its outcome after.
 
+### Configuration files
+
+`ParseBalancer` and `ParseFallback` take the names that the built-in balancers
+and `Fallback` print, such as `least-conn` and `all`. `State`, `Health`,
+`OutlierState`, `Outcome`, `EventKind`, `Fallback` and `health.Reason` encode
+and decode as their names in JSON and text. A `Balancer` is an interface: a
+configuration names it and `ParseBalancer` builds it.
+
 ### Active health
 
 ```go
-checker := health.Watch(ctx, pool,
-	func(b *upstream.Backend[string]) health.Target {
-		return health.Target{Address: b.Value()} // TCP connect check
-	},
+watcher, err := health.Watch(ctx, pool, nil, // nil: TCP connect check of each value
 	health.Config[string]{Options: health.Options{Interval: 5 * time.Second, Rise: 2, Fall: 3}})
-defer checker.Close()
+if err != nil {
+	return err
+}
+defer watcher.Close()
 ```
 
 `Watch` follows the pool's membership and reports each result with
 `Pool.ReportCheck`, matching reports to members by generation so that a
-re-added member never takes an old verdict. Thresholds apply in the checker: before its first check a
-target is `HealthUnknown`; the first check decides at once; after that `Rise`
+re-added member never takes an old verdict. Give a target function to choose
+the address, a `Probe` (such as `uphttp.Probe`) or per-member options.
+Thresholds apply in the checker: before its first check a target is
+`HealthUnknown`; the first check decides at once; after that `Rise`
 consecutive passes bring it up and `Fall` consecutive failures take it down.
-Transitions are reported once each.
+Transitions are reported once each. Closing the watcher before the pool sets
+the members' health back to `HealthUnknown`, so no member stays out of
+rotation on a verdict nothing will revise.
+
+`Attach` connects a pool to one group of a shared checker instead, for
+example one pool per tunnel. The checker then holds targets by address
+(`TargetKey`): an address that several pools or members use is checked once
+and reported to each of them, members with one ID but different addresses stay
+apart, and a member that joins an address already checked takes its verdict at
+once. Closing a pool, or calling the function `Attach` returns, ends its group.
 
 ### Draining
 
 `Drain(id)` stops new picks while the backend stays a member; `Remove(id)`
 also takes it out of the pool. Both return a `*Drain` whose `Done` channel is
-closed when the backend's last lease is released. `Resume` ends a drain early;
-the `Drain` then reports `Canceled`.
+closed, and whose `Wait` returns, when the backend's last lease is released.
+`Resume` ends a drain early; the `Drain` then reports `Canceled` and `Wait`
+returns `ErrDrainCanceled`. Members that
+`Sync` removes drain the same way.
 
 ### Slow start
 
@@ -156,8 +248,11 @@ given duration.
 `Subscribe` delivers `EventAdded`, `EventUpdated`, `EventRemoved` and
 `EventStateChanged` in order, starting with the current members. Callbacks run
 without any lock held and may call the pool. `Status` and `Backend.Status`
-return in-flight counts, outcome counters, the latest check result, the
-outlier state and the routing state of every backend.
+return in-flight counts, outcome counters (successes, failures and neutral
+outcomes, which with the in-flight count make up every pick), the latest check
+result, the outlier state and the routing state of every backend.
+`Available` counts the members that are eligible for traffic, for readiness
+checks; it is zero in panic mode, when `FallbackAll` still lets picks through.
 
 ## Health checks on their own
 
@@ -175,7 +270,7 @@ checker := health.New[string, int](ctx, health.Config[string]{
 defer checker.Close()
 
 // Apply a full list for tunnel 7: adds new targets, keeps unchanged ones
-// with their state, removes the rest.
+// with their state, removes the rest. Put and AddToGroup add one target.
 checker.SyncGroup(7, map[string]health.Target{
 	"10.0.0.5:22":  {Address: "10.0.0.5:22"},
 	"db.lan:5432":  {Address: "db.lan:5432", Options: health.Options{Fall: 5}},
@@ -200,8 +295,9 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
 - **UDP** has no handshake to observe, so there is no generic UDP check. UDP
   targets without a `Probe` are not checked and stay `HealthUnknown`; give a
   `Probe` if you know the protocol.
-- **Results** carry the health after the check, whether it changed, the
-  latency, the answering address and a `Reason` (`refused`, `timeout`,
+- **Results** carry the health before and after the check (`Changed` compares
+  them), the latency and its statistics, the answering address and a
+  `Reason` (`refused`, `timeout`,
   `unreachable` for unreachable or down hosts and networks and unusable local
   addresses, `dns`, `reset`, `response`, `other`) derived from error values
   and system error numbers. `Status` adds the last latency, a moving average
@@ -210,11 +306,13 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
   disabled) can be set globally and per target, merged field by field before
   defaults apply, so a target's own interval also sets its default timeout and
   jitter, and changed at any time with
-  `Set`, `Add`, `SyncGroup` or `SetConfig`; the next check is rescheduled at
-  once. A target whose checks stop goes back to `HealthUnknown`.
+  `Put`, `AddToGroup`, `SyncGroup` or `SetConfig`; the next check is
+  rescheduled at once. `CheckNow` checks a target ahead of schedule, for
+  example after real traffic to it failed. A target whose checks stop goes
+  back to `HealthUnknown`.
 - **Removal** cancels the target's check in progress through its context,
   discards the result, stops its timer and frees its slot. Once `Remove`,
-  `RemoveFrom`, `RemoveGroup` or `SyncGroup` returns, no callback for the
+  `RemoveFromGroup`, `RemoveGroup` or `SyncGroup` returns, no callback for the
   removed target starts (one already running may finish, as with
   `time.Timer.Stop`); `OnRemove` reports its key and generation last.
   Adding the key again starts a new generation, and every report carries the
@@ -243,13 +341,14 @@ use when it was dropped close once they go idle.
 - No method waits for a probe or a callback, so none deadlocks when called
   re-entrantly, `Close` included.
 - The pool starts no goroutines; it owns its ejection and slow-start timers,
-  which `Close` stops. `Pool.Closed` reports that the pool was closed.
+  which `Close` stops. `Pool.Done` reports that the pool was closed.
 - The checker owns its timers, one goroutine per running check and one
   goroutine for callbacks. `Close` (or the end of its context) stops them and
   returns at once; `Done` is closed, and `Wait` returns, once every one of them
   has ended. Waiting on `Done` from inside a probe or callback waits for
   itself.
-- A checker started with `Watch` belongs to its pool and closes with it.
+- A watcher started with `Watch` belongs to its pool and closes with it; a
+  pool attached with `Attach` leaves its checker when it closes.
 - Time comes from an injectable `Clock`, so behaviour over time can be tested
   without waiting.
 
@@ -262,7 +361,9 @@ use when it was dropped close once they go idle.
   average.
 - Bounded-load consistent hashing reads every backend's in-flight count on
   each pick; retries on rings of more than 256 backends allocate.
-- The failure-rate window counts up to 2³²−1 requests per window and backend.
+- `Attempts` allocates from the fifth attempt of one request on.
+- The failure-rate window counts up to 2³²−1 requests per window and backend;
+  the retry budget, up to 2³²−1 requests per window and pool.
 - The checker compares targets by key; two groups that give different
   targets for one key share the latest one.
 

@@ -1,6 +1,7 @@
 package upstream_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -14,7 +15,7 @@ func Example() {
 		Outlier:  upstream.OutlierConfig{ConsecutiveFailures: 5},
 	})
 	defer pool.Close()
-	err := pool.Update([]upstream.Target[string]{
+	err := pool.Sync([]upstream.Target[string]{
 		{ID: "a", Value: "10.0.0.1:8080", Weight: 2},
 		{ID: "b", Value: "10.0.0.2:8080"},
 	})
@@ -38,25 +39,90 @@ func Example() {
 }
 
 func ExamplePool_Do() {
-	pool := upstream.New[string](upstream.Config{})
+	pool := upstream.New[string](upstream.Config{
+		Balancer: upstream.Failover(),
+		Retry:    upstream.RetryConfig{Attempts: 3, Budget: 0.2},
+	})
 	defer pool.Close()
-	_ = pool.Update([]upstream.Target[string]{{ID: "local", Value: "127.0.0.1:1"}})
+	_ = pool.Sync([]upstream.Target[string]{
+		{ID: "primary", Value: "10.0.0.1:8080"},
+		{ID: "backup", Value: "10.0.0.2:8080"},
+	})
 
-	// Do releases the lease with the outcome of the function's error.
-	err := pool.Do(func(b *upstream.Backend[string]) error {
-		return errors.New("connection refused")
+	// Do releases each lease with the outcome of the function's error and
+	// retries a failure on a backend it has not tried.
+	err := pool.Do(context.Background(), func(b *upstream.Backend[string]) error {
+		if b.ID() == "primary" {
+			return errors.New("connection refused")
+		}
+		fmt.Println("served by", b.ID())
+		return nil
 	})
 	fmt.Println(err)
-	fmt.Println("failures:", pool.Status()[0].Failures)
+	fmt.Println("primary failures:", pool.Status()[0].Failures)
 	// Output:
-	// connection refused
-	// failures: 1
+	// served by backup
+	// <nil>
+	// primary failures: 1
+}
+
+func ExampleAttempts() {
+	pool := upstream.New[string](upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}})
+
+	// Attempts is Do for leases that outlive a function, such as
+	// connections: each Next leases a backend not tried before.
+	attempts := pool.Attempts("client-key")
+	first, _ := attempts.Next()
+	first.Release(upstream.Failure)
+	second, _ := attempts.Next()
+	fmt.Println(first.Backend() == nil, second.Backend() != nil)
+	second.Release(upstream.Success)
+	_, err := attempts.Next()
+	fmt.Println(err)
+	// Output:
+	// true true
+	// upstream: retry limit reached
+}
+
+func ExampleLease_Report() {
+	pool := upstream.New[string](upstream.Config{Balancer: upstream.LeastConn()})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{{ID: "relay", Value: "10.0.0.1:9000"}})
+
+	lease, _ := pool.Pick()
+	// The connection is up: report the outcome now and keep the in-flight
+	// slot until the connection closes.
+	lease.Report(upstream.Success)
+	s := pool.Status()[0]
+	fmt.Println(s.InFlight, s.Successes)
+	lease.Release(upstream.Neutral) // the reported outcome stands
+	s = pool.Status()[0]
+	fmt.Println(s.InFlight, s.Successes, s.Neutrals)
+	// Output:
+	// 1 1
+	// 0 1 0
+}
+
+func ExampleParseBalancer() {
+	// Balancers and fallbacks by name, as a configuration file gives them.
+	b, err := upstream.ParseBalancer("least-conn")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	f, _ := upstream.ParseFallback("all")
+	pool := upstream.New[string](upstream.Config{Balancer: b, Fallback: f})
+	defer pool.Close()
+	fmt.Println(b, f)
+	// Output: least-conn all
 }
 
 func ExamplePool_PickKey() {
 	pool := upstream.New[string](upstream.Config{Balancer: upstream.ConsistentHash(upstream.HashConfig{})})
 	defer pool.Close()
-	_ = pool.Update([]upstream.Target[string]{{ID: "a"}, {ID: "b"}, {ID: "c"}})
+	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}, {ID: "c"}})
 
 	first, _ := pool.PickKey("198.51.100.7")
 	again, _ := pool.PickKey("198.51.100.7")
@@ -69,7 +135,7 @@ func ExamplePool_PickKey() {
 func ExamplePool_Remove() {
 	pool := upstream.New[string](upstream.Config{})
 	defer pool.Close()
-	_ = pool.Update([]upstream.Target[string]{{ID: "old"}, {ID: "new"}})
+	_ = pool.Sync([]upstream.Target[string]{{ID: "old"}, {ID: "new"}})
 
 	lease, _ := pool.PickKey("")
 	for lease.Backend().ID() != "old" {
@@ -93,7 +159,7 @@ func ExamplePool_Remove() {
 func ExamplePool_Subscribe() {
 	pool := upstream.New[string](upstream.Config{})
 	defer pool.Close()
-	_ = pool.Update([]upstream.Target[string]{{ID: "a"}})
+	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}})
 
 	cancel := pool.Subscribe(func(ev upstream.Event[string]) {
 		fmt.Println(ev.Kind, ev.Backend.ID(), ev.From, "->", ev.To, ev.Err)
@@ -114,7 +180,7 @@ func ExamplePool_Subscribe() {
 func ExampleOutlierDetector() {
 	// Passive health checking for a single connection target, without a
 	// pool.
-	d := upstream.NewOutlierDetector(upstream.OutlierConfig{ConsecutiveFailures: 2}, nil)
+	d := upstream.NewOutlierDetector(upstream.OutlierConfig{ConsecutiveFailures: 2}, nil, nil)
 	defer d.Close()
 	dial := func() error {
 		t, ok := d.Admit()

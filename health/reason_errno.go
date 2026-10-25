@@ -12,18 +12,20 @@ func errnoReason(err error) (Reason, bool) {
 	if !errors.As(err, &errno) {
 		return ReasonNone, false
 	}
-	switch errno {
-	case syscall.ECONNREFUSED:
+	// Error numbers are compared as integers, not as error values.
+	switch n := uintptr(errno); n {
+	case uintptr(syscall.ECONNREFUSED):
 		return ReasonRefused, true
-	case syscall.ETIMEDOUT:
+	case uintptr(syscall.ETIMEDOUT):
 		return ReasonTimeout, true
-	case syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ENETDOWN, syscall.EADDRNOTAVAIL:
+	case uintptr(syscall.EHOSTUNREACH), uintptr(syscall.ENETUNREACH), uintptr(syscall.ENETDOWN), uintptr(syscall.EADDRNOTAVAIL):
 		return ReasonUnreachable, true
-	case syscall.ECONNRESET, syscall.ECONNABORTED:
+	case uintptr(syscall.ECONNRESET), uintptr(syscall.ECONNABORTED):
 		return ReasonReset, true
-	}
-	if errno != 0 && errno == errHostDown {
-		return ReasonUnreachable, true
+	default:
+		if n != 0 && n == errHostDown {
+			return ReasonUnreachable, true
+		}
 	}
 	return ReasonNone, false
 }

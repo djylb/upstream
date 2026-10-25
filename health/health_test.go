@@ -76,7 +76,7 @@ func (r *reports) changes() []upstream.Health {
 	defer r.mu.Unlock()
 	var c []upstream.Health
 	for _, rep := range r.list {
-		if rep.Changed {
+		if rep.Changed() {
 			c = append(c, rep.Health)
 		}
 	}
@@ -131,7 +131,7 @@ func (h *harness) tick(n int) {
 func TestRiseAndFall(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{Options: Options{Rise: 2, Fall: 3}})
-		h.c.Set("a", h.sw.target("a"))
+		h.c.Put("a", h.sw.target("a"))
 		if s, _ := h.c.Status("a"); s.Health != unknown && s.Checks != 0 {
 			t.Fatalf("status before the first check: %+v", s)
 		}
@@ -182,7 +182,7 @@ func TestFirstFailureDecides(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.sw.set("a", true)
-		h.c.Set("a", h.sw.target("a"))
+		h.c.Put("a", h.sw.target("a"))
 		synctest.Wait()
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{down}) {
 			t.Fatalf("changes %v", got)
@@ -196,8 +196,8 @@ func TestFirstFailureDecides(t *testing.T) {
 func TestUncheckedNetworks(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{})
-		h.c.Set("dns", Target{Network: "udp", Address: "192.0.2.1:53"})
-		h.c.Set("custom", Target{Network: "udp", Address: "x", Probe: h.sw.probe})
+		h.c.Put("dns", Target{Network: "udp", Address: "192.0.2.1:53"})
+		h.c.Put("custom", Target{Network: "udp", Address: "x", Probe: h.sw.probe})
 		synctest.Wait()
 		s, _ := h.c.Status("dns")
 		if s.Checking || s.Health != unknown || s.Checks != 0 {
@@ -216,15 +216,15 @@ func TestIntervals(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{Options: Options{Interval: 10 * time.Second, UnhealthyInterval: time.Second}})
 		h.sw.set("down", true)
-		h.c.Set("up", h.sw.target("up"))
-		h.c.Set("down", h.sw.target("down"))
+		h.c.Put("up", h.sw.target("up"))
+		h.c.Put("down", h.sw.target("down"))
 		synctest.Wait()
 		h.tick(10)
 		if up, down := h.sw.count("up"), h.sw.count("down"); up != 2 || down != 11 {
 			t.Fatalf("checks: up %d, down %d; want 2 and 11", up, down)
 		}
 		// Per-target options override the defaults.
-		h.c.Set("up", Target{Probe: h.sw.probe, Address: "up", Options: Options{Interval: time.Second}})
+		h.c.Put("up", Target{Probe: h.sw.probe, Address: "up", Options: Options{Interval: time.Second}})
 		h.tick(3)
 		if got := h.sw.count("up"); got != 5 {
 			t.Fatalf("checks after shortening the interval: %d, want 5", got)
@@ -251,7 +251,7 @@ func TestIntervals(t *testing.T) {
 func TestRuntimeOptions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{Options: Options{Interval: time.Hour}})
-		h.c.Set("a", h.sw.target("a"))
+		h.c.Put("a", h.sw.target("a"))
 		synctest.Wait()
 
 		// A shorter interval applies to the pending check at once.
@@ -263,7 +263,7 @@ func TestRuntimeOptions(t *testing.T) {
 		}
 
 		// Disabling one target forgets its health and stops its checks.
-		h.c.Set("a", Target{Probe: h.sw.probe, Address: "a", Options: Options{Disabled: true}})
+		h.c.Put("a", Target{Probe: h.sw.probe, Address: "a", Options: Options{Disabled: true}})
 		synctest.Wait()
 		h.tick(5)
 		s, _ := h.c.Status("a")
@@ -274,14 +274,14 @@ func TestRuntimeOptions(t *testing.T) {
 			t.Fatalf("changes %v", got)
 		}
 		// Enabling it checks at once.
-		h.c.Set("a", h.sw.target("a"))
+		h.c.Put("a", h.sw.target("a"))
 		synctest.Wait()
 		if got := h.sw.count("a"); got != 3 {
 			t.Fatalf("checks after enabling: %d", got)
 		}
 
 		// Disabling globally stops every target.
-		h.c.Set("b", h.sw.target("b"))
+		h.c.Put("b", h.sw.target("b"))
 		synctest.Wait()
 		cfg.Disabled = true
 		h.c.SetConfig(cfg)
@@ -302,9 +302,9 @@ func TestRuntimeOptions(t *testing.T) {
 func TestAddressChangeStartsAfresh(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{})
-		h.c.Add("tunnel", "k", h.sw.target("old"))
+		h.c.AddToGroup("tunnel", "k", h.sw.target("old"))
 		synctest.Wait()
-		h.c.Add("tunnel", "k", h.sw.target("new"))
+		h.c.AddToGroup("tunnel", "k", h.sw.target("new"))
 		synctest.Wait()
 		s, _ := h.c.Status("k")
 		if s.Checks != 1 || s.Target.Address != "new" || s.Health != up {
@@ -328,15 +328,15 @@ func TestGroupsShareTargets(t *testing.T) {
 			removed = append(removed, k)
 			mu.Unlock()
 		}})
-		h.c.Add("t1", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
-		h.c.Add("t1", "10.0.0.2:80", h.sw.target("10.0.0.2:80"))
-		h.c.Add("t2", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
+		h.c.AddToGroup("t1", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
+		h.c.AddToGroup("t1", "10.0.0.2:80", h.sw.target("10.0.0.2:80"))
+		h.c.AddToGroup("t2", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
 		synctest.Wait()
 		h.tick(2)
 		if got := h.sw.count("10.0.0.1:80"); got != 3 {
 			t.Fatalf("shared target checked %d times, want once per interval (3)", got)
 		}
-		keys := h.c.Keys("t1")
+		keys := h.c.GroupKeys("t1")
 		slices.Sort(keys)
 		groups := h.c.Groups()
 		slices.Sort(groups)
@@ -354,7 +354,7 @@ func TestGroupsShareTargets(t *testing.T) {
 		if h.sw.count("10.0.0.1:80") != 4 || h.sw.count("10.0.0.2:80") != 3 {
 			t.Fatal("shared target stopped with its first group, or the other did not stop")
 		}
-		if !h.c.RemoveFrom("t2", "10.0.0.1:80") || h.c.RemoveFrom("t2", "10.0.0.1:80") {
+		if !h.c.RemoveFromGroup("t2", "10.0.0.1:80") || h.c.RemoveFromGroup("t2", "10.0.0.1:80") {
 			t.Fatal("RemoveFrom")
 		}
 		synctest.Wait() // OnRemove runs on the dispatcher
@@ -370,8 +370,8 @@ func TestGroupsShareTargets(t *testing.T) {
 		}
 
 		// A key held directly survives its groups.
-		h.c.Set("d", h.sw.target("d"))
-		h.c.Add("g", "d", h.sw.target("d"))
+		h.c.Put("d", h.sw.target("d"))
+		h.c.AddToGroup("g", "d", h.sw.target("d"))
 		h.c.RemoveGroup("g")
 		if h.c.Len() != 1 || !h.c.Remove("d") || h.c.Remove("d") {
 			t.Fatal("direct hold")
@@ -383,12 +383,12 @@ func TestSyncGroup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.c.SyncGroup("t", map[string]Target{"a": h.sw.target("a"), "b": h.sw.target("b")})
-		h.c.Add("other", "a", h.sw.target("a"))
+		h.c.AddToGroup("other", "a", h.sw.target("a"))
 		synctest.Wait()
 		h.tick(1)
 		h.c.SyncGroup("t", map[string]Target{"b": h.sw.target("b"), "c": h.sw.target("c")})
 		synctest.Wait()
-		keys := h.c.Keys("t")
+		keys := h.c.GroupKeys("t")
 		slices.Sort(keys)
 		if !slices.Equal(keys, []string{"b", "c"}) {
 			t.Fatalf("keys %v", keys)
@@ -422,9 +422,9 @@ func TestRemoveCancelsCheck(t *testing.T) {
 		clk := fakeclock.New()
 		c := New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: rep.add, Concurrency: 1, Options: Options{Timeout: time.Hour}})
 		defer c.Close()
-		c.Set("hang", Target{Probe: hang})
+		c.Put("hang", Target{Probe: hang})
 		<-started
-		c.Set("next", Target{Probe: sw.probe, Address: "next"}) // waits for the only slot
+		c.Put("next", Target{Probe: sw.probe, Address: "next"}) // waits for the only slot
 		synctest.Wait()
 		if sw.count("next") != 0 {
 			t.Fatal("concurrency bound not applied")
@@ -441,7 +441,7 @@ func TestRemoveCancelsCheck(t *testing.T) {
 			t.Fatalf("%d reports, want only next's", rep.len())
 		}
 		// Adding the key again starts afresh.
-		c.Set("hang", Target{Probe: sw.probe, Address: "hang"})
+		c.Put("hang", Target{Probe: sw.probe, Address: "hang"})
 		synctest.Wait()
 		if s, _ := c.Status("hang"); s.Checks != 1 || s.Health != up {
 			t.Fatalf("re-added: %+v", s)
@@ -462,9 +462,9 @@ func TestSlowTargetDoesNotDelayOthers(t *testing.T) {
 			}
 			return Observation{}, nil
 		}
-		h.c.Set("slow", Target{Probe: slow})
-		h.c.Set("x", h.sw.target("x"))
-		h.c.Set("y", h.sw.target("y"))
+		h.c.Put("slow", Target{Probe: slow})
+		h.c.Put("x", h.sw.target("x"))
+		h.c.Put("y", h.sw.target("y"))
 		synctest.Wait()
 		h.tick(5)
 		if x, y := h.sw.count("x"), h.sw.count("y"); x != 6 || y != 6 {
@@ -492,7 +492,7 @@ func TestConcurrencyBound(t *testing.T) {
 		}
 		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), Concurrency: 3})
 		for _, id := range []string{"a", "b", "c", "d", "e", "f", "g"} {
-			c.Set(id, Target{Probe: probe})
+			c.Put(id, Target{Probe: probe})
 		}
 		synctest.Wait()
 		if peak.Load() != 3 || running.Load() != 3 {
@@ -510,7 +510,7 @@ func TestConcurrencyBound(t *testing.T) {
 func TestLatencyStats(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{LatencyWindow: 3})
-		h.c.Set("a", h.sw.target("a"))
+		h.c.Put("a", h.sw.target("a"))
 		synctest.Wait()
 		for _, ms := range []int{40, 10, 30, 20} {
 			h.sw.mu.Lock()
@@ -522,11 +522,11 @@ func TestLatencyStats(t *testing.T) {
 		h.tick(1)
 		s, _ := h.c.Status("a")
 		// Samples: 0 (first check, zero latency means elapsed = 0), 40, 10, 30, 20.
-		want := Latency{Last: 20 * time.Millisecond, Min: 10 * time.Millisecond, Max: 30 * time.Millisecond, Samples: 3}
-		avg := s.Latency.Average
-		s.Latency.Average = 0
-		if s.Latency != want {
-			t.Fatalf("latency %+v, want %+v", s.Latency, want)
+		want := LatencyStats{Last: 20 * time.Millisecond, Min: 10 * time.Millisecond, Max: 30 * time.Millisecond, Samples: 3}
+		avg := s.Stats.Average
+		s.Stats.Average = 0
+		if s.Stats != want {
+			t.Fatalf("latency %+v, want %+v", s.Stats, want)
 		}
 		if avg <= 0 || avg >= 40*time.Millisecond {
 			t.Fatalf("average %v", avg)
@@ -544,7 +544,7 @@ func TestCloseAndContext(t *testing.T) {
 			return Observation{}, ctx.Err()
 		}
 		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: rep.add, Options: Options{Timeout: time.Hour}})
-		c.Set("a", Target{Probe: probe})
+		c.Put("a", Target{Probe: probe})
 		<-started
 		c.Close()
 		c.Close()
@@ -552,8 +552,8 @@ func TestCloseAndContext(t *testing.T) {
 		if rep.len() != 0 {
 			t.Fatal("canceled check reported")
 		}
-		c.Set("b", Target{Probe: probe})
-		if c.Len() != 0 {
+		c.Put("b", Target{Probe: probe})
+		if len(c.Statuses()) != 0 {
 			t.Fatal("Set after Close")
 		}
 	})
@@ -562,11 +562,11 @@ func TestCloseAndContext(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		sw := newSwitchable()
 		c := New[string, string](ctx, Config[string]{Clock: clk})
-		c.Set("a", sw.target("a"))
+		c.Put("a", sw.target("a"))
 		synctest.Wait()
 		cancel()
 		synctest.Wait()
-		if clk.Pending() != 0 || c.Len() != 0 {
+		if clk.Pending() != 0 || len(c.Statuses()) != 0 {
 			t.Fatal("checker survives its context")
 		}
 		c.Close()
@@ -596,7 +596,7 @@ func TestConcurrentChurn(t *testing.T) {
 			Concurrency: 4,
 			Options:     Options{Interval: time.Second, Timeout: 50 * time.Millisecond},
 			OnResult: func(Report[string]) {
-				_ = c.Len() // callbacks may call the Checker
+				_ = len(c.Statuses()) // callbacks may call the Checker
 			},
 		})
 		key := func(i int) string { return fmt.Sprintf("10.0.%d.%d:80", i%7, i%13) }
@@ -608,11 +608,11 @@ func TestConcurrentChurn(t *testing.T) {
 					k := key(i * (w + 1))
 					switch i % 6 {
 					case 0:
-						c.Add(g, k, Target{Probe: probe, Address: k})
+						c.AddToGroup(g, k, Target{Probe: probe, Address: k})
 					case 1:
 						c.SyncGroup(g, map[string]Target{k: {Probe: probe, Address: k}, key(i + 1): {Probe: probe, Address: key(i + 1)}})
 					case 2:
-						c.RemoveFrom(g, k)
+						c.RemoveFromGroup(g, k)
 					case 3:
 						c.RemoveGroup(g)
 					case 4:
@@ -634,8 +634,8 @@ func TestConcurrentChurn(t *testing.T) {
 			c.RemoveGroup(g)
 		}
 		synctest.Wait()
-		if c.Len() != 0 || clk.Pending() != 0 {
-			t.Fatalf("%d keys and %d timers after removing every group", c.Len(), clk.Pending())
+		if len(c.Statuses()) != 0 || clk.Pending() != 0 {
+			t.Fatalf("%d keys and %d timers after removing every group", len(c.Statuses()), clk.Pending())
 		}
 		c.Close()
 	})
@@ -646,7 +646,7 @@ func TestWatchPool(t *testing.T) {
 		clk := fakeclock.New()
 		p := upstream.New[string](upstream.Config{})
 		defer p.Close()
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "b", Value: "2"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "b", Value: "2"}}); err != nil {
 			t.Fatal(err)
 		}
 		var mu sync.Mutex
@@ -661,7 +661,7 @@ func TestWatchPool(t *testing.T) {
 		sw := newSwitchable()
 		sw.set("2", true)
 		target := func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} }
-		c := Watch(t.Context(), p, target, Config[string]{Clock: clk, Options: Options{Interval: time.Second, Fall: 2, Jitter: -1}})
+		c := mustWatch(t, t.Context(), p, target, Config[string]{Clock: clk, Options: Options{Interval: time.Second, Fall: 2, Jitter: -1}})
 		synctest.Wait()
 		b, _ := p.Backend("b")
 		if b.State() != upstream.StateUnhealthy || !errors.Is(b.Status().LastCheck.Err, errDown) || b.Status().Health != down {
@@ -681,12 +681,12 @@ func TestWatchPool(t *testing.T) {
 			t.Fatalf("state events %v", got)
 		}
 
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "c", Value: "3"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "c", Value: "3"}}); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if c.Len() != 2 || sw.count("3") != 1 {
-			t.Fatalf("checker has %d targets, c checked %d times", c.Len(), sw.count("3"))
+		if len(c.Statuses()) != 2 || sw.count("3") != 1 {
+			t.Fatalf("checker has %d targets, c checked %d times", len(c.Statuses()), sw.count("3"))
 		}
 		before := sw.count("2")
 		clk.Advance(time.Second)
@@ -711,13 +711,13 @@ func TestWatchClosedContext(t *testing.T) {
 		defer p.Close()
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		c := Watch(ctx, p, func(*upstream.Backend[string]) Target { return Target{} }, Config[string]{Clock: fakeclock.New()})
+		c := mustWatch(t, ctx, p, func(*upstream.Backend[string]) Target { return Target{} }, Config[string]{Clock: fakeclock.New()})
 		synctest.Wait()
 		c.Close()
 		if err := p.Put(upstream.Target[string]{ID: "a"}); err != nil {
 			t.Fatal(err)
 		}
-		if c.Len() != 0 {
+		if len(c.Statuses()) != 0 {
 			t.Fatal("checker started after its context ended")
 		}
 	})
@@ -852,13 +852,13 @@ func TestDisableCancelsCheck(t *testing.T) {
 		}
 		c := New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: rep.add, Options: Options{Timeout: time.Hour}})
 		defer c.Close()
-		c.Set("a", Target{Probe: probe})
+		c.Put("a", Target{Probe: probe})
 		close(gate)
 		synctest.Wait() // first check: up
 		gate = make(chan struct{})
 		clk.Advance(time.Hour)
 		synctest.Wait() // second check hangs
-		c.Set("a", Target{Probe: probe, Options: Options{Disabled: true}})
+		c.Put("a", Target{Probe: probe, Options: Options{Disabled: true}})
 		synctest.Wait()
 		s, _ := c.Status("a")
 		if !canceled.Load() || s.Health != unknown || s.Checking || clk.Pending() != 0 {
@@ -874,24 +874,24 @@ func TestWatchIgnoresStaleAddress(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := upstream.New[string](upstream.Config{})
 		defer p.Close()
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "old"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "old"}}); err != nil {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
 		sw.set("old", true)
-		c := Watch(t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: fakeclock.New()})
 		defer c.Close()
 		synctest.Wait()
 		// Reports about the old address do not apply to the new one.
-		c.mu.Lock()
-		sink := c.sink
-		c.mu.Unlock()
+		c.c.mu.Lock()
+		sink := c.c.sinks[0].fn
+		c.c.mu.Unlock()
 		if err := p.Put(upstream.Target[string]{ID: "a", Value: "new"}); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		sink(Report[string]{Result: Result{Health: down, Changed: true}, Key: "a", Target: Target{Probe: sw.probe, Address: "old"}})
+		sink(Report[string]{Result: Result{Health: down, Previous: up}, Key: "a", Target: Target{Probe: sw.probe, Address: "old"}})
 		if b, _ := p.Backend("a"); b.Status().Health != up {
 			t.Fatalf("stale report applied: %+v", b.Status())
 		}
@@ -907,11 +907,11 @@ func TestCloseFromCallbacks(t *testing.T) {
 			close(closed)
 		}})
 		sw := newSwitchable()
-		c.Set("a", sw.target("a"))
+		c.Put("a", sw.target("a"))
 		<-closed
 		c.Close() // from outside too: does not wait
 		<-c.Done()
-		if c.Len() != 0 {
+		if len(c.Statuses()) != 0 {
 			t.Fatal("targets left after Close")
 		}
 	})
@@ -923,7 +923,7 @@ func TestCloseFromCallbacks(t *testing.T) {
 		}
 		var rep reports
 		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: rep.add})
-		c.Set("a", Target{Probe: probe})
+		c.Put("a", Target{Probe: probe})
 		<-c.Done()
 		if rep.len() != 0 {
 			t.Fatal("result of a check that closed the checker was reported")
@@ -939,9 +939,9 @@ func TestCloseFromCallbacks(t *testing.T) {
 			c.Remove(r.Key)
 		}})
 		defer c.Close()
-		c.Add("g", "a", sw.target("a"))
+		c.AddToGroup("g", "a", sw.target("a"))
 		synctest.Wait()
-		if _, ok := c.Status("a"); ok || len(c.Keys("g")) != 0 {
+		if _, ok := c.Status("a"); ok || len(c.GroupKeys("g")) != 0 {
 			t.Fatal("removal from a callback did not apply")
 		}
 	})
@@ -960,7 +960,7 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 			Clock:   clk,
 			Options: Options{Interval: time.Second, Jitter: -1},
 			OnResult: func(r Report[string]) {
-				if r.Key == "block" && r.Health == up && r.Changed {
+				if r.Key == "block" && r.Health == up && r.Changed() {
 					<-block
 				}
 				mu.Lock()
@@ -981,10 +981,10 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 			},
 		})
 		defer c.Close()
-		c.Set("block", sw.target("block"))
+		c.Put("block", sw.target("block"))
 		synctest.Wait() // the dispatcher is stuck in block's first callback
-		c.Set("x", sw.target("x"))
-		c.Set("y", sw.target("y"))
+		c.Put("x", sw.target("x"))
+		c.Put("y", sw.target("y"))
 		for range 50 {
 			clk.Advance(time.Second)
 			synctest.Wait()
@@ -1004,7 +1004,7 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 		if removedGen != gen || gen == 0 {
 			t.Fatalf("OnRemove generation %d, want %d", removedGen, gen)
 		}
-		c.Set("x", sw.target("x"))
+		c.Put("x", sw.target("x"))
 		if s, _ := c.Status("x"); s.Generation == gen {
 			t.Fatal("re-added key kept its generation")
 		}
@@ -1021,7 +1021,7 @@ func TestBlockedCallbackCoalesces(t *testing.T) {
 			Clock:   clk,
 			Options: Options{Interval: time.Second, Jitter: -1},
 			OnResult: func(r Report[string]) {
-				if r.Key == "block" && r.Changed {
+				if r.Key == "block" && r.Changed() {
 					<-block
 				}
 				if r.Key == "y" {
@@ -1030,9 +1030,9 @@ func TestBlockedCallbackCoalesces(t *testing.T) {
 			},
 		})
 		defer c.Close()
-		c.Set("block", sw.target("block"))
+		c.Put("block", sw.target("block"))
 		synctest.Wait()
-		c.Set("y", sw.target("y"))
+		c.Put("y", sw.target("y"))
 		synctest.Wait()
 		for range 100 {
 			clk.Advance(time.Second)
@@ -1056,26 +1056,35 @@ func TestWatchCloseFromPoolSubscriber(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := upstream.New[string](upstream.Config{})
 		defer p.Close()
-		if err := p.Update([]upstream.Target[string]{{ID: "a", Value: "a"}}); err != nil {
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "a"}}); err != nil {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
 		sw.set("a", true)
-		var c *Checker[string, struct{}]
+		// The subscriber must not block: it may run on the goroutine that
+		// calls Watch, which delivers the events it causes.
+		var cp atomic.Pointer[Watcher]
 		var once sync.Once
-		ready := make(chan struct{})
+		closed := make(chan struct{})
 		p.Subscribe(func(ev upstream.Event[string]) {
-			if ev.Kind == upstream.EventStateChanged {
-				<-ready
-				once.Do(c.Close) // runs on the checker's dispatcher, through ReportCheck
+			if w := cp.Load(); w != nil && ev.Kind == upstream.EventStateChanged {
+				once.Do(func() { w.Close(); close(closed) }) // on the dispatcher, through ReportCheck
 			}
 		})
-		c = Watch(t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
-			Config[string]{Clock: fakeclock.New()})
-		close(ready)
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+			Config[string]{Clock: fakeclock.New(), Options: Options{Rise: 1}})
 		synctest.Wait()
+		cp.Store(c)
+		sw.set("a", false)
+		c.CheckNow("a") // a state change after the pointer is set
+		synctest.Wait()
+		select {
+		case <-closed:
+		default:
+			t.Fatal("the subscriber did not close the watcher")
+		}
 		c.Close()
-		if c.Len() != 0 {
+		if len(c.Statuses()) != 0 {
 			t.Fatal("checker still running")
 		}
 	})

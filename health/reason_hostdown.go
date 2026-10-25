@@ -5,4 +5,4 @@ package health
 import "syscall"
 
 // errHostDown is EHOSTDOWN where the platform defines it.
-const errHostDown = syscall.EHOSTDOWN
+const errHostDown = uintptr(syscall.EHOSTDOWN)

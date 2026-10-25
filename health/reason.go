@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -59,4 +60,18 @@ func (r Reason) String() string {
 		return "other"
 	}
 	return "Reason(" + strconv.Itoa(int(r)) + ")"
+}
+
+// MarshalText encodes the reason as its name.
+func (r Reason) MarshalText() ([]byte, error) { return []byte(r.String()), nil }
+
+// UnmarshalText decodes a reason from its name.
+func (r *Reason) UnmarshalText(b []byte) error {
+	for v := ReasonNone; v <= ReasonOther; v++ {
+		if v.String() == string(b) {
+			*r = v
+			return nil
+		}
+	}
+	return fmt.Errorf("health: unknown reason %q", b)
 }

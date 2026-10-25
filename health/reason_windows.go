@@ -10,15 +10,15 @@ import (
 // Winsock reports socket failures as WSAE* codes; the syscall.E* constants
 // on Windows are values the network stack never returns.
 const (
-	wsaEADDRNOTAVAIL syscall.Errno = 10049
-	wsaENETDOWN      syscall.Errno = 10050
-	wsaENETUNREACH   syscall.Errno = 10051
-	wsaECONNABORTED  syscall.Errno = 10053
-	wsaECONNRESET    syscall.Errno = 10054
-	wsaETIMEDOUT     syscall.Errno = 10060
-	wsaECONNREFUSED  syscall.Errno = 10061
-	wsaEHOSTDOWN     syscall.Errno = 10064
-	wsaEHOSTUNREACH  syscall.Errno = 10065
+	wsaEADDRNOTAVAIL uintptr = 10049
+	wsaENETDOWN      uintptr = 10050
+	wsaENETUNREACH   uintptr = 10051
+	wsaECONNABORTED  uintptr = 10053
+	wsaECONNRESET    uintptr = 10054
+	wsaETIMEDOUT     uintptr = 10060
+	wsaECONNREFUSED  uintptr = 10061
+	wsaEHOSTDOWN     uintptr = 10064
+	wsaEHOSTUNREACH  uintptr = 10065
 )
 
 func errnoReason(err error) (Reason, bool) {
@@ -26,15 +26,16 @@ func errnoReason(err error) (Reason, bool) {
 	if !errors.As(err, &errno) {
 		return ReasonNone, false
 	}
-	switch errno {
-	case wsaECONNREFUSED, syscall.ECONNREFUSED:
+	// Error numbers are compared as integers, not as error values.
+	switch uintptr(errno) {
+	case wsaECONNREFUSED, uintptr(syscall.ECONNREFUSED):
 		return ReasonRefused, true
-	case wsaETIMEDOUT, syscall.ETIMEDOUT:
+	case wsaETIMEDOUT, uintptr(syscall.ETIMEDOUT):
 		return ReasonTimeout, true
 	case wsaEHOSTUNREACH, wsaENETUNREACH, wsaEHOSTDOWN, wsaENETDOWN, wsaEADDRNOTAVAIL,
-		syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EHOSTDOWN, syscall.ENETDOWN, syscall.EADDRNOTAVAIL:
+		uintptr(syscall.EHOSTUNREACH), uintptr(syscall.ENETUNREACH), uintptr(syscall.EHOSTDOWN), uintptr(syscall.ENETDOWN), uintptr(syscall.EADDRNOTAVAIL):
 		return ReasonUnreachable, true
-	case wsaECONNRESET, wsaECONNABORTED, syscall.ECONNRESET, syscall.ECONNABORTED:
+	case wsaECONNRESET, wsaECONNABORTED, uintptr(syscall.ECONNRESET), uintptr(syscall.ECONNABORTED):
 		return ReasonReset, true
 	}
 	return ReasonNone, false

@@ -1,6 +1,7 @@
 // Package uphttp holds the HTTP-specific parts of upstream: an HTTP health
-// check and a cache of per-backend transports. It is separate so that the
-// root package does not depend on net/http.
+// check, a cache of per-backend transports and an http.RoundTripper that
+// balances requests over a pool. It is separate so that the root package
+// does not depend on net/http.
 package uphttp
 
 import (
@@ -108,9 +109,11 @@ func Probe(c Check) health.Probe {
 		var mu sync.Mutex
 		var obs health.Observation
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
-			mu.Lock()
-			obs.Addr = info.Conn.RemoteAddr().String()
-			mu.Unlock()
+			if a := info.Conn.RemoteAddr(); a != nil {
+				mu.Lock()
+				obs.Addr = a.String()
+				mu.Unlock()
+			}
 		}})
 		err := c.do(ctx, t.Address, expect)
 		mu.Lock()
@@ -140,8 +143,11 @@ func (c *Check) do(ctx context.Context, address string, expect []byte) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range c.Header {
-		req.Header[k] = v
+	// A copy per request: a client's transport may change the header,
+	// and checks run concurrently.
+	req.Header = c.Header.Clone()
+	if req.Header == nil {
+		req.Header = make(http.Header)
 	}
 	if c.Host != "" {
 		req.Host = c.Host

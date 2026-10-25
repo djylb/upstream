@@ -12,8 +12,10 @@
 //   - An [OutlierDetector] is passive health checking for one backend:
 //     consecutive failures or a failure rate eject it, with exponential
 //     backoff, and half-open trials let it back in.
-//   - Package health runs active health checks on any set of targets, and
-//     package uphttp adds an HTTP check and a per-backend transport cache.
+//   - Package health runs active health checks on any set of targets and
+//     drives pools with them; package uphttp adds an HTTP check, a
+//     per-backend transport cache and an http.RoundTripper over a pool;
+//     package upnet dials the backends of a pool.
 //   - A [Pool] combines them: it holds the members, routes picks through
 //     the balancer to eligible backends, counts requests in flight through
 //     a [Lease], feeds outcomes to an outlier detector per backend, takes
@@ -23,10 +25,14 @@
 // # Picking
 //
 // Pick, PickKey and PickHash return a Lease, which must be released
-// exactly once with the request's [Outcome]; [Pool.Do] does both around a
-// function. Picks are lock-free and do not allocate: they read an
-// immutable routing view that every change rebuilds and publishes
-// atomically, so updates never disturb picks in flight.
+// exactly once with the request's [Outcome]; [Lease.Report] records the
+// outcome early for leases that live long, such as connections. [Pool.Do]
+// picks, runs a function and releases, retrying failures on other
+// backends as [RetryConfig] allows, within a retry budget; [Attempts] does
+// the same for leases that outlive a function. Picks are lock-free and do
+// not allocate: they read an immutable routing view that every change
+// rebuilds and publishes atomically, so updates never disturb picks in
+// flight.
 //
 // # Health
 //

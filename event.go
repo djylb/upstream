@@ -40,6 +40,9 @@ func (k EventKind) String() string {
 	return "EventKind(" + strconv.Itoa(int(k)) + ")"
 }
 
+// MarshalText encodes the kind as its name.
+func (k EventKind) MarshalText() ([]byte, error) { return []byte(k.String()), nil }
+
 // An Event reports a change in a Pool. State changes are edge-triggered:
 // a backend that keeps failing produces one event when it goes down, not
 // one per failure.

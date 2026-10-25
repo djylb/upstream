@@ -14,7 +14,7 @@ func benchPool(b *testing.B, bal Balancer, n int) *Pool[string] {
 	for i := range ts {
 		ts[i] = Target[string]{ID: "backend-" + strconv.Itoa(i), Value: strconv.Itoa(i), Weight: i%4 + 1}
 	}
-	if err := p.Update(ts); err != nil {
+	if err := p.Sync(ts); err != nil {
 		b.Fatal(err)
 	}
 	return p

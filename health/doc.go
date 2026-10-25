@@ -15,6 +15,8 @@
 // targets without a custom Probe are not checked and their health stays
 // upstream.HealthUnknown.
 //
-// Watch connects a Checker to an upstream.Pool so that it follows the
-// pool's membership and takes failing members out of rotation.
+// Watch starts a Checker for one upstream.Pool that follows the pool's
+// membership and takes failing members out of rotation; Attach connects
+// pools to groups of a shared Checker, so that targets several pools use
+// are checked once.
 package health

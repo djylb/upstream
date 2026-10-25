@@ -3,6 +3,7 @@ package uphttp_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,7 +61,7 @@ func ExampleTransportCache() {
 		}
 	})()
 
-	_ = pool.Update([]upstream.Target[string]{{ID: "a", Value: "10.0.0.1:80"}})
+	_ = pool.Sync([]upstream.Target[string]{{ID: "a", Value: "10.0.0.1:80"}})
 	lease, _ := pool.Pick()
 	t := cache.Get(lease.Backend().ID())
 	fmt.Println(t == cache.Get("a"))
@@ -72,4 +73,44 @@ func ExampleParseStatusRange() {
 	r, _ := uphttp.ParseStatusRange("2xx")
 	fmt.Println(r, r.Contains(204), r.Contains(301))
 	// Output: 200-299 true false
+}
+
+func ExampleRoundTripper() {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello from " + r.Host))
+	}))
+	defer backend.Close()
+
+	pool := upstream.New[string](upstream.Config{
+		Balancer: upstream.ConsistentHash(upstream.HashConfig{LoadFactor: 1.25}),
+		Outlier:  upstream.OutlierConfig{ConsecutiveFailures: 5},
+		Retry:    upstream.RetryConfig{Attempts: 2, Budget: 0.2},
+	})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{{ID: "web-1", Value: strings.TrimPrefix(backend.URL, "http://")}})
+
+	cache := uphttp.NewTransportCache(func(string) *http.Transport {
+		return &http.Transport{IdleConnTimeout: time.Minute}
+	}, uphttp.TransportCacheConfig{IdleTTL: 10 * time.Minute})
+	defer cache.CloseIdleConnections()
+
+	client := &http.Client{Transport: &uphttp.RoundTripper[string]{
+		Pool:      pool,
+		Transport: func(b *upstream.Backend[string]) http.RoundTripper { return cache.Get(b.ID()) },
+		Key: func(r *http.Request) string { // sticky sessions
+			if c, err := r.Cookie("session"); err == nil {
+				return c.Value
+			}
+			return ""
+		},
+	}}
+	resp, err := client.Get("http://shop.internal/")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	fmt.Println(string(body))
+	// Output: hello from shop.internal
 }

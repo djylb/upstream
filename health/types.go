@@ -140,7 +140,7 @@ type Config[K comparable] struct {
 	// All callbacks run one at a time, in the order of the events, on one
 	// goroutine the Checker owns, without any lock held. They may call any
 	// method of the Checker, including Close; waiting on Done from a
-	// callback waits for itself. Once Remove, RemoveFrom,
+	// callback waits for itself. Once Remove, RemoveFromGroup,
 	// RemoveGroup, SyncGroup or an address change has removed a target, no
 	// callback for it starts; one already running may finish, as with
 	// time.Timer.Stop. Reports carry the target's Generation so that
@@ -150,12 +150,12 @@ type Config[K comparable] struct {
 	// coalesced per target, so only transitions accumulate.
 	OnResult func(Report[K])
 
-	// OnChange is like OnResult but is called only for reports whose
-	// Changed field is set: one call per health transition.
+	// OnChange is like OnResult but is called only for reports that
+	// change the health: one call per transition.
 	OnChange func(Report[K])
 
 	// OnRemove, if not nil, is called once for every target that leaves the
-	// Checker by Remove, RemoveFrom, RemoveGroup or SyncGroup, with its key
+	// Checker by Remove, RemoveFromGroup, RemoveGroup or SyncGroup, with its key
 	// and generation. No other callback for that generation follows it.
 	OnRemove func(key K, generation uint64)
 
@@ -235,14 +235,21 @@ type Result struct {
 	// change it.
 	Health upstream.Health
 
-	// Changed reports whether this result changed Health. Changes are
-	// edge-triggered: a target that keeps failing is reported down once.
-	Changed bool
+	// Previous is the target's health before this result.
+	Previous upstream.Health
 }
+
+// Changed reports whether this result changed the health. Changes are
+// edge-triggered: a target that keeps failing is reported down once.
+func (r Result) Changed() bool { return r.Health != r.Previous }
 
 // A Report is a Result together with the target it belongs to.
 type Report[K comparable] struct {
 	Result
+
+	// Stats summarizes the target's latencies after this result, for
+	// callers that report latency changes without calling Status.
+	Stats LatencyStats
 
 	// Target is the target as it was checked.
 	Target Target
@@ -255,8 +262,8 @@ type Report[K comparable] struct {
 	Generation uint64
 }
 
-// Latency summarizes the latencies of passing checks.
-type Latency struct {
+// LatencyStats summarizes the latencies of passing checks.
+type LatencyStats struct {
 	// Last is the latest latency.
 	Last time.Duration
 
@@ -278,8 +285,8 @@ type Status[K comparable] struct {
 	// check.
 	Last Result
 
-	// Latency summarizes the passing checks.
-	Latency Latency
+	// Stats summarizes the latencies of the passing checks.
+	Stats LatencyStats
 
 	// Target is the target.
 	Target Target

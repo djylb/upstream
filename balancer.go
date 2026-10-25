@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"sync/atomic"
 )
@@ -57,6 +58,8 @@ type roundRobin struct{}
 
 func (roundRobin) Build(c []Candidate) Picker { return newCounterPicker(len(c)) }
 
+func (roundRobin) String() string { return "round-robin" }
+
 type counterPicker struct {
 	next atomic.Uint64
 	n    uint64
@@ -84,6 +87,8 @@ func (p *counterPicker) Pick(_ uint64, _ int) int { return int(p.next.Add(1) % p
 func WeightedRoundRobin() Balancer { return weightedRoundRobin{} }
 
 type weightedRoundRobin struct{}
+
+func (weightedRoundRobin) String() string { return "weighted-round-robin" }
 
 // maxSmoothWork bounds the work, and the memory, spent precomputing a
 // smooth weighted round-robin cycle.
@@ -167,6 +172,8 @@ func (s *smooth) next() int {
 func Random() Balancer { return random{} }
 
 type random struct{}
+
+func (random) String() string { return "random" }
 
 func (random) Build(c []Candidate) Picker {
 	equal := true
@@ -272,6 +279,8 @@ func PowerOfTwo() Balancer { return powerOfTwo{} }
 
 type powerOfTwo struct{}
 
+func (powerOfTwo) String() string { return "power-of-two" }
+
 func (powerOfTwo) Build(c []Candidate) Picker {
 	return &p2cPicker{loadPicker: newLoadPicker(c)}
 }
@@ -301,6 +310,8 @@ func (p *p2cPicker) Pick(_ uint64, _ int) int {
 func LeastConn() Balancer { return leastConn{} }
 
 type leastConn struct{}
+
+func (leastConn) String() string { return "least-conn" }
 
 func (leastConn) Build(c []Candidate) Picker {
 	return &leastConnPicker{loadPicker: newLoadPicker(c)}
@@ -336,6 +347,33 @@ func Failover() Balancer { return failover{} }
 type failover struct{}
 
 func (failover) Build(c []Candidate) Picker { return failoverPicker{n: len(c)} }
+
+func (failover) String() string { return "failover" }
+
+// ParseBalancer returns the built-in Balancer with the given name, as its
+// String method writes it: "round-robin", "weighted-round-robin",
+// "random", "power-of-two", "least-conn", "failover" or "consistent-hash"
+// (with the default HashConfig). It suits configuration files; build a
+// ConsistentHash with options in code.
+func ParseBalancer(name string) (Balancer, error) {
+	switch name {
+	case "round-robin":
+		return RoundRobin(), nil
+	case "weighted-round-robin":
+		return WeightedRoundRobin(), nil
+	case "random":
+		return Random(), nil
+	case "power-of-two":
+		return PowerOfTwo(), nil
+	case "least-conn":
+		return LeastConn(), nil
+	case "failover":
+		return Failover(), nil
+	case "consistent-hash":
+		return ConsistentHash(HashConfig{}), nil
+	}
+	return nil, fmt.Errorf("upstream: unknown balancer %q", name)
+}
 
 type failoverPicker struct{ n int }
 

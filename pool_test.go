@@ -25,7 +25,7 @@ func newTestPool(t *testing.T, cfg Config, ids ...string) *Pool[string] {
 	t.Helper()
 	p := New[string](cfg)
 	t.Cleanup(p.Close)
-	if err := p.Update(targets(ids...)); err != nil {
+	if err := p.Sync(targets(ids...)); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -58,7 +58,7 @@ func TestPoolBasics(t *testing.T) {
 	if _, err := p.Pick(); !errors.Is(err, ErrNoBackends) {
 		t.Fatalf("empty pool: %v, want ErrNoBackends", err)
 	}
-	if err := p.Update([]Target[string]{{ID: "a", Value: "x", Weight: 3}, {ID: "b", Value: "y"}}); err != nil {
+	if err := p.Sync([]Target[string]{{ID: "a", Value: "x", Weight: 3}, {ID: "b", Value: "y"}}); err != nil {
 		t.Fatal(err)
 	}
 	got := pickIDs(t, p, 400)
@@ -99,7 +99,7 @@ func TestPoolInvalidTargets(t *testing.T) {
 		{{ID: "x", Weight: int(tooHeavy)}},
 		{{ID: "x"}, {ID: "x"}},
 	} {
-		if err := p.Update(ts); !errors.Is(err, ErrInvalidTarget) {
+		if err := p.Sync(ts); !errors.Is(err, ErrInvalidTarget) {
 			t.Errorf("Update(%v) = %v, want ErrInvalidTarget", ts, err)
 		}
 	}
@@ -129,7 +129,7 @@ func TestPoolUpdateKeepsState(t *testing.T) {
 	}
 	p.ReportCheck(a, HealthDown, CheckResult{Err: errors.New("down")})
 
-	if err := p.Update([]Target[string]{{ID: "b"}, {ID: "a", Value: "new", Weight: 7}}); err != nil {
+	if err := p.Sync([]Target[string]{{ID: "b"}, {ID: "a", Value: "new", Weight: 7}}); err != nil {
 		t.Fatal(err)
 	}
 	a2, _ := p.Backend("a")
@@ -190,7 +190,7 @@ func TestPoolRemoveIsGraceful(t *testing.T) {
 	// Removed by Update, with nothing in flight.
 	p2 := newTestPool(t, Config{}, "a", "b")
 	l = mustPick(t, p2)
-	if err := p2.Update(targets("c")); err != nil {
+	if err := p2.Sync(targets("c")); err != nil {
 		t.Fatal(err)
 	}
 	if got := pickIDs(t, p2, 10); got["c"] != 10 {
@@ -347,10 +347,10 @@ func TestPoolDo(t *testing.T) {
 	p := newTestPool(t, Config{}, "a")
 	a, _ := p.Backend("a")
 	boom := errors.New("boom")
-	if err := p.Do(func(*Backend[string]) error { return boom }); !errors.Is(err, boom) {
+	if err := p.Do(context.Background(), func(*Backend[string]) error { return boom }); !errors.Is(err, boom) {
 		t.Fatalf("Do = %v", err)
 	}
-	if err := p.DoKey("k", func(b *Backend[string]) error {
+	if err := p.DoKey(context.Background(), "k", func(b *Backend[string]) error {
 		if b.InFlight() != 1 {
 			t.Errorf("in flight %d inside Do", b.InFlight())
 		}
@@ -360,16 +360,16 @@ func TestPoolDo(t *testing.T) {
 	}
 	func() {
 		defer func() { _ = recover() }()
-		_ = p.Do(func(*Backend[string]) error { panic("x") })
+		_ = p.Do(context.Background(), func(*Backend[string]) error { panic("x") })
 	}()
 	if s := a.Status(); s.InFlight != 0 || s.Failures != 2 || s.Successes != 0 {
 		t.Fatalf("status after Do: %+v", s)
 	}
 	p.Remove("a")
-	if err := p.Do(func(*Backend[string]) error { return nil }); !errors.Is(err, ErrNoBackends) {
+	if err := p.Do(context.Background(), func(*Backend[string]) error { return nil }); !errors.Is(err, ErrNoBackends) {
 		t.Fatalf("Do on empty pool = %v", err)
 	}
-	if err := p.DoKey("k", func(*Backend[string]) error { return nil }); !errors.Is(err, ErrNoBackends) {
+	if err := p.DoKey(context.Background(), "k", func(*Backend[string]) error { return nil }); !errors.Is(err, ErrNoBackends) {
 		t.Fatalf("DoKey on empty pool = %v", err)
 	}
 }
@@ -382,7 +382,7 @@ func TestPoolClose(t *testing.T) {
 	if _, err := p.Pick(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Pick after Close: %v", err)
 	}
-	if err := p.Update(targets("b")); !errors.Is(err, ErrClosed) {
+	if err := p.Sync(targets("b")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Update after Close: %v", err)
 	}
 	if err := p.Put(Target[string]{ID: "b"}); !errors.Is(err, ErrClosed) {
@@ -432,7 +432,7 @@ func TestPoolEvents(t *testing.T) {
 	p.ReportCheck(a, HealthUp, CheckResult{})
 	p.Drain("b")
 	p.Resume("b")
-	if err := p.Update(targets("b", "c")); err != nil {
+	if err := p.Sync(targets("b", "c")); err != nil {
 		t.Fatal(err)
 	}
 	want = []string{
@@ -497,7 +497,7 @@ func TestPickDoesNotAllocate(t *testing.T) {
 		for i := range ts {
 			ts[i] = Target[string]{ID: strconv.Itoa(i), Weight: i%3 + 1}
 		}
-		if err := p.Update(ts); err != nil {
+		if err := p.Sync(ts); err != nil {
 			t.Fatal(err)
 		}
 		allocs := testing.AllocsPerRun(1000, func() {
@@ -538,7 +538,7 @@ func TestConcurrentUpdatesWhilePicking(t *testing.T) {
 			p := New[string](Config{Balancer: bal, Fallback: FallbackAll, Outlier: OutlierConfig{ConsecutiveFailures: 3, BaseEjection: time.Millisecond}})
 			defer p.Close()
 			ids := []string{"a", "b", "c", "d", "e"}
-			if err := p.Update(targets(ids...)); err != nil {
+			if err := p.Sync(targets(ids...)); err != nil {
 				t.Fatal(err)
 			}
 			var events atomic.Int64
@@ -575,7 +575,7 @@ func TestConcurrentUpdatesWhilePicking(t *testing.T) {
 					id := ids[i%len(ids)]
 					switch i % 6 {
 					case 0:
-						_ = p.Update(targets(ids[:1+i%len(ids)]...))
+						_ = p.Sync(targets(ids[:1+i%len(ids)]...))
 					case 1:
 						_ = p.Put(Target[string]{ID: id, Weight: i%5 + 1})
 					case 2:
@@ -623,7 +623,7 @@ func TestPoolReentrantFromSubscriber(t *testing.T) {
 	p.Subscribe(func(ev Event[string]) {
 		calls++
 		if ev.Kind == EventRemoved {
-			_ = p.Update(targets("c")) // its events are not delivered: Close follows
+			_ = p.Sync(targets("c")) // its events are not delivered: Close follows
 			p.Close()
 		}
 	})
@@ -656,7 +656,7 @@ func TestBalancerMayCallPool(t *testing.T) {
 	p := New[string](Config{Balancer: bal})
 	defer p.Close()
 	bal.p = p
-	if err := p.Update(targets("a", "b")); err != nil {
+	if err := p.Sync(targets("a", "b")); err != nil {
 		t.Fatal(err)
 	}
 	l := mustPick(t, p)

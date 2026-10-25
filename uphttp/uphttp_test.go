@@ -256,7 +256,7 @@ func TestTransportCacheRace(t *testing.T) {
 	for w := range 8 {
 		wg.Go(func() {
 			for i := range 500 {
-				k := string(rune('a' + (i+w)%5))
+				k := string('a' + rune((i+w)%5))
 				if c.Get(k) == nil {
 					t.Error("nil transport")
 					return

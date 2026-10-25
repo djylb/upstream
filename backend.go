@@ -1,6 +1,8 @@
 package upstream
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -54,6 +56,9 @@ func (s State) String() string {
 	return "State(" + strconv.Itoa(int(s)) + ")"
 }
 
+// MarshalText encodes the state as its name.
+func (s State) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
+
 // Health is the verdict of active health checking on a backend.
 type Health uint8
 
@@ -81,6 +86,9 @@ func (h Health) String() string {
 	}
 	return "Health(" + strconv.Itoa(int(h)) + ")"
 }
+
+// MarshalText encodes the verdict as its name.
+func (h Health) MarshalText() ([]byte, error) { return []byte(h.String()), nil }
 
 // CheckResult is the result of one active health check.
 type CheckResult struct {
@@ -113,9 +121,13 @@ type Status struct {
 	// InFlight is the number of leases not yet released.
 	InFlight int64
 
-	// Successes and Failures count released leases by outcome.
+	// Successes, Failures and Neutrals count the outcomes of leases, as
+	// reported by Lease.Report or Lease.Release. Together with InFlight
+	// they count every pick: each lease is in flight until released and
+	// has one outcome.
 	Successes uint64
 	Failures  uint64
+	Neutrals  uint64
 
 	// State is the routing state.
 	State State
@@ -191,6 +203,7 @@ func (b *Backend[T]) Status() Status {
 		InFlight:  c.inflight.Load(),
 		Successes: c.successes.Load(),
 		Failures:  c.failures.Load(),
+		Neutrals:  c.neutrals.Load(),
 		State:     stateOf(f, c.det.State()),
 		Health:    healthOf(f),
 		Draining:  f&(flagDraining|flagRemoved) != 0,
@@ -216,7 +229,8 @@ type core struct {
 	drain     atomic.Pointer[Drain]
 	check     atomic.Pointer[CheckResult]
 	rampStart atomic.Int64 // slow start: 0 none, -1 pending, else unix nanoseconds
-	reported  State        // last state announced in an event; guarded by the pool's mutex
+	neutrals  atomic.Uint64
+	reported  State // last state announced in an event; guarded by the pool's mutex
 }
 
 func stateOf(f uint32, o OutlierState) State {
@@ -299,16 +313,29 @@ func (c *core) acquire(ignoreHealth bool) (Ticket, bool) {
 // release returns the slot first: recording the outcome may run event
 // subscribers and a Balancer, and a panic there must not leak the slot.
 func (c *core) release(t Ticket, o Outcome) {
+	c.count(o)
+	c.leave()
+	if c.passive {
+		c.det.Record(t, o)
+	}
+}
+
+// report records an outcome without returning the slot.
+func (c *core) report(t Ticket, o Outcome) {
+	c.count(o)
+	if c.passive {
+		c.det.Record(t, o)
+	}
+}
+
+func (c *core) count(o Outcome) {
 	switch o {
 	case Success:
 		c.successes.Add(1)
 	case Failure:
 		c.failures.Add(1)
 	case Neutral:
-	}
-	c.leave()
-	if c.passive {
-		c.det.Record(t, o)
+		c.neutrals.Add(1)
 	}
 }
 
@@ -376,6 +403,25 @@ func (d *Drain) Canceled() bool {
 		return d.canceled
 	default:
 		return false
+	}
+}
+
+// ErrDrainCanceled is returned by Drain.Wait when Resume ended the drain
+// before the backend's leases were all released.
+var ErrDrainCanceled = errors.New("upstream: drain canceled")
+
+// Wait waits until the drain ends. It returns nil once the backend's last
+// lease is released, ErrDrainCanceled if Resume ended the drain first, and
+// ctx's error if ctx is done first.
+func (d *Drain) Wait(ctx context.Context) error {
+	select {
+	case <-d.ch:
+		if d.canceled {
+			return ErrDrainCanceled
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
