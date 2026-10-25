@@ -65,6 +65,8 @@ const (
 )
 
 // String returns the name of the fallback, as ParseFallback accepts it.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (f Fallback) String() string {
 	switch f {
 	case FallbackNone:
@@ -76,6 +78,8 @@ func (f Fallback) String() string {
 }
 
 // MarshalText encodes the fallback as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (f Fallback) MarshalText() ([]byte, error) { return []byte(f.String()), nil }
 
 // ParseFallback returns the Fallback named s: "none" or "all".

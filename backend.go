@@ -38,6 +38,8 @@ const (
 )
 
 // String returns the name of the state.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (s State) String() string {
 	switch s {
 	case StateHealthy:
@@ -57,6 +59,8 @@ func (s State) String() string {
 }
 
 // MarshalText encodes the state as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (s State) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
 
 // Health is the verdict of active health checking on a backend.
@@ -75,6 +79,8 @@ const (
 )
 
 // String returns the name of the verdict.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (h Health) String() string {
 	switch h {
 	case HealthUnknown:
@@ -88,6 +94,8 @@ func (h Health) String() string {
 }
 
 // MarshalText encodes the verdict as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (h Health) MarshalText() ([]byte, error) { return []byte(h.String()), nil }
 
 // CheckResult is the result of one active health check.

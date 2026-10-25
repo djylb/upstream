@@ -142,7 +142,7 @@ func TestRoundTripperRealServers(t *testing.T) {
 			mu.Unlock()
 			_, _ = io.WriteString(w, r.Host)
 		}))
-		defer srvs[i].Close()
+		t.Cleanup(srvs[i].Close)
 	}
 	p := upstream.New[*url.URL](upstream.Config{Balancer: upstream.ConsistentHash(upstream.HashConfig{})})
 	defer p.Close()

@@ -68,6 +68,8 @@ func (e *outcomeError) Error() string { return e.err.Error() }
 func (e *outcomeError) Unwrap() error { return e.err }
 
 // String returns the name of the outcome.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (o Outcome) String() string {
 	switch o {
 	case Success:
@@ -81,4 +83,6 @@ func (o Outcome) String() string {
 }
 
 // MarshalText encodes the outcome as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (o Outcome) MarshalText() ([]byte, error) { return []byte(o.String()), nil }

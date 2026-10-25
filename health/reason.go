@@ -40,6 +40,8 @@ func Classify(err error) Reason {
 }
 
 // String returns the name of the reason.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (r Reason) String() string {
 	switch r {
 	case ReasonNone:
@@ -63,9 +65,13 @@ func (r Reason) String() string {
 }
 
 // MarshalText encodes the reason as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (r Reason) MarshalText() ([]byte, error) { return []byte(r.String()), nil }
 
 // UnmarshalText decodes a reason from its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (r *Reason) UnmarshalText(b []byte) error {
 	for v := ReasonNone; v <= ReasonOther; v++ {
 		if v.String() == string(b) {

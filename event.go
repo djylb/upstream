@@ -26,6 +26,8 @@ const (
 )
 
 // String returns the name of the kind.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k EventKind) String() string {
 	switch k {
 	case EventAdded:
@@ -41,6 +43,8 @@ func (k EventKind) String() string {
 }
 
 // MarshalText encodes the kind as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k EventKind) MarshalText() ([]byte, error) { return []byte(k.String()), nil }
 
 // An Event reports a change in a Pool. State changes are edge-triggered:

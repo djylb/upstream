@@ -150,6 +150,8 @@ const (
 )
 
 // String returns the name of the state.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (s OutlierState) String() string {
 	switch s {
 	case OutlierOK:
@@ -163,6 +165,8 @@ func (s OutlierState) String() string {
 }
 
 // MarshalText encodes the state as its name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (s OutlierState) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
 
 // OutlierStatus is a snapshot of an OutlierDetector.
