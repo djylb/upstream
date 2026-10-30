@@ -706,21 +706,17 @@ func TestWatchPool(t *testing.T) {
 }
 
 func TestWatchClosedContext(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := upstream.New[string](upstream.Config{})
-		defer p.Close()
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-		c := mustWatch(t, ctx, p, func(*upstream.Backend[string]) Target { return Target{} }, Config[string]{Clock: fakeclock.New()})
-		synctest.Wait()
-		c.Close()
-		if err := p.Put(upstream.Target[string]{ID: "a"}); err != nil {
-			t.Fatal(err)
-		}
-		if len(c.Statuses()) != 0 {
-			t.Fatal("checker started after its context ended")
-		}
-	})
+	p := upstream.New[string](upstream.Config{})
+	defer p.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if w, err := Watch(ctx, p, nil, Config[string]{Clock: fakeclock.New()}); !errors.Is(err, context.Canceled) || w != nil {
+		t.Fatalf("Watch with a done context = %v, %v", w, err)
+	}
+	p.Close()
+	if _, err := Watch(t.Context(), p, nil, Config[string]{Clock: fakeclock.New()}); !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("Watch of a closed pool = %v", err)
+	}
 }
 
 func TestClassify(t *testing.T) {
@@ -1088,4 +1084,310 @@ func TestWatchCloseFromPoolSubscriber(t *testing.T) {
 			t.Fatal("checker still running")
 		}
 	})
+}
+
+// Two owned goroutines (two probes) calling Close at the same time each wait
+// for the other to end: len(owned) stays 2 > min(owned[self],1).
+func TestConcurrentCloseFromTwoProbes(t *testing.T) {
+	var c *Checker[string, string]
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+	done := make(chan struct{}, 2)
+	probe := func(ctx context.Context, _ Target) (Observation, error) {
+		barrier.Done()
+		barrier.Wait()
+		c.Close()
+		done <- struct{}{}
+		return Observation{}, nil
+	}
+	c = New[string, string](context.Background(), Config[string]{Concurrency: 4})
+	c.Put("a", Target{Probe: probe, Address: "a"})
+	c.Put("b", Target{Probe: probe, Address: "b"})
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("deadlock: two probes calling Close wait for each other")
+		}
+	}
+	waitDone(t, c)
+}
+
+func waitDone(t *testing.T, c *Checker[string, string]) {
+	t.Helper()
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done not closed")
+	}
+}
+
+// A callback and a probe calling Close at the same time.
+func TestCloseFromCallbackAndProbe(t *testing.T) {
+	var c *Checker[string, string]
+	inProbe := make(chan struct{})
+	done := make(chan struct{}, 2)
+	probe := func(ctx context.Context, tg Target) (Observation, error) {
+		if tg.Address == "slow" {
+			close(inProbe)
+			time.Sleep(100 * time.Millisecond) // let the callback reach Close
+			c.Close()
+			done <- struct{}{}
+		}
+		return Observation{}, nil
+	}
+	c = New[string, string](context.Background(), Config[string]{Concurrency: 4, OnChange: func(r Report[string]) {
+		if r.Key == "fast" {
+			<-inProbe
+			c.Close()
+			done <- struct{}{}
+		}
+	}})
+	c.Put("slow", Target{Probe: probe, Address: "slow"})
+	c.Put("fast", Target{Probe: probe, Address: "fast"})
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("deadlock: callback and probe calling Close wait for each other")
+		}
+	}
+	waitDone(t, c)
+}
+
+// Per-target Interval: the documented defaults (UnhealthyInterval =
+// Interval, Timeout = min(5s, Interval), Jitter = Interval/10) are taken from
+// the Config's resolved values instead.
+func TestPerTargetIntervalDefaults(t *testing.T) {
+	c := New[string, string](context.Background(), Config[string]{Options: Options{Interval: 10 * time.Second, Disabled: true}})
+	defer c.Close()
+	c.Put("a", Target{Address: "x:1", Options: Options{Interval: time.Second}})
+	c.mu.Lock()
+	o := c.optionsLocked(c.entries["a"])
+	c.mu.Unlock()
+	if o.UnhealthyInterval != time.Second {
+		t.Errorf("UnhealthyInterval = %v, documented default is Interval (1s)", o.UnhealthyInterval)
+	}
+	if o.Jitter > 100*time.Millisecond {
+		t.Errorf("Jitter = %v, documented default is Interval/10 (100ms)", o.Jitter)
+	}
+	if o.Timeout > time.Second {
+		t.Errorf("Timeout = %v, documented default is min(5s, Interval) (1s)", o.Timeout)
+	}
+}
+
+func TestDoneAndWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := make(chan struct{})
+		probe := func(ctx context.Context, _ Target) (Observation, error) {
+			<-gate // ignores ctx on purpose: Done must wait for it
+			return Observation{}, nil
+		}
+		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New()})
+		c.Put("a", Target{Probe: probe})
+		synctest.Wait()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := c.Wait(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait on a running checker: %v", err)
+		}
+		c.Close() // returns at once although the probe hangs
+		select {
+		case <-c.Done():
+			t.Fatal("Done closed while a probe was running")
+		default:
+		}
+		close(gate)
+		if err := c.Wait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestConcurrentCloseEverywhere closes the checker from several probes,
+// callbacks and outside goroutines at once.
+func TestConcurrentCloseEverywhere(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var c *Checker[string, string]
+		var arrived atomic.Int32
+		all := make(chan struct{})
+		probe := func(ctx context.Context, _ Target) (Observation, error) {
+			if arrived.Add(1) == 4 {
+				close(all)
+			}
+			select { // an outside Close may cancel probes before all arrive
+			case <-all:
+			case <-ctx.Done():
+			}
+			c.Close()
+			return Observation{}, nil
+		}
+		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: func(Report[string]) { c.Close() }})
+		for _, k := range []string{"a", "b", "c", "d"} {
+			c.Put(k, Target{Probe: probe})
+		}
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(c.Close)
+		}
+		wg.Wait()
+		<-c.Done()
+	})
+}
+
+// TestAddressChangeEndsGeneration checks that OnRemove reports the end of
+// the old generation when an address change starts a new one, before any
+// report of the new one.
+func TestAddressChangeEndsGeneration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var log []string
+		h := newHarness(t, Config[string]{
+			OnResult: func(r Report[string]) {
+				mu.Lock()
+				defer mu.Unlock()
+				log = append(log, fmt.Sprintf("result %d %v", r.Generation, r.Health))
+			},
+			OnRemove: func(key string, gen uint64) {
+				mu.Lock()
+				defer mu.Unlock()
+				log = append(log, fmt.Sprintf("remove %s %d", key, gen))
+			},
+		})
+		h.c.Put("k", h.sw.target("a"))
+		synctest.Wait()
+		h.c.Put("k", Target{Probe: h.sw.probe, Network: "tcp", Address: "a"}) // the same network
+		h.c.Put("k", h.sw.target("b"))
+		synctest.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		want := []string{"result 1 up", "remove k 1", "result 2 unknown", "result 2 up"}
+		if !slices.Equal(log, want) {
+			t.Fatalf("callbacks %v, want %v", log, want)
+		}
+	})
+}
+
+// TestTCPCustomDialClosesConnWithError checks that a connection a custom
+// Dial returns together with an error is closed.
+func TestTCPCustomDialClosesConnWithError(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	probe := TCP(TCPOptions{Dial: func(context.Context, string, string) (net.Conn, error) { return client, errDown }})
+	if _, err := probe(t.Context(), Target{Address: "x"}); !errors.Is(err, errDown) {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte{0}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("connection left open: %v", err)
+	}
+}
+
+// TestTCPNoAddress checks that the TCP check fails a target without an
+// address with ErrNoAddress instead of dialing "".
+func TestTCPNoAddress(t *testing.T) {
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		t.Error("dialed an empty address")
+		return nil, errDown
+	}
+	for _, o := range []TCPOptions{{}, {Dial: dial}} {
+		if _, err := TCP(o)(context.Background(), Target{}); !errors.Is(err, upstream.ErrNoAddress) {
+			t.Fatalf("check = %v, want ErrNoAddress", err)
+		}
+	}
+}
+
+// The Checker's Clock is its only time source: the default TCP check
+// measures latency on it, whatever TCPOptions.Clock says, and the check
+// timeout runs on it.
+func TestCheckerClockIsOnlyTimeSource(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		dial := func(context.Context, string, string) (net.Conn, error) {
+			clk.Advance(3 * time.Second)
+			a, b := net.Pipe()
+			_ = b.Close()
+			return a, nil
+		}
+		results := make(chan Report[string], 4)
+		c := New[string, string](t.Context(), Config[string]{
+			Clock:    clk,
+			TCP:      TCPOptions{Dial: dial, Clock: upstream.SystemClock()},
+			Options:  Options{Interval: time.Hour, Timeout: time.Minute},
+			OnResult: func(r Report[string]) { results <- r },
+		})
+		defer c.Close()
+		c.Put("tcp", Target{Address: "tcp.invalid:80"})
+		synctest.Wait()
+		if r := <-results; r.Err != nil || r.Latency != 3*time.Second {
+			t.Fatalf("TCP check: err %v, latency %v, want nil, 3s", r.Err, r.Latency)
+		}
+		c.Remove("tcp")
+		synctest.Wait()
+
+		deadlines := make(chan time.Time, 1)
+		hang := func(ctx context.Context, _ Target) (Observation, error) {
+			d, ok := ctx.Deadline()
+			if !ok {
+				t.Error("probe context has no deadline")
+			}
+			deadlines <- d
+			<-ctx.Done()
+			return Observation{}, errors.New("canceled")
+		}
+		want := clk.Now().Add(time.Minute)
+		c.Put("hang", Target{Probe: hang})
+		synctest.Wait()
+		if d := <-deadlines; !d.Equal(want) {
+			t.Fatalf("probe deadline %v, want %v", d, want)
+		}
+		clk.Advance(time.Minute - time.Nanosecond)
+		synctest.Wait()
+		if len(results) != 0 {
+			t.Fatal("check timed out early")
+		}
+		clk.Advance(time.Nanosecond)
+		synctest.Wait()
+		if r := <-results; r.Reason != ReasonTimeout || !errors.Is(r.Err, context.DeadlineExceeded) {
+			t.Fatalf("timed out check: %v (%v), want ReasonTimeout", r.Err, r.Reason)
+		}
+	})
+}
+
+func TestTCPLatencyUsesClock(t *testing.T) {
+	clk := fakeclock.New()
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		clk.Advance(2 * time.Second)
+		a, b := net.Pipe()
+		_ = b.Close()
+		return a, nil
+	}
+	obs, err := TCP(TCPOptions{Dial: dial, Clock: clk})(context.Background(), Target{Address: "x.invalid:1"})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if obs.Latency != 2*time.Second {
+		t.Fatalf("latency %v, want 2s", obs.Latency)
+	}
+}
+
+func TestProbeSeesDeadline(t *testing.T) {
+	deadlines := make(chan time.Time, 1)
+	probe := func(ctx context.Context, _ Target) (Observation, error) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Error("probe context has no deadline")
+		}
+		deadlines <- d
+		return Observation{}, nil
+	}
+	before := time.Now()
+	c := New[string, string](t.Context(), Config[string]{
+		Options: Options{Interval: time.Hour, Timeout: time.Minute},
+	})
+	defer c.Close()
+	c.Put("p", Target{Probe: probe})
+	d := <-deadlines
+	if d.Before(before.Add(time.Minute)) || d.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("probe deadline %v, want about a minute from %v", d, before)
+	}
 }

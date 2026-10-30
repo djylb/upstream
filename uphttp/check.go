@@ -7,8 +7,10 @@ package uphttp
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -43,10 +45,11 @@ type Check struct {
 	// target directly, ignoring proxy settings in the environment, does not
 	// follow redirects and does not keep connections alive, so no idle
 	// connection outlives a check; supply a client to reuse connections
-	// across checks or to go through a proxy. To check over
-	// TLS, set Scheme to "https" and give a client whose transport has the
-	// TLS configuration (server name, roots, client certificates) and, if
-	// needed, its own dialer.
+	// across checks or to go through a proxy. For "https" the default
+	// client verifies the certificate against ServerName with the system
+	// roots; give a client of your own for other roots, client
+	// certificates or its own dialer, and set the server name in its
+	// transport.
 	Client *http.Client
 
 	// Header is added to every request.
@@ -65,6 +68,12 @@ type Check struct {
 	// Host overrides the Host header, for backends that serve virtual
 	// hosts. The connection still goes to the target's address.
 	Host string
+
+	// ServerName is the TLS server name that the default client sends
+	// and verifies the certificate against for "https". The default is
+	// Host without its port, and, without Host, the host of the target's
+	// address. It has no effect with a Client of your own.
+	ServerName string
 
 	// ExpectBody, if not empty, must occur in the first MaxBody bytes of
 	// the response body.
@@ -86,7 +95,7 @@ type Check struct {
 // effect.
 func Probe(c Check) health.Probe {
 	if c.Client == nil {
-		c.Client = defaultClient()
+		c.Client = defaultClient(serverName(c))
 	}
 	if c.Method == "" {
 		c.Method = http.MethodGet
@@ -122,13 +131,30 @@ func Probe(c Check) health.Probe {
 	}
 }
 
-func defaultClient() *http.Client {
+// serverName returns the TLS server name of c for the default client, or
+// "" for the target's host.
+func serverName(c Check) string {
+	if c.ServerName != "" || c.Host == "" {
+		return c.ServerName
+	}
+	if h, _, err := net.SplitHostPort(c.Host); err == nil {
+		return h
+	}
+	return c.Host
+}
+
+// defaultClient returns the client of a Check without one; a non-empty
+// serverName replaces the target's host for TLS.
+func defaultClient(serverName string) *http.Client {
 	// A fresh transport rather than a clone of the default one, which
 	// would send checks to the proxy named by the environment. Timeouts
 	// come from the check's context.
 	t := &http.Transport{
 		DisableKeepAlives: true,
 		ForceAttemptHTTP2: true,
+	}
+	if serverName != "" {
+		t.TLSClientConfig = &tls.Config{ServerName: serverName}
 	}
 	return &http.Client{
 		Transport: t,

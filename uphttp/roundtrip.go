@@ -1,45 +1,63 @@
 package uphttp
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/djylb/upstream"
 )
 
-// ErrNoRewrite means a RoundTripper has no Rewrite function and its pool's
-// values are neither strings nor *url.URL values.
-var ErrNoRewrite = errors.New("uphttp: Rewrite is nil and the backend values are neither strings nor *url.URL")
+// ErrAttemptTimeout is the error of an attempt that RoundTripper's
+// AttemptTimeout cut short. It wraps context.DeadlineExceeded, so the
+// attempt counts as a Failure of its backend.
+var ErrAttemptTimeout = fmt.Errorf("uphttp: attempt timed out: %w", context.DeadlineExceeded)
+
+// ErrHeaderTimeout is the error of an attempt whose response headers did
+// not arrive within RoundTripper's HeaderTimeout. It wraps
+// context.DeadlineExceeded, so the attempt counts as a Failure of its
+// backend.
+var ErrHeaderTimeout = fmt.Errorf("uphttp: timed out waiting for response headers: %w", context.DeadlineExceeded)
 
 // A RoundTripper sends each request to a backend picked from Pool, so that
 // an http.Client or a reverse proxy balances requests over the pool. It
-// retries a request that failed on another backend, as the pool's
-// upstream.RetryConfig allows, when the request can be sent again: its
-// body is empty or has GetBody, and either its method is idempotent (GET,
-// HEAD, OPTIONS, TRACE, or any method with an Idempotency-Key header) or
-// the connection to the failed backend was never established.
+// retries a request that failed on another backend, as Retry and the
+// pool's upstream.RetryConfig allow, when the request can be sent again:
+// its body is empty or has GetBody, and either its method is idempotent
+// (GET, HEAD, OPTIONS, TRACE, or any method with an Idempotency-Key
+// header) or the connection to the failed backend was never established.
+// When no retry is allowed, the last response or error is returned.
 //
 // The lease on the backend lasts until the response body is read to the
 // end or closed, or, for an upgraded connection (status 101), until it is
 // closed, so in-flight counts and drains cover streaming responses and
-// upgraded connections; the outcome is reported as soon as the response
-// headers arrive. A panic in Rewrite, Transport, the round trip or Outcome
-// releases the backend's lease and goes on. The fields must not change
-// while requests are in flight.
+// upgraded connections; the outcome is reported, and the time to the
+// response headers, by the pool's Clock, observed as the backend's
+// latency (see upstream.Lease.Observe), as soon as the headers arrive. A panic in
+// Rewrite, Transport, the round trip, Outcome or Retry releases the
+// backend's lease and goes on. The fields must not change while requests
+// are in flight.
 type RoundTripper[T any] struct {
 	// Pool holds the backends.
 	Pool *upstream.Pool[T]
 
 	// Rewrite points the outgoing request, a clone of the incoming one, at
-	// backend b, usually by setting r.URL.Scheme and r.URL.Host. Nil sets
-	// the host for pools of strings (host and port; the scheme stays, or
-	// becomes "http" if empty) and the scheme and host for pools of
-	// *url.URL values; other pools need a Rewrite, or RoundTrip fails with
-	// ErrNoRewrite.
+	// backend b, usually by setting r.URL.Scheme and r.URL.Host. Nil
+	// handles two kinds of pools. For *url.URL values it sets the scheme
+	// and host and joins the URL's path and query before the request's,
+	// as a reverse proxy to that URL does. For values with an address, as
+	// upstream.AddressOf finds it, it sets the host to the address; the
+	// scheme stays, or becomes "http" if empty. Other pools need a
+	// Rewrite, or RoundTrip fails with upstream.ErrNoAddress; a backend
+	// whose value has none, such as a nil *url.URL or a nil Addresser,
+	// fails its attempt with it, as a Failure.
 	//
 	// The request's Host field is kept, so the backend sees the Host
 	// header the client sent; set r.Host to send the backend's own. With
@@ -49,7 +67,7 @@ type RoundTripper[T any] struct {
 	Rewrite func(r *http.Request, b *upstream.Backend[T])
 
 	// Transport returns the round tripper for backend b, such as one from
-	// a TransportCache keyed by b.ID(). Nil means http.DefaultTransport.
+	// a TransportCache. Nil means http.DefaultTransport.
 	Transport func(b *upstream.Backend[T]) http.RoundTripper
 
 	// Key returns the request's affinity key for the pool's balancer, such
@@ -57,76 +75,200 @@ type RoundTripper[T any] struct {
 	// affinity. Nil means no key.
 	Key func(r *http.Request) string
 
-	// Outcome judges a response or error for passive health checking and
-	// retries. Nil means upstream.OutcomeOf for errors, Failure for status
-	// codes from 500 and Success otherwise.
+	// Outcome judges a response or error for passive health checking.
+	// Nil means upstream.OutcomeOf for errors, Failure for status codes
+	// from 500 and Success otherwise.
 	Outcome func(resp *http.Response, err error) upstream.Outcome
+
+	// Retry reports whether a response or error should be retried on
+	// another backend, if the request can be sent again. It decides apart
+	// from Outcome, so that, for example, a 503 from an overloaded backend
+	// is retried without counting against its health. Nil retries what
+	// the Outcome judges a Failure.
+	Retry func(resp *http.Response, err error) bool
+
+	// AttemptTimeout, if positive, bounds each attempt, from sending the
+	// request until its response body ends or is closed. The attempt's
+	// context comes from the pool's Clock.WithTimeout, so the transport,
+	// its dialer and the TLS handshake see the deadline. An attempt that
+	// times out before the response headers fails with ErrAttemptTimeout
+	// and may be retried, so that a backend that does not answer cannot use
+	// up the whole request's deadline; a body still being read when it
+	// expires fails with context.DeadlineExceeded. Leave it zero for
+	// streaming responses and use HeaderTimeout instead.
+	AttemptTimeout time.Duration
+
+	// HeaderTimeout, if positive, bounds only the wait for an attempt's
+	// response headers, from sending the request until the transport
+	// returns the response; reading the body is not bounded, so it suits
+	// streaming responses. It sets no deadline on the attempt's context:
+	// a timer of the pool's Clock cancels the context if the headers have
+	// not arrived, and stops once they have. Headers count only if they
+	// arrive before the timer fires; once it has fired, a response the
+	// transport still returns is closed and the attempt fails with
+	// ErrHeaderTimeout, which may be retried like ErrAttemptTimeout. With
+	// both set, whichever expires first ends the attempt.
+	HeaderTimeout time.Duration
 }
 
 // RoundTrip implements http.RoundTripper.
 func (rt *RoundTripper[T]) RoundTrip(req *http.Request) (*http.Response, error) {
-	rewrite := rt.Rewrite
-	if rewrite == nil {
+	rewrite := func(r *http.Request, b *upstream.Backend[T]) error { rt.Rewrite(r, b); return nil }
+	if rt.Rewrite == nil {
 		if rewrite = defaultRewrite[T](); rewrite == nil {
 			closeBody(req)
-			return nil, ErrNoRewrite
+			return nil, upstream.ErrNoAddress
 		}
 	}
 	key := ""
 	if rt.Key != nil {
 		key = rt.Key(req)
 	}
-	a := rt.Pool.Attempts(key)
-	l, err := a.Next()
+	replayable := req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
+	var last attempt[T] // the last attempt's response, kept with its lease
+	r := rt.Pool.Request(key)
+	err := r.Do(req.Context(), func(l *upstream.Lease[T]) (bool, error) {
+		last.discard()
+		a := rt.try(req, l, rewrite, r.Tried() > 1)
+		retry := replayable && (idempotent(req) || notSent(a.err)) && rt.retry(a)
+		if a.err != nil {
+			l.Release(a.o)
+			return retry, a.err
+		}
+		a.lease = l.Take()
+		last = a
+		return retry, nil
+	})
+	if err != nil && last.resp != nil {
+		// The last response asked for a retry that could not be made.
+		return last.finish(), nil
+	}
 	if err != nil {
-		closeBody(req)
+		if r.Tried() == 0 {
+			closeBody(req)
+		}
 		return nil, err
 	}
-	replayable := req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
-	for {
-		resp, o, err := rt.try(req, &l, rewrite, a.Count() > 1)
-		retry := o == upstream.Failure && replayable && req.Context().Err() == nil && (idempotent(req) || notSent(err))
-		if !retry {
-			return finish(l, o, resp, err)
-		}
-		next, nerr := a.Next()
-		if nerr != nil {
-			return finish(l, o, resp, err)
-		}
-		if resp != nil {
-			discard(resp.Body)
-		}
-		l.Release(o)
-		l = next
+	return last.finish(), nil
+}
+
+// An attempt is one round trip to a backend.
+type attempt[T any] struct {
+	resp   *http.Response
+	err    error
+	cancel context.CancelFunc // ends the attempt's context, or nil
+	lease  upstream.Lease[T]  // set for a response
+	o      upstream.Outcome
+}
+
+// discard drops the response of an attempt that is retried.
+func (a *attempt[T]) discard() {
+	if a.resp != nil && a.resp.Body != nil {
+		discard(a.resp.Body)
 	}
+	a.lease.Release(a.o)
+	if a.cancel != nil {
+		a.cancel()
+	}
+	*a = attempt[T]{}
 }
 
 // try sends one attempt of req to the backend of l. If Rewrite, Transport,
-// the round trip or Outcome panics, it releases l with Failure, closes the
-// response if there is one, and lets the panic go on.
-func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite func(*http.Request, *upstream.Backend[T]), again bool) (resp *http.Response, o upstream.Outcome, err error) {
+// the round trip or Outcome panics, it closes the response if there is
+// one and lets the panic go on; the caller releases l.
+func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite func(*http.Request, *upstream.Backend[T]) error, again bool) (a attempt[T]) {
+	ctx := req.Context()
+	clock := rt.Pool.Clock()
+	if rt.AttemptTimeout > 0 {
+		ctx, a.cancel = clock.WithTimeout(ctx, rt.AttemptTimeout)
+	}
+	var hdr *headerTimer
+	if rt.HeaderTimeout > 0 {
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		hdr = &headerTimer{cancel: cancel}
+		outer := a.cancel
+		a.cancel = func() {
+			cancel(context.Canceled)
+			if outer != nil {
+				outer()
+			}
+		}
+		hdr.stop = clock.AfterFunc(rt.HeaderTimeout, hdr.fire)
+	}
 	done := false
 	defer func() {
+		if hdr != nil {
+			hdr.headers()
+		}
 		if !done {
-			if resp != nil && resp.Body != nil {
-				_ = resp.Body.Close()
+			if a.resp != nil && a.resp.Body != nil {
+				_ = a.resp.Body.Close()
 			}
-			l.Release(upstream.Failure)
+			if a.cancel != nil {
+				a.cancel()
+			}
 		}
 	}()
-	out := req.Clone(req.Context())
+	out := req.Clone(ctx)
 	if again && req.GetBody != nil {
+		var err error
 		if out.Body, err = req.GetBody(); err != nil {
-			done = true
-			return nil, upstream.Neutral, err
+			a.err, a.o = err, upstream.Neutral
+			return a
 		}
 	}
 	b := l.Backend()
-	rewrite(out, b)
-	resp, err = rt.transport(b).RoundTrip(out)
-	o = rt.outcome(resp, err)
+	if err := rewrite(out, b); err != nil {
+		a.err, a.o = err, upstream.Failure
+		return a
+	}
+	start := clock.Now()
+	a.resp, a.err = rt.transport(b).RoundTrip(out)
+	if hdr != nil && !hdr.headers() && req.Context().Err() == nil && errors.Is(context.Cause(ctx), ErrHeaderTimeout) {
+		if a.resp != nil && a.resp.Body != nil {
+			_ = a.resp.Body.Close()
+		}
+		a.resp, a.err = nil, ErrHeaderTimeout
+	}
+	if a.err != nil && !errors.Is(a.err, ErrHeaderTimeout) && a.cancel != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && req.Context().Err() == nil {
+		a.err = ErrAttemptTimeout
+	}
+	if a.err == nil {
+		l.Observe(clock.Now().Sub(start))
+	}
+	a.o = rt.outcome(a.resp, a.err)
+	if a.err != nil && a.cancel != nil {
+		a.cancel()
+		a.cancel = nil
+	}
 	done = true
-	return resp, o, err
+	return a
+}
+
+// A headerTimer cancels an attempt whose response headers are late. Its
+// state decides the race between the timer and the headers: whichever of
+// fire and headers runs first wins.
+type headerTimer struct {
+	cancel context.CancelCauseFunc
+	stop   func() bool
+	state  atomic.Bool // set by the first of fire and headers
+}
+
+func (h *headerTimer) fire() {
+	if h.state.CompareAndSwap(false, true) {
+		h.cancel(ErrHeaderTimeout)
+	}
+}
+
+// headers marks the response headers as arrived and stops the timer. It
+// reports whether they won the race; later calls report false.
+func (h *headerTimer) headers() bool {
+	if h.state.CompareAndSwap(false, true) {
+		h.stop()
+		return true
+	}
+	return false
 }
 
 func (rt *RoundTripper[T]) transport(b *upstream.Backend[T]) http.RoundTripper {
@@ -149,24 +291,83 @@ func (rt *RoundTripper[T]) outcome(resp *http.Response, err error) upstream.Outc
 	return upstream.Success
 }
 
-func defaultRewrite[T any]() func(*http.Request, *upstream.Backend[T]) {
+func (rt *RoundTripper[T]) retry(a attempt[T]) bool {
+	if rt.Retry != nil {
+		return rt.Retry(a.resp, a.err)
+	}
+	return a.o == upstream.Failure
+}
+
+// defaultRewrite returns the rewrite for a nil Rewrite, or nil if the
+// pool's values have no address. The rewrite fails with
+// upstream.ErrNoAddress for a value without one, such as a nil *url.URL
+// or a nil Addresser.
+func defaultRewrite[T any]() func(*http.Request, *upstream.Backend[T]) error {
 	var zero T
-	switch any(zero).(type) {
-	case string:
-		return func(r *http.Request, b *upstream.Backend[T]) {
-			r.URL.Host, _ = any(b.Value()).(string)
-			if r.URL.Scheme == "" {
-				r.URL.Scheme = "http"
+	if _, ok := any(zero).(*url.URL); ok {
+		return func(r *http.Request, b *upstream.Backend[T]) error {
+			u, _ := any(b.Value()).(*url.URL)
+			if u == nil {
+				return upstream.ErrNoAddress
 			}
-		}
-	case *url.URL:
-		return func(r *http.Request, b *upstream.Backend[T]) {
-			if u, _ := any(b.Value()).(*url.URL); u != nil {
-				r.URL.Scheme, r.URL.Host = u.Scheme, u.Host
-			}
+			rewriteURL(r.URL, u)
+			return nil
 		}
 	}
-	return nil
+	if !upstream.Addressable[T]() {
+		return nil
+	}
+	return func(r *http.Request, b *upstream.Backend[T]) error {
+		addr, ok := upstream.AddressOf(b.Value())
+		if !ok {
+			return upstream.ErrNoAddress
+		}
+		r.URL.Host = addr
+		if r.URL.Scheme == "" {
+			r.URL.Scheme = "http"
+		}
+		return nil
+	}
+}
+
+// rewriteURL points u at target: its scheme and host, its path joined
+// before u's with one slash between them, and its query before u's.
+func rewriteURL(u, target *url.URL) {
+	u.Scheme, u.Host = target.Scheme, target.Host
+	u.Path, u.RawPath = joinURLPath(target, u)
+	switch {
+	case target.RawQuery == "":
+	case u.RawQuery == "":
+		u.RawQuery = target.RawQuery
+	default:
+		u.RawQuery = target.RawQuery + "&" + u.RawQuery
+	}
+}
+
+func joinURLPath(a, b *url.URL) (path, rawpath string) {
+	if a.RawPath == "" && b.RawPath == "" {
+		return singleJoiningSlash(a.Path, b.Path), ""
+	}
+	apath, bpath := a.EscapedPath(), b.EscapedPath()
+	aslash, bslash := strings.HasSuffix(apath, "/"), strings.HasPrefix(bpath, "/")
+	switch {
+	case aslash && bslash:
+		return a.Path + b.Path[1:], apath + bpath[1:]
+	case !aslash && !bslash:
+		return a.Path + "/" + b.Path, apath + "/" + bpath
+	}
+	return a.Path + b.Path, apath + bpath
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash, bslash := strings.HasSuffix(a, "/"), strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
 
 // idempotent reports whether req may be sent twice, by the rules
@@ -184,6 +385,9 @@ func idempotent(req *http.Request) bool {
 // notSent reports whether err means that no connection to the backend was
 // established, so the request never reached it.
 func notSent(err error) bool {
+	if errors.Is(err, upstream.ErrNoAddress) {
+		return true
+	}
 	var op *net.OpError
 	return errors.As(err, &op) && op.Op == "dial"
 }
@@ -201,30 +405,34 @@ func discard(body io.ReadCloser) {
 	_ = body.Close()
 }
 
-// finish hands the response of the last attempt to the caller: an error
-// releases the lease at once; a response reports its outcome and keeps
-// the lease until its body ends.
-func finish[T any](l upstream.Lease[T], o upstream.Outcome, resp *http.Response, err error) (*http.Response, error) {
-	if err != nil || resp.Body == nil {
-		l.Release(o)
-		return resp, err
+// finish hands the response of the last attempt to the caller: it
+// reports the outcome and keeps the lease until the body ends.
+func (a *attempt[T]) finish() *http.Response {
+	resp := a.resp
+	if resp.Body == nil {
+		a.lease.Release(a.o)
+		if a.cancel != nil {
+			a.cancel()
+		}
+		return resp
 	}
-	l.Report(o)
-	body := &leaseBody[T]{ReadCloser: resp.Body, l: l}
+	a.lease.Report(a.o)
+	body := &leaseBody[T]{ReadCloser: resp.Body, l: a.lease, cancel: a.cancel}
 	if w, ok := resp.Body.(io.Writer); ok { // an upgraded connection
 		resp.Body = &leaseConnBody[T]{leaseBody: body, w: w}
 	} else {
 		resp.Body = body
 	}
-	return resp, nil
+	return resp
 }
 
 // leaseBody releases its lease when the body is read to the end or
 // closed, whichever comes first.
 type leaseBody[T any] struct {
 	io.ReadCloser
-	l    upstream.Lease[T]
-	done atomic.Bool
+	l      upstream.Lease[T]
+	cancel context.CancelFunc // the attempt's context, or nil
+	done   atomic.Bool
 }
 
 func (b *leaseBody[T]) Read(p []byte) (int, error) {
@@ -244,6 +452,9 @@ func (b *leaseBody[T]) Close() error {
 func (b *leaseBody[T]) release() {
 	if b.done.CompareAndSwap(false, true) {
 		b.l.Release(upstream.Neutral) // the outcome was reported
+		if b.cancel != nil {
+			b.cancel()
+		}
 	}
 }
 

@@ -18,5 +18,6 @@
 // Watch starts a Checker for one upstream.Pool that follows the pool's
 // membership and takes failing members out of rotation; Attach connects
 // pools to groups of a shared Checker, so that targets several pools use
-// are checked once.
+// are checked once. Both check each member's address, as
+// upstream.AddressOf finds it, unless a target function says otherwise.
 package health

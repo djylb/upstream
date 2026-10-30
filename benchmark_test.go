@@ -83,3 +83,26 @@ func BenchmarkBuild(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkRebuild measures updating a hash ring of 2000 backends of equal
+// weight when one goes down and comes back, as a pool does on health
+// changes, against building it afresh.
+func BenchmarkRebuild(b *testing.B) {
+	full := candidates(slices.Repeat([]int{1}, 2000)...)
+	less := slices.Delete(slices.Clone(full), 1000, 1001)
+	bal := ConsistentHash(HashConfig{}).(Rebuilder)
+	b.Run("Rebuild", func(b *testing.B) {
+		p := bal.Build(full)
+		b.ReportAllocs()
+		for b.Loop() {
+			p = bal.Rebuild(bal.Rebuild(p, less), full)
+		}
+	})
+	b.Run("Build", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			bal.Build(less)
+			bal.Build(full)
+		}
+	})
+}

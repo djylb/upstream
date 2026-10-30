@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 // fakeBackends answers requests in memory: each backend address maps to a
@@ -184,7 +186,7 @@ func TestRoundTripperErrors(t *testing.T) {
 	defer p.Close()
 	_ = p.Sync([]upstream.Target[int]{{ID: "a", Value: 1}})
 	req, _ := http.NewRequest(http.MethodGet, "http://x/", http.NoBody)
-	if _, err := (&RoundTripper[int]{Pool: p}).RoundTrip(req); !errors.Is(err, ErrNoRewrite) {
+	if _, err := (&RoundTripper[int]{Pool: p}).RoundTrip(req); !errors.Is(err, upstream.ErrNoAddress) {
 		t.Fatalf("RoundTrip = %v", err)
 	}
 	empty := newRTPool(t, upstream.Config{})
@@ -281,5 +283,326 @@ func TestRoundTripperPanicsRelease(t *testing.T) {
 		if s := p.Status()[0]; s.InFlight != 0 || s.Failures != 1 {
 			t.Errorf("%s: status %+v", name, s)
 		}
+	}
+}
+
+func TestTransportPanicReleasesLease(t *testing.T) {
+	p := newRTPool(t, upstream.Config{}, "a")
+	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(*http.Request) (*http.Response, error) { panic("boom") })
+	}}
+	req, _ := http.NewRequest(http.MethodGet, "http://x/", http.NoBody)
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = rt.RoundTrip(req)
+	}()
+	if n := p.Status()[0].InFlight; n != 0 {
+		t.Fatalf("in flight %d after a panicking transport", n)
+	}
+}
+
+// TestRoundTripperRetryAndOutcomeApart checks that Retry decides retries
+// apart from the Outcome that counts for health: a 503 is retried without
+// counting against its backend.
+func TestRoundTripperRetryAndOutcomeApart(t *testing.T) {
+	fb := &fakeBackends{status: map[string]int{"busy": 503, "ok": 200}}
+	p := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "busy", "ok")
+	rt := &RoundTripper[string]{
+		Pool:      p,
+		Transport: func(*upstream.Backend[string]) http.RoundTripper { return fb },
+		Outcome: func(resp *http.Response, err error) upstream.Outcome {
+			if err == nil && resp.StatusCode == 503 {
+				return upstream.Neutral
+			}
+			return upstream.OutcomeOf(err)
+		},
+		Retry: func(resp *http.Response, err error) bool { return err != nil || resp.StatusCode == 503 },
+	}
+	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if s := p.Status()[0]; s.Neutrals != 1 || s.Failures != 0 {
+		t.Fatalf("busy: %+v", s)
+	}
+	if s := p.Status()[1]; s.Latency <= 0 {
+		t.Fatal("latency not observed")
+	}
+
+	// Without a retry left, the last response is returned.
+	p2 := newRTPool(t, upstream.Config{}, "busy")
+	rt.Pool = p2
+	resp, err = (&http.Client{Transport: rt}).Get("http://service/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 503 || p2.Status()[0].InFlight != 0 {
+		t.Fatalf("status %d, %+v", resp.StatusCode, p2.Status()[0])
+	}
+}
+
+// TestRoundTripperAttemptTimeout checks that a backend that does not
+// answer costs one attempt, not the request's whole deadline.
+func TestRoundTripperAttemptTimeout(t *testing.T) {
+	p := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
+	tr := rtFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "hole" {
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}
+		if _, ok := r.Context().Deadline(); !ok {
+			t.Error("attempt context has no deadline")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+	})
+	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return tr }, AttemptTimeout: 10 * time.Millisecond}
+	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "ok" {
+		t.Fatalf("body %q", body)
+	}
+	if s := p.Status()[0]; s.Failures != 1 || s.InFlight != 0 {
+		t.Fatalf("hole: %+v", s)
+	}
+	rt.Pool = newRTPool(t, upstream.Config{}, "hole")
+	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrAttemptTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error %v", err)
+	}
+}
+
+// TestRewriteURLJoinsPath checks the default Rewrite for *url.URL values.
+func TestRewriteURLJoinsPath(t *testing.T) {
+	for _, tc := range []struct{ target, in, want string }{
+		{"http://b:1", "http://svc/x?q=1", "http://b:1/x?q=1"},
+		{"https://b:1/api", "http://svc/x", "https://b:1/api/x"},
+		{"http://b:1/api/", "http://svc/x?q=1", "http://b:1/api/x?q=1"},
+		{"http://b:1/api?k=v", "http://svc/x?q=1", "http://b:1/api/x?k=v&q=1"},
+		{"http://b:1/a%2Fb", "http://svc/x", "http://b:1/a%2Fb/x"},
+	} {
+		target, _ := url.Parse(tc.target)
+		u, _ := url.Parse(tc.in)
+		rewriteURL(u, target)
+		if u.String() != tc.want {
+			t.Errorf("%s + %s = %s, want %s", tc.target, tc.in, u, tc.want)
+		}
+	}
+}
+
+// TestRoundTripperLatencyUsesPoolClock checks that the latency to the
+// response headers comes from the pool's Clock.
+func TestRoundTripperLatencyUsesPoolClock(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			clk.Advance(9 * time.Millisecond)
+			return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+		})
+	}}
+	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got := p.Status()[0].Latency; got != 9*time.Millisecond {
+		t.Fatalf("latency %v, want 9ms", got)
+	}
+}
+
+// TestRoundTripperNilAddress checks that a backend without an address
+// fails with ErrNoAddress instead of sending the request unrewritten.
+func TestRoundTripperNilAddress(t *testing.T) {
+	send := func(*upstream.Backend[*url.URL]) http.RoundTripper {
+		return rtFunc(func(*http.Request) (*http.Response, error) {
+			t.Error("sent a request to a backend without an address")
+			return nil, errors.New("sent")
+		})
+	}
+	p := upstream.New[*url.URL](upstream.Config{})
+	defer p.Close()
+	_ = p.Put(upstream.Target[*url.URL]{ID: "a"})
+	_, err := (&http.Client{Transport: &RoundTripper[*url.URL]{Pool: p, Transport: send}}).Get("http://service/")
+	if !errors.Is(err, upstream.ErrNoAddress) {
+		t.Fatalf("Get = %v, want ErrNoAddress", err)
+	}
+	q := upstream.New[upstream.Addresser](upstream.Config{})
+	defer q.Close()
+	_ = q.Put(upstream.Target[upstream.Addresser]{ID: "a"})
+	sendA := func(*upstream.Backend[upstream.Addresser]) http.RoundTripper { return send(nil) }
+	_, err = (&http.Client{Transport: &RoundTripper[upstream.Addresser]{Pool: q, Transport: sendA}}).Get("http://service/")
+	if !errors.Is(err, upstream.ErrNoAddress) {
+		t.Fatalf("Get = %v, want ErrNoAddress", err)
+	}
+	if p.Status()[0].InFlight != 0 || q.Status()[0].InFlight != 0 {
+		t.Fatal("lease leaked")
+	}
+}
+
+// slowBody is a response body that advances clk by step on each Read and
+// fails if its request's context has ended.
+type slowBody struct {
+	ctx   context.Context
+	clk   *fakeclock.Clock
+	step  time.Duration
+	reads int
+}
+
+func (b *slowBody) Read(p []byte) (int, error) {
+	if b.reads == 0 {
+		return 0, io.EOF
+	}
+	b.reads--
+	b.clk.Advance(b.step)
+	if d, ok := b.ctx.Deadline(); ok && !b.clk.Now().Before(d) {
+		<-b.ctx.Done() // the fake timer fires in its own goroutine
+	}
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	p[0] = 'x'
+	return 1, nil
+}
+
+func (b *slowBody) Close() error { return nil }
+
+// TestRoundTripperHeaderTimeout checks that late headers fail the
+// attempt with ErrHeaderTimeout, that it is retried, that the attempt's
+// context has no deadline, and that the timer does not outlive the attempt.
+func TestRoundTripperHeaderTimeout(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk, Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
+	tr := rtFunc(func(r *http.Request) (*http.Response, error) {
+		if _, ok := r.Context().Deadline(); ok {
+			t.Error("attempt context has a deadline")
+		}
+		if r.URL.Host == "hole" {
+			clk.Advance(10 * time.Millisecond)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+	})
+	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return tr }, HeaderTimeout: 10 * time.Millisecond}
+	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "ok" || clk.Pending() != 0 {
+		t.Fatalf("body %q, %d timers pending", body, clk.Pending())
+	}
+	if s := p.Status()[0]; s.Failures != 1 || s.InFlight != 0 {
+		t.Fatalf("hole: %+v", s)
+	}
+	rt.Pool = newRTPool(t, upstream.Config{Clock: clk}, "hole")
+	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrHeaderTimeout) || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAttemptTimeout) {
+		t.Fatalf("error %v", err)
+	}
+}
+
+// TestRoundTripperHeaderTimeoutLoses checks the race: a response that the
+// transport returns after the timer fired is closed and the attempt fails.
+func TestRoundTripperHeaderTimeoutLoses(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	closed := false
+	rt := &RoundTripper[string]{Pool: p, HeaderTimeout: time.Millisecond, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			clk.Advance(time.Millisecond)
+			<-r.Context().Done() // fired, but answer anyway
+			return &http.Response{StatusCode: 200, Body: closeFunc(func() { closed = true }), Request: r}, nil
+		})
+	}}
+	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrHeaderTimeout) || !closed {
+		t.Fatalf("error %v, closed %v", err, closed)
+	}
+	if s := p.Status()[0]; s.InFlight != 0 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+type closeFunc func()
+
+func (closeFunc) Read([]byte) (int, error) { return 0, io.EOF }
+func (f closeFunc) Close() error           { f(); return nil }
+
+// TestRoundTripperHeaderTimeoutStreams checks that HeaderTimeout does not
+// cut a body that streams for longer than it, and that combined with
+// AttemptTimeout the attempt deadline still ends the body.
+func TestRoundTripperHeaderTimeoutStreams(t *testing.T) {
+	for _, tc := range []struct {
+		attempt time.Duration
+		wantErr error
+	}{{0, nil}, {35 * time.Millisecond, context.DeadlineExceeded}} {
+		clk := fakeclock.New()
+		p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+		rt := &RoundTripper[string]{Pool: p, HeaderTimeout: 10 * time.Millisecond, AttemptTimeout: tc.attempt, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+			return rtFunc(func(r *http.Request) (*http.Response, error) {
+				clk.Advance(5 * time.Millisecond)
+				return &http.Response{StatusCode: 200, Body: &slowBody{ctx: r.Context(), clk: clk, step: 10 * time.Millisecond, reads: 5}, Request: r}, nil
+			})
+		}}
+		resp, err := (&http.Client{Transport: rt}).Get("http://service/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if tc.wantErr == nil && (err != nil || string(body) != "xxxxx") {
+			t.Fatalf("body %q, error %v", body, err)
+		}
+		if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+			t.Fatalf("attempt %v: error %v", tc.attempt, err)
+		}
+		if clk.Pending() != 0 || p.Status()[0].InFlight != 0 {
+			t.Fatalf("%d timers pending, %+v", clk.Pending(), p.Status()[0])
+		}
+	}
+	// Combined, late headers: the header timeout wins over the longer
+	// attempt timeout.
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	rt := &RoundTripper[string]{Pool: p, HeaderTimeout: 10 * time.Millisecond, AttemptTimeout: time.Second, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			clk.Advance(10 * time.Millisecond)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		})
+	}}
+	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrHeaderTimeout) || clk.Pending() != 0 {
+		t.Fatalf("error %v, %d pending", err, clk.Pending())
+	}
+}
+
+func TestRoundTripperGetBodyErrorStopsTimer(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 3}}, "a", "b")
+	rt := &RoundTripper[string]{Pool: p, AttemptTimeout: time.Hour, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 503, Body: http.NoBody, Request: r}, nil
+		})
+	}}
+	req, _ := http.NewRequest("PUT", "http://service/", strings.NewReader("x"))
+	req.Header.Set("Idempotency-Key", "1")
+	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("no body") }
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("RoundTrip succeeded although GetBody failed")
+	}
+	if clk.Pending() != 0 {
+		t.Fatalf("leaked %d timers", clk.Pending())
 	}
 }

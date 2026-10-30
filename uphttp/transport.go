@@ -38,8 +38,11 @@ type TransportCacheConfig struct {
 // Expired entries are dropped during Get, in time proportional to the
 // number dropped; the cache starts no goroutines.
 //
-// To drop the transport of a backend leaving a pool, subscribe to the pool
-// and call Remove on upstream.EventRemoved.
+// Keyed by backend ID, a transport carries settings derived from the
+// backend's value, such as its TLS server name, so it must go when that
+// value changes: subscribe to the pool and call Remove on
+// upstream.EventRemoved and on upstream.EventUpdated, which a pool emits
+// only when a member's weight or value really changed.
 type TransportCache[K comparable] struct {
 	newTransport func(K) *http.Transport
 	clock        upstream.Clock

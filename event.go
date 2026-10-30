@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -15,7 +16,7 @@ const (
 	EventAdded EventKind = iota
 
 	// EventUpdated reports a member replaced with a new weight or value;
-	// Backend is the new version.
+	// Backend is the new version. Updates that change neither emit none.
 	EventUpdated
 
 	// EventRemoved reports a member that left the pool.
@@ -23,6 +24,12 @@ const (
 
 	// EventStateChanged reports a change of a member's State.
 	EventStateChanged
+
+	// EventBalancerPanic reports that the Balancer panicked while the pool
+	// built its view. Err is the *BalancerPanicError; Backend is nil. The
+	// pool keeps routing with the view it published before, and builds
+	// again on its next change.
+	EventBalancerPanic
 )
 
 // String returns the name of the kind.
@@ -38,6 +45,8 @@ func (k EventKind) String() string {
 		return "removed"
 	case EventStateChanged:
 		return "state-changed"
+	case EventBalancerPanic:
+		return "balancer-panic"
 	}
 	return "EventKind(" + strconv.Itoa(int(k)) + ")"
 }
@@ -53,10 +62,11 @@ func (k EventKind) MarshalText() ([]byte, error) { return []byte(k.String()), ni
 type Event[T any] struct {
 	// Err is the cause of an EventStateChanged to StateUnhealthy (the last
 	// check error) or to StateEjected or StateHalfOpen (the ejection
-	// cause), and nil otherwise.
+	// cause), the *BalancerPanicError of an EventBalancerPanic, and nil
+	// otherwise.
 	Err error
 
-	// Backend is the member concerned.
+	// Backend is the member concerned; nil for EventBalancerPanic.
 	Backend *Backend[T]
 
 	// Kind says what happened.
@@ -168,4 +178,25 @@ func (p *Pool[T]) flush() {
 		batch = nil
 		p.qmu.Lock()
 	}
+}
+
+// A BalancerPanicError is the Err of an EventBalancerPanic: what a
+// Balancer's Build or Rebuild panicked with, and where.
+type BalancerPanicError struct {
+	// Value is the value passed to panic.
+	Value any
+
+	// Stack is the stack of the panicking goroutine, as runtime/debug.Stack
+	// formats it.
+	Stack []byte
+}
+
+func (e *BalancerPanicError) Error() string {
+	return "upstream: balancer panicked: " + fmt.Sprint(e.Value)
+}
+
+// Unwrap returns Value if it is an error, such as a runtime.Error.
+func (e *BalancerPanicError) Unwrap() error {
+	err, _ := e.Value.(error)
+	return err
 }

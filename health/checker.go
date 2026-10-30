@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -25,7 +27,8 @@ import (
 // Changing a target's options, or the Config, takes effect at once: the
 // next check is rescheduled from the end of the previous one. Changing a
 // target's network or address starts a new generation as if the target had
-// been removed and added, keeping its owners.
+// been removed and added, keeping its owners; an empty network and "tcp"
+// are the same network.
 //
 // Every check runs in its own goroutine, which exists only while the check
 // runs, so a slow or hanging target never delays the others;
@@ -166,7 +169,9 @@ func (c *Checker[K, G]) endLocked() {
 
 func (c *Checker[K, G]) setConfigLocked(cfg Config[K]) {
 	c.cfg = cfg
-	c.tcp = TCP(cfg.TCP)
+	o := cfg.TCP
+	o.Clock = c.clock
+	c.tcp = TCP(o)
 }
 
 // SetConfig replaces the configuration, except Clock, Concurrency and
@@ -318,12 +323,13 @@ func (c *Checker[K, G]) newEntryLocked(key K, groups map[G]struct{}) *entry[K, G
 // putLocked adds or updates the entry for key and queues its scheduling.
 func (c *Checker[K, G]) putLocked(key K, t Target, w *work[K, G]) *entry[K, G] {
 	e := c.entries[key]
-	if e != nil && (e.target.Network != t.Network || e.target.Address != t.Address) {
-		// A different address is a different target: start a new
-		// generation with the same owners, and announce that health is
-		// unknown again.
+	if e != nil && (normNetwork(e.target.Network) != normNetwork(t.Network) || e.target.Address != t.Address) {
+		// A different address is a different target: end the generation,
+		// start a new one with the same owners, and announce that health
+		// is unknown again.
 		old := e
 		c.dropLocked(old, w, false)
+		c.enqueueLocked(&delivery[K, G]{e: old, removed: true})
 		e = c.newEntryLocked(key, old.groups)
 		e.direct = old.direct
 		e.target = t
@@ -340,7 +346,8 @@ func (c *Checker[K, G]) putLocked(key K, t Target, w *work[K, G]) *entry[K, G] {
 }
 
 // dropLocked removes e. With unlink it also leaves its groups and is
-// announced to OnRemove.
+// announced to OnRemove; without, the caller announces it if the
+// generation ends.
 func (c *Checker[K, G]) dropLocked(e *entry[K, G], w *work[K, G], unlink bool) {
 	e.gone = true
 	delete(c.entries, e.key)
@@ -699,7 +706,7 @@ func (c *Checker[K, G]) probeLocked(t Target) Probe {
 	if t.Probe != nil {
 		return t.Probe
 	}
-	if isTCP(t.Network) {
+	if isTCP(normNetwork(t.Network)) {
 		return c.tcp
 	}
 	return nil
@@ -739,7 +746,7 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 		if e.health != upstream.HealthUnknown {
 			prev := e.health
 			e.health, e.ok, e.fail = upstream.HealthUnknown, 0, 0
-			c.reportLocked(e, Result{Time: now, Health: upstream.HealthUnknown, Previous: prev})
+			c.reportLocked(e, Result{CheckResult: upstream.CheckResult{Time: now}, Health: upstream.HealthUnknown, Previous: prev})
 		}
 		c.mu.Unlock()
 		if old != nil && old() {
@@ -836,14 +843,18 @@ func (c *Checker[K, G]) check(ctx context.Context, probe Probe, t Target, o Opti
 	}
 	defer func() { <-c.sem }()
 	start := c.clock.Now()
-	pctx, cancel := context.WithTimeout(ctx, o.Timeout)
+	pctx, cancel := c.clock.WithTimeout(ctx, o.Timeout)
 	obs, err := probe(pctx, t)
+	if err != nil && ctx.Err() == nil && errors.Is(pctx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("health: check timed out: %w: %w", context.DeadlineExceeded, err)
+	}
 	cancel()
 	elapsed := c.clock.Now().Sub(start)
 	if obs.Latency <= 0 {
 		obs.Latency = elapsed
 	}
-	return Result{Time: start, Err: err, Addr: obs.Addr, Latency: obs.Latency, Reason: Classify(err)}, start.Add(elapsed), true
+	cr := upstream.CheckResult{Time: start, Err: err, Addr: obs.Addr, Latency: obs.Latency}
+	return Result{CheckResult: cr, Reason: Classify(err)}, start.Add(elapsed), true
 }
 
 // observe applies one result to the rise and fall counters. Health changes

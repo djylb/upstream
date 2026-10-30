@@ -98,7 +98,9 @@ func (h Health) String() string {
 //goland:noinspection GoMixedReceiverTypes
 func (h Health) MarshalText() ([]byte, error) { return []byte(h.String()), nil }
 
-// CheckResult is the result of one active health check.
+// CheckResult is the result of one active health check. Package health
+// embeds it in its own results, so a pool keeps everything a check saw
+// except the checker's thresholds.
 type CheckResult struct {
 	// Time is when the check started.
 	Time time.Time
@@ -106,7 +108,11 @@ type CheckResult struct {
 	// Err is why the check failed, or nil.
 	Err error
 
-	// Latency is how long the check took.
+	// Addr is the address that answered, if the check reported it, such as
+	// the IP address a host name resolved to.
+	Addr string
+
+	// Latency is the time the target took to answer.
 	Latency time.Duration
 }
 
@@ -128,6 +134,10 @@ type Status struct {
 
 	// InFlight is the number of leases not yet released.
 	InFlight int64
+
+	// Latency is the moving average of the latencies reported with
+	// Lease.Observe, or zero before the first one.
+	Latency time.Duration
 
 	// Successes, Failures and Neutrals count the outcomes of leases, as
 	// reported by Lease.Report or Lease.Release. Together with InFlight
@@ -178,7 +188,8 @@ func healthFlags(h Health) uint32 {
 // A Backend is one member of a Pool: a Target as the pool currently routes
 // to it. Changing a target's weight or value in the pool creates a new
 // Backend that shares the old one's counters and health state, so leases
-// keep the version they were issued with.
+// keep the version they were issued with; an update that changes neither
+// keeps the Backend.
 type Backend[T any] struct {
 	core   *core
 	id     string
@@ -198,6 +209,10 @@ func (b *Backend[T]) Weight() int { return b.weight }
 // InFlight returns the number of leases on the backend not yet released.
 func (b *Backend[T]) InFlight() int64 { return b.core.inflight.Load() }
 
+// Latency returns the moving average of the latencies reported with
+// Lease.Observe, or zero before the first one.
+func (b *Backend[T]) Latency() time.Duration { return time.Duration(b.core.latency.Load()) }
+
 // State returns the backend's routing state.
 func (b *Backend[T]) State() State { return b.core.state() }
 
@@ -209,6 +224,7 @@ func (b *Backend[T]) Status() Status {
 		ID:        b.id,
 		Weight:    b.weight,
 		InFlight:  c.inflight.Load(),
+		Latency:   time.Duration(c.latency.Load()),
 		Successes: c.successes.Load(),
 		Failures:  c.failures.Load(),
 		Neutrals:  c.neutrals.Load(),
@@ -219,7 +235,7 @@ func (b *Backend[T]) Status() Status {
 	if r := c.check.Load(); r != nil {
 		s.LastCheck = *r
 	}
-	if c.passive {
+	if c.det.enabled.Load() {
 		s.Outlier = c.det.Status()
 	}
 	return s
@@ -229,10 +245,10 @@ func (b *Backend[T]) Status() Status {
 // first; flags change only under the pool's mutex but are read without it.
 type core struct {
 	inflight  atomic.Int64
+	latency   atomic.Int64 // moving average in nanoseconds; 0 before the first sample
 	successes atomic.Uint64
 	failures  atomic.Uint64
 	flags     atomic.Uint32
-	passive   bool // det is enabled
 	det       OutlierDetector
 	drain     atomic.Pointer[Drain]
 	check     atomic.Pointer[CheckResult]
@@ -285,7 +301,8 @@ func (c *core) eligible() bool {
 const blockAlways = flagDraining | flagRemoved
 
 // acquire takes an in-flight slot. With ignoreHealth it admits any backend
-// that is neither draining nor removed.
+// that is neither draining nor removed; its outcome still counts for
+// passive health checking.
 //
 // The slot is counted before draining is checked a second time: drain sets
 // the flag before it reads the count, so either drain sees the slot or
@@ -296,26 +313,32 @@ func (c *core) acquire(ignoreHealth bool) (Ticket, bool) {
 		return Ticket{}, false
 	}
 	var t Ticket
-	if !ignoreHealth {
-		if f&flagUnhealthy != 0 {
-			return Ticket{}, false
-		}
-		if c.passive {
+	if !ignoreHealth && f&flagUnhealthy != 0 {
+		return Ticket{}, false
+	}
+	if c.det.enabled.Load() {
+		if !ignoreHealth {
 			var ok bool
 			if t, ok = c.det.Admit(); !ok {
 				return Ticket{}, false
 			}
 		}
+		t.admitted = true
 	}
 	c.inflight.Add(1)
 	if c.flags.Load()&blockAlways != 0 {
 		c.leave()
-		if c.passive {
-			c.det.Record(t, Neutral)
-		}
+		c.record(t, Neutral)
 		return Ticket{}, false
 	}
 	return t, true
+}
+
+// record passes an outcome to the detector if it admitted the request.
+func (c *core) record(t Ticket, o Outcome) {
+	if t.admitted {
+		c.det.Record(t, o)
+	}
 }
 
 // release returns the slot first: recording the outcome may run event
@@ -323,16 +346,28 @@ func (c *core) acquire(ignoreHealth bool) (Ticket, bool) {
 func (c *core) release(t Ticket, o Outcome) {
 	c.count(o)
 	c.leave()
-	if c.passive {
-		c.det.Record(t, o)
-	}
+	c.record(t, o)
 }
 
 // report records an outcome without returning the slot.
 func (c *core) report(t Ticket, o Outcome) {
 	c.count(o)
-	if c.passive {
-		c.det.Record(t, o)
+	c.record(t, o)
+}
+
+// observe folds a latency sample into the moving average, in which each
+// sample weighs one eighth.
+func (c *core) observe(d time.Duration) {
+	d = max(d, 1)
+	for {
+		old := c.latency.Load()
+		avg := int64(d)
+		if old != 0 {
+			avg = old + (int64(d)-old)/8
+		}
+		if c.latency.CompareAndSwap(old, avg) {
+			return
+		}
 	}
 }
 

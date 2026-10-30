@@ -67,6 +67,16 @@ type OutlierConfig struct {
 	// HalfOpenSuccesses is the number of successful trials that restore a
 	// half-open backend. The default is 1.
 	HalfOpenSuccesses int
+
+	// MaxEjectionPercent, from 1 to 100, caps the share of a pool's members
+	// that passive health checking may hold ejected or half-open at once,
+	// so that a fault shared by every backend, such as a database they all
+	// depend on, cannot eject the whole pool. One member may always be
+	// ejected. A failure that would eject a member beyond the cap leaves it
+	// in rotation and is counted in OutlierStatus.Refused. Zero means no
+	// cap. It applies to the detectors of a Pool, not to an
+	// OutlierDetector on its own.
+	MaxEjectionPercent int
 }
 
 // Enabled reports whether the configuration enables passive health
@@ -75,22 +85,27 @@ func (c OutlierConfig) Enabled() bool {
 	return c.ConsecutiveFailures > 0 || c.FailurePercent > 0
 }
 
-// outlierParams is a normalized OutlierConfig.
+// outlierParams is a normalized OutlierConfig. It is immutable once
+// published; a change publishes a new one.
 type outlierParams struct {
-	clock    Clock
-	epoch    time.Time
-	window   time.Duration
-	base     time.Duration
-	max      time.Duration
-	minReq   float64
-	percent  float64
-	consec   uint32
-	trials   int32
-	trialsOK int32
+	clock      Clock
+	epoch      time.Time
+	window     time.Duration
+	base       time.Duration
+	max        time.Duration
+	minReq     float64
+	percent    float64
+	consec     uint32
+	trials     int32
+	trialsOK   int32
+	maxEjected int32  // percent; 0 means no cap
+	seq        uint64 // orders the parameters published to one detector
 }
 
-func newOutlierParams(c OutlierConfig, clock Clock) outlierParams {
-	p := outlierParams{
+// newOutlierParams normalizes c. epoch is the origin of the failure-rate
+// window, or zero for now. The caller sets seq.
+func newOutlierParams(c OutlierConfig, clock Clock, epoch time.Time) *outlierParams {
+	p := &outlierParams{
 		clock:    clockOrSystem(clock),
 		window:   c.Window,
 		base:     c.BaseEjection,
@@ -100,8 +115,14 @@ func newOutlierParams(c OutlierConfig, clock Clock) outlierParams {
 		consec:   uint32(min(max(c.ConsecutiveFailures, 0), math.MaxInt32)),
 		trials:   int32(min(c.HalfOpenRequests, 1<<30)),
 		trialsOK: int32(min(c.HalfOpenSuccesses, 1<<30)),
+		epoch:    epoch,
 	}
-	p.epoch = p.clock.Now()
+	if c.MaxEjectionPercent > 0 && c.MaxEjectionPercent < 100 {
+		p.maxEjected = int32(c.MaxEjectionPercent)
+	}
+	if p.epoch.IsZero() {
+		p.epoch = p.clock.Now()
+	}
 	if p.window <= 0 {
 		p.window = 10 * time.Second
 	}
@@ -182,6 +203,10 @@ type OutlierStatus struct {
 	// Ejections counts every ejection since the detector was created.
 	Ejections uint64
 
+	// Refused counts the failures that would have ejected the backend but
+	// that OutlierConfig.MaxEjectionPercent refused.
+	Refused uint64
+
 	// ConsecutiveFailures is the current run of failures.
 	ConsecutiveFailures uint32
 
@@ -194,6 +219,7 @@ type OutlierStatus struct {
 type Ticket struct {
 	gen      uint32
 	trial    bool
+	admitted bool // used by Pool: the detector is to record the outcome
 	reported bool // used by Lease, which embeds the ticket of its pick
 }
 
@@ -212,15 +238,43 @@ type OutlierDetector struct {
 	gen       atomic.Uint32 // changes on every transition
 	trials    atomic.Uint64 // half-open period<<32 | trial requests in flight
 	trialsOK  atomic.Uint64 // half-open period<<32 | successful trials
+	refused   atomic.Uint64
+	params    atomic.Pointer[outlierParams]
+	enabled   atomic.Bool // params.enabled(); set with params under mu
 	onChange  func()
-	params    outlierParams
+	guard     *ejectionGuard // the pool's cap on ejections, or nil
 
 	mu     sync.Mutex
 	stop   func() bool // ends the pending reopen timer; guarded by mu
 	cause  error       // guarded by mu
 	level  uint        // ejections without recovery; guarded by mu
+	held   bool        // holds one of guard's ejections; guarded by mu
 	closed bool        // guarded by mu
 }
+
+// ejectionGuard caps the share of a pool's members that are ejected or
+// half-open. Each detector holds at most one of its slots, from its
+// ejection until it recovers, is reset or is closed.
+type ejectionGuard struct {
+	held    atomic.Int32
+	members atomic.Int32
+}
+
+// acquire takes a slot unless that would put more than percent of the
+// members out; one member may always be out.
+func (g *ejectionGuard) acquire(percent int32) bool {
+	for {
+		n := g.held.Load()
+		if percent > 0 && n > 0 && int64(n+1)*100 > int64(percent)*int64(g.members.Load()) {
+			return false
+		}
+		if g.held.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+func (g *ejectionGuard) release() { g.held.Add(-1) }
 
 // NewOutlierDetector returns a detector for one backend that reads time
 // from clock; nil means SystemClock. onChange, if not nil, is called after every state transition, without any lock held, from
@@ -232,13 +286,49 @@ type OutlierDetector struct {
 // ejects.
 func NewOutlierDetector(cfg OutlierConfig, clock Clock, onChange func()) *OutlierDetector {
 	d := new(OutlierDetector)
-	d.init(newOutlierParams(cfg, clock), onChange)
+	d.init(newOutlierParams(cfg, clock, time.Time{}), onChange, nil)
 	return d
 }
 
-func (d *OutlierDetector) init(p outlierParams, onChange func()) {
-	d.params = p
+func (d *OutlierDetector) init(p *outlierParams, onChange func(), g *ejectionGuard) {
+	d.params.Store(p)
+	d.enabled.Store(p.enabled())
 	d.onChange = onChange
+	d.guard = g
+}
+
+// SetConfig replaces the detector's configuration. The current state and
+// any ejection in progress stay; the new thresholds and times apply from
+// the next request and the next ejection. A configuration that is not
+// Enabled also clears any ejection, as Reset does.
+func (d *OutlierDetector) SetConfig(cfg OutlierConfig) {
+	d.mu.Lock()
+	old := d.params.Load()
+	p := newOutlierParams(cfg, old.clock, old.epoch)
+	p.seq = old.seq + 1
+	d.mu.Unlock()
+	d.setParams(p)
+}
+
+// setParams publishes p, which has the epoch and clock of the current
+// parameters, unless parameters with a later seq are published already,
+// so that concurrent updates end with the latest.
+func (d *OutlierDetector) setParams(p *outlierParams) {
+	d.mu.Lock()
+	old := d.params.Load()
+	if old.seq >= p.seq {
+		d.mu.Unlock()
+		return
+	}
+	d.params.Store(p)
+	d.enabled.Store(p.enabled())
+	if old.window != p.window {
+		d.win.restart(p.clock.Now().Sub(p.epoch), p.window)
+	}
+	d.mu.Unlock()
+	if !p.enabled() {
+		d.Reset()
+	}
 }
 
 // Admit reports whether the backend may take a new request now. A healthy
@@ -268,7 +358,7 @@ func (d *OutlierDetector) admitTrial() (Ticket, bool) {
 	for {
 		v := d.trials.Load()
 		n := periodCount(v, gen)
-		if n >= uint32(d.params.trials) {
+		if n >= uint32(d.params.Load().trials) {
 			return Ticket{}, false
 		}
 		if d.trials.CompareAndSwap(v, uint64(gen)<<32|uint64(n+1)) {
@@ -312,7 +402,7 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 		d.recordTrial(t.gen, o)
 		return
 	}
-	p := &d.params
+	p := d.params.Load()
 	switch o {
 	case Success:
 		if d.consec.Load() != 0 {
@@ -325,7 +415,9 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 		if OutlierState(d.state.Load()) != OutlierOK {
 			return // judged by trials, not by requests admitted earlier
 		}
-		if p.consec > 0 && d.consec.Add(1) == p.consec {
+		// At or beyond the threshold, as a refused ejection leaves the
+		// run going.
+		if p.consec > 0 && d.consec.Add(1) >= p.consec {
 			d.eject(OutlierOK, 0, ErrConsecutiveFailures)
 			return
 		}
@@ -349,7 +441,7 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 			v := d.trialsOK.Load()
 			n := periodCount(v, gen) + 1
 			if d.trialsOK.CompareAndSwap(v, uint64(gen)<<32|uint64(n)) {
-				if n >= uint32(d.params.trialsOK) {
+				if n >= uint32(d.params.Load().trialsOK) {
 					d.recover(gen)
 				}
 				return
@@ -364,16 +456,25 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 // eject moves the detector from state from (and, for half-open, period
 // gen) to ejected. It does nothing if the detector moved on meanwhile.
 func (d *OutlierDetector) eject(from OutlierState, gen uint32, cause error) {
-	if !d.params.enabled() {
+	p := d.params.Load()
+	if !p.enabled() {
 		return
 	}
-	now := d.params.clock.Now()
+	now := p.clock.Now()
 	d.mu.Lock()
 	if d.closed || OutlierState(d.state.Load()) != from || (from == OutlierHalfOpen && d.gen.Load() != gen) {
 		d.mu.Unlock()
 		return
 	}
-	wait := d.params.backoff(d.level)
+	if !d.held && d.guard != nil {
+		if !d.guard.acquire(p.maxEjected) {
+			d.mu.Unlock()
+			d.refused.Add(1)
+			return
+		}
+		d.held = true
+	}
+	wait := p.backoff(d.level)
 	d.level++
 	ejectGen := d.gen.Add(1)
 	d.cause = cause
@@ -391,7 +492,7 @@ func (d *OutlierDetector) eject(from OutlierState, gen uint32, cause error) {
 
 	// The clock is called without the lock; the generation check below
 	// handles a timer that fires, or a Close that runs, in between.
-	stop := d.params.clock.AfterFunc(wait, func() { d.reopen(ejectGen) })
+	stop := p.clock.AfterFunc(wait, func() { d.reopen(ejectGen) })
 	d.mu.Lock()
 	if d.closed || d.gen.Load() != ejectGen {
 		d.mu.Unlock()
@@ -430,6 +531,7 @@ func (d *OutlierDetector) recover(gen uint32) {
 }
 
 func (d *OutlierDetector) resetLocked() {
+	d.releaseGuardLocked()
 	d.level = 0
 	d.cause = nil
 	d.consec.Store(0)
@@ -466,11 +568,19 @@ func (d *OutlierDetector) Reset() {
 func (d *OutlierDetector) Close() {
 	d.mu.Lock()
 	d.closed = true
+	d.releaseGuardLocked()
 	stop := d.stop
 	d.stop = nil
 	d.mu.Unlock()
 	if stop != nil {
 		stop()
+	}
+}
+
+func (d *OutlierDetector) releaseGuardLocked() {
+	if d.held {
+		d.held = false
+		d.guard.release()
 	}
 }
 
@@ -487,6 +597,7 @@ func (d *OutlierDetector) Status() OutlierStatus {
 	s := OutlierStatus{
 		Cause:               cause,
 		Ejections:           d.ejections.Load(),
+		Refused:             d.refused.Load(),
 		ConsecutiveFailures: d.consec.Load(),
 		State:               OutlierState(d.state.Load()),
 	}
@@ -581,4 +692,11 @@ func (w *window) removePart() {
 func (w *window) reset() {
 	w.cur.Store(0)
 	w.prev.Store(0)
+}
+
+// restart empties the window for a new size, starting at the bucket of
+// now. Adds that race with it may land in either window.
+func (w *window) restart(now, size time.Duration) {
+	w.idx.Store(int64(now / size))
+	w.reset()
 }

@@ -66,24 +66,46 @@ func ExamplePool_Do() {
 	// primary failures: 1
 }
 
-func ExampleAttempts() {
+func ExampleRequest() {
 	pool := upstream.New[string](upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}})
 	defer pool.Close()
 	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}})
 
-	// Attempts is Do for leases that outlive a function, such as
-	// connections: each Next leases a backend not tried before.
-	attempts := pool.Attempts("client-key")
-	first, _ := attempts.Next()
+	// A Request leases distinct backends for one request: each Next
+	// leases a backend not tried before, as the retry settings allow.
+	req := pool.Request("client-key")
+	first, _ := req.Next()
 	first.Release(upstream.Failure)
-	second, _ := attempts.Next()
+	second, _ := req.Next()
 	fmt.Println(first.Backend() == nil, second.Backend() != nil)
 	second.Release(upstream.Success)
-	_, err := attempts.Next()
+	_, err := req.Next()
 	fmt.Println(err)
 	// Output:
 	// true true
 	// upstream: retry limit reached
+}
+
+func ExampleRequest_Do() {
+	pool := upstream.New[string](upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}})
+
+	// Do runs the retry loop for leases that outlive it, such as
+	// connections: Take hands the lease of the attempt that worked on.
+	var kept upstream.Lease[string]
+	req := pool.Request("")
+	err := req.Do(context.Background(), func(l *upstream.Lease[string]) (retry bool, err error) {
+		if req.Tried() == 1 {
+			return true, errors.New("refused") // released as a Failure, then retried
+		}
+		kept = l.Take()
+		return false, nil
+	})
+	fmt.Println(err, req.Tried(), kept.Backend() != nil)
+	kept.Release(upstream.Success)
+	// Output:
+	// <nil> 2 true
 }
 
 func ExampleLease_Report() {

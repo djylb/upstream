@@ -12,6 +12,16 @@ type Candidate struct {
 	// balancers read it; nil means no load information, read as zero.
 	InFlight *atomic.Int64
 
+	// Latency is the backend's moving average latency in nanoseconds, as
+	// reported with Lease.Observe; zero means no sample yet, and nil no
+	// latency information. Latency-aware balancers read it at pick time.
+	Latency *atomic.Int64
+
+	// Meta is whatever the caller attaches to the candidate. A Pool sets
+	// it to the *Backend[T], so that a balancer can route by the
+	// backend's value, such as its zone or labels, or by its Status.
+	Meta any
+
 	// ID identifies the backend. Consistent hashing places backends by ID,
 	// so equal IDs map keys to the same place in every process.
 	ID string
@@ -25,9 +35,14 @@ func (c *Candidate) weight() int64 {
 }
 
 // A Balancer builds Pickers for sets of candidates. A Pool calls Build
-// whenever the set of backends that may receive traffic changes, never
-// while holding a lock, and keeps using the previous Picker until Build
-// returns.
+// when its routing view changes: when members join, leave or change
+// weight, go down or come back, are ejected or restored, and at the steps
+// of a slow start. Calls never overlap for one pool and never happen
+// while the pool holds a lock; picks use the previous Picker until Build
+// returns. If Build or Rebuild panics, the pool recovers, keeps the
+// previous Picker, reports an [EventBalancerPanic] and calls the Balancer
+// again on its next change. A Balancer that can update a Picker more cheaply than it builds
+// one also implements Rebuilder.
 //
 // Balancers can be used without a Pool: build a Picker from candidates and
 // call Pick.
@@ -35,6 +50,21 @@ type Balancer interface {
 	// Build returns a Picker for candidates, which is never empty. The
 	// Picker may keep the slice; the caller does not modify it afterwards.
 	Build(candidates []Candidate) Picker
+}
+
+// A Rebuilder is a Balancer that derives a Picker from the previous one,
+// for balancers whose Build is expensive, such as hash rings. A Pool calls
+// Rebuild instead of Build when it has a Picker that the same Balancer
+// built. The result must be what Build would return for candidates;
+// Rebuild only saves work, such as by keeping the parts of prev whose
+// candidates did not change.
+type Rebuilder interface {
+	Balancer
+
+	// Rebuild returns a Picker for candidates, which is never empty. prev
+	// was returned by Build or Rebuild of this Balancer and may still be
+	// in use by picks: Rebuild must not modify it.
+	Rebuild(prev Picker, candidates []Candidate) Picker
 }
 
 // A Picker chooses among the candidates it was built from. It must be safe

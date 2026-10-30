@@ -3,6 +3,8 @@ package fakeclock
 
 import (
 	"cmp"
+	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
@@ -57,6 +59,66 @@ func (c *Clock) AfterFunc(d time.Duration, f func()) func() bool {
 		}
 		c.timers = slices.Delete(c.timers, i, i+1)
 		return true
+	}
+}
+
+// WithTimeout returns a copy of ctx whose Deadline is the clock's time
+// plus d, or the parent's deadline if that is sooner, and that is canceled
+// with context.DeadlineExceeded once Advance reaches it.
+func (c *Clock) WithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	inner, cancel := context.WithCancelCause(parent)
+	t := &timeoutCtx{Context: inner, deadline: c.Now().Add(d), done: make(chan struct{})}
+	if pd, ok := parent.Deadline(); ok && pd.Before(t.deadline) {
+		t.deadline = pd
+	}
+	stopWatch := context.AfterFunc(inner, t.finish)
+	stopTimer := c.AfterFunc(d, func() {
+		cancel(context.DeadlineExceeded)
+		t.finish()
+	})
+	return t, func() {
+		stopTimer()
+		cancel(context.Canceled)
+		stopWatch()
+		t.finish()
+	}
+}
+
+// timeoutCtx is the context of Clock.WithTimeout. It has its own Done
+// channel, so that contexts derived from it take their error from Err,
+// which reports context.DeadlineExceeded rather than context.Canceled when
+// the fake deadline passed. Cause comes from the inner context.
+type timeoutCtx struct {
+	context.Context // inner, canceled with the cause
+	deadline        time.Time
+	once            sync.Once
+	done            chan struct{}
+	err             error
+}
+
+func (t *timeoutCtx) finish() {
+	t.once.Do(func() {
+		t.err = t.Context.Err()
+		if errors.Is(context.Cause(t.Context), context.DeadlineExceeded) {
+			t.err = context.DeadlineExceeded
+		}
+		close(t.done)
+	})
+}
+
+func (t *timeoutCtx) Deadline() (time.Time, bool) { return t.deadline, true }
+
+func (t *timeoutCtx) Done() <-chan struct{} { return t.done }
+
+func (t *timeoutCtx) Err() error {
+	if t.Context.Err() != nil {
+		t.finish()
+	}
+	select {
+	case <-t.done:
+		return t.err
+	default:
+		return nil
 	}
 }
 

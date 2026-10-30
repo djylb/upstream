@@ -55,7 +55,7 @@ func (o *Outcome) UnmarshalText(b []byte) (err error) {
 //
 //goland:noinspection GoMixedReceiverTypes
 func (k *EventKind) UnmarshalText(b []byte) (err error) {
-	*k, err = parseName(string(b), EventStateChanged+1, "event kind")
+	*k, err = parseName(string(b), EventBalancerPanic+1, "event kind")
 	return err
 }
 

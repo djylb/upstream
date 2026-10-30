@@ -8,6 +8,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/djylb/upstream"
 )
 
 // TCPOptions configure the TCP check.
@@ -25,36 +27,50 @@ type TCPOptions struct {
 	// targets are checked often, but the target may log an aborted
 	// connection.
 	Reset bool
+
+	// Clock measures Latency. Nil means upstream.SystemClock. A Checker
+	// passes its own Clock to the TCP check it uses for targets without a
+	// Probe, replacing this field.
+	Clock upstream.Clock
 }
 
 // TCP returns the TCP check: it connects to the target's address and
 // closes the connection as soon as it is established, without writing or
-// reading anything. The check passes if the connection is established.
+// reading anything. The check passes if the connection is established; it
+// fails with upstream.ErrNoAddress for a target without an address, such
+// as a backend whose value is a nil Addresser.
 // Host names are resolved by each check; when a name has several
 // addresses, they are tried as net.Dialer does, and the Observation names
 // the one that answered.
 func TCP(o TCPOptions) Probe {
+	clock := o.Clock
+	if clock == nil {
+		clock = upstream.SystemClock()
+	}
 	return func(ctx context.Context, t Target) (Observation, error) {
-		network := t.Network
-		if network == "" {
-			network = "tcp"
+		if t.Address == "" {
+			return Observation{}, upstream.ErrNoAddress
 		}
+		network := normNetwork(t.Network)
 		var (
 			conn net.Conn
 			err  error
 			obs  Observation
 		)
-		begin := time.Now()
+		begin := clock.Now()
 		switch {
 		case o.Dial != nil:
 			conn, err = o.Dial(ctx, network, t.Address)
-			obs.Latency = time.Since(begin)
-			if err == nil && conn == nil {
+			obs.Latency = clock.Now().Sub(begin)
+			switch {
+			case err != nil && conn != nil:
+				_ = conn.Close()
+			case err == nil && conn == nil:
 				err = errNoConn
 			}
 		case !controlHooks:
 			conn, err = new(net.Dialer).DialContext(ctx, network, t.Address)
-			obs.Latency = time.Since(begin)
+			obs.Latency = clock.Now().Sub(begin)
 		default:
 			// Record when each connection attempt starts so that the
 			// latency excludes name resolution and failed attempts.
@@ -62,12 +78,12 @@ func TCP(o TCPOptions) Probe {
 			starts := make(map[string]time.Time, 2)
 			d := net.Dialer{ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
 				mu.Lock()
-				starts[address] = time.Now()
+				starts[address] = clock.Now()
 				mu.Unlock()
 				return nil
 			}}
 			conn, err = d.DialContext(ctx, network, t.Address)
-			end := time.Now()
+			end := clock.Now()
 			start := begin
 			if err == nil {
 				mu.Lock()
@@ -106,9 +122,17 @@ func addrString(a net.Addr) string {
 // simulated networks of js and wasip1 refuse sockets that have one.
 const controlHooks = runtime.GOOS != "js" && runtime.GOOS != "wasip1"
 
+// normNetwork returns the network that an empty one stands for.
+func normNetwork(network string) string {
+	if network == "" {
+		return "tcp"
+	}
+	return network
+}
+
 func isTCP(network string) bool {
 	switch network {
-	case "", "tcp", "tcp4", "tcp6":
+	case "tcp", "tcp4", "tcp6":
 		return true
 	}
 	return false

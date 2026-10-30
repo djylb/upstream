@@ -209,11 +209,11 @@ func TestOutlierDisabledAndClosed(t *testing.T) {
 }
 
 func TestBackoffBounds(t *testing.T) {
-	p := newOutlierParams(OutlierConfig{BaseEjection: 3 * time.Second, MaxEjection: time.Second}, nil)
+	p := newOutlierParams(OutlierConfig{BaseEjection: 3 * time.Second, MaxEjection: time.Second}, nil, time.Time{})
 	if p.max != 3*time.Second || p.backoff(0) != 3*time.Second || p.backoff(5) != 3*time.Second {
 		t.Fatalf("max below base not raised: %v", p.max)
 	}
-	p = newOutlierParams(OutlierConfig{BaseEjection: time.Nanosecond, MaxEjection: time.Duration(1<<63 - 1)}, nil)
+	p = newOutlierParams(OutlierConfig{BaseEjection: time.Nanosecond, MaxEjection: time.Duration(1<<63 - 1)}, nil, time.Time{})
 	for _, level := range []uint{0, 1, 30, 61, 62, 63, 1000} {
 		if b := p.backoff(level); b <= 0 || b > p.max {
 			t.Fatalf("backoff(%d) = %v", level, b)
@@ -314,4 +314,49 @@ func TestPoolCloseStopsTimers(t *testing.T) {
 			t.Fatal("Close left the timer")
 		}
 	})
+}
+
+func TestTrialsBelongToTheirPeriod(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second, HalfOpenRequests: 2, HalfOpenSuccesses: 2}, clk, nil)
+		defer d.Close()
+		fail(t, d, 1)
+		clk.Advance(time.Second)
+		synctest.Wait()
+		stale, _ := d.Admit()
+		bad, _ := d.Admit()
+		d.Record(bad, Failure) // ejected again; stale is still in flight
+		clk.Advance(time.Hour)
+		synctest.Wait()
+		if d.State() != OutlierHalfOpen {
+			t.Fatal("not half-open")
+		}
+		// The stale trial neither holds a slot nor counts as a success.
+		t1, ok1 := d.Admit()
+		t2, ok2 := d.Admit()
+		if !ok1 || !ok2 {
+			t.Fatal("slots of the new period taken by an old trial")
+		}
+		d.Record(stale, Success)
+		d.Record(t1, Success)
+		if d.State() != OutlierHalfOpen {
+			t.Fatal("recovered with one successful trial of this period")
+		}
+		d.Record(t2, Success)
+		if d.State() != OutlierOK {
+			t.Fatalf("state %v after two successful trials", d.State())
+		}
+	})
+}
+
+func TestWindowNeverMovesBack(t *testing.T) {
+	var w window
+	size := 10 * time.Second
+	w.add(65*time.Second, size, windowTotal|windowPart)
+	w.add(55*time.Second, size, windowTotal|windowPart) // a late writer with an older time
+	total, failed := w.add(66*time.Second, size, windowTotal)
+	if total < 3 || failed < 2 {
+		t.Fatalf("window lost counts: %v requests, %v failures", total, failed)
+	}
 }

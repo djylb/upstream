@@ -222,12 +222,12 @@ func TestAttachNilTarget(t *testing.T) {
 	})
 	ints := upstream.New[int](upstream.Config{})
 	defer ints.Close()
-	if _, err := Watch(t.Context(), ints, nil, Config[string]{}); !errors.Is(err, ErrNoTarget) {
+	if _, err := Watch(t.Context(), ints, nil, Config[string]{}); !errors.Is(err, upstream.ErrNoAddress) {
 		t.Fatalf("Watch of ints without a target: %v", err)
 	}
 	c := New[string, int](t.Context(), Config[string]{})
 	defer c.Close()
-	if _, err := Attach(c, 1, ints, nil); !errors.Is(err, ErrNoTarget) {
+	if _, err := Attach(c, 1, ints, nil); !errors.Is(err, upstream.ErrNoAddress) {
 		t.Fatalf("Attach of ints without a target: %v", err)
 	}
 }
@@ -339,3 +339,184 @@ func TestAttachKeysByAddress(t *testing.T) {
 		}
 	})
 }
+
+// Pool 1 has "x" at address "old" (down). Pool 2 then gives "x" another
+// address. Pool 1's member never hears again, and stays down.
+func TestAttachSharedIDDivergentTargets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		sw := newSwitchable()
+		sw.set("old", true)
+		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1, Rise: 1, Fall: 1}})
+		defer c.Close()
+		p1 := newPool(t, upstream.Target[string]{ID: "x", Value: "old"}, upstream.Target[string]{ID: "y", Value: "y"})
+		target := func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) }
+		mustAttach(t, c, 1, p1, target)
+		synctest.Wait()
+		if healthOf(t, p1, "x") != down {
+			t.Fatalf("setup: %v", healthOf(t, p1, "x"))
+		}
+		p2 := newPool(t, upstream.Target[string]{ID: "x", Value: "new"})
+		mustAttach(t, c, 2, p2, target)
+		synctest.Wait()
+		sw.set("old", false)
+		for range 5 {
+			clk.Advance(time.Second)
+			synctest.Wait()
+		}
+		if h := healthOf(t, p1, "x"); h == down {
+			t.Fatalf("pool 1 member stuck %v; checks of old %d", h, sw.count("old"))
+		}
+	})
+}
+
+// A pool attached after the shared key's first check gets no verdict until
+// the next interval.
+func TestLateAttachTakesVerdict(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		sw := newSwitchable()
+		sw.set("s", true)
+		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Hour, Jitter: -1, Rise: 1, Fall: 1}})
+		defer c.Close()
+		target := func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) }
+		p1 := newPool(t, upstream.Target[string]{ID: "s", Value: "s"})
+		mustAttach(t, c, 1, p1, target)
+		synctest.Wait()
+		p2 := newPool(t, upstream.Target[string]{ID: "s", Value: "s"})
+		mustAttach(t, c, 2, p2, target)
+		synctest.Wait()
+		if healthOf(t, p1, "s") != down || healthOf(t, p2, "s") != down {
+			t.Fatalf("p1 %v p2 %v", healthOf(t, p1, "s"), healthOf(t, p2, "s"))
+		}
+	})
+}
+
+func TestWatchEndsWithPool(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := upstream.New[string](upstream.Config{})
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "a"}}); err != nil {
+			t.Fatal(err)
+		}
+		sw := newSwitchable()
+		clk := fakeclock.New()
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+			Config[string]{Clock: clk})
+		synctest.Wait()
+		p.Close()
+		<-c.Done()
+		if len(c.Statuses()) != 0 || clk.Pending() != 0 {
+			t.Fatalf("checker of a closed pool: %d targets, %d timers", len(c.Statuses()), clk.Pending())
+		}
+	})
+}
+
+func TestWatchMatchesGenerations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := upstream.New[string](upstream.Config{})
+		defer p.Close()
+		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "x"}}); err != nil {
+			t.Fatal(err)
+		}
+		sw := newSwitchable()
+		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+			Config[string]{Clock: fakeclock.New()})
+		defer c.Close()
+		synctest.Wait()
+		old, _ := c.Status("a")
+		// Remove and re-add with the same address: a new generation.
+		p.Remove("a")
+		if err := p.Put(upstream.Target[string]{ID: "a", Value: "x"}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		cur, _ := c.Status("a")
+		if cur.Generation == old.Generation {
+			t.Fatal("re-added member kept its generation")
+		}
+		c.c.mu.Lock()
+		sink := c.c.sinks[0].fn
+		c.c.mu.Unlock()
+		sink(Report[string]{Result: Result{Health: down, Previous: up}, Key: "a", Target: old.Target, Generation: old.Generation})
+		if b, _ := p.Backend("a"); b.Status().Health == down {
+			t.Fatal("a report of the old generation reached the re-added member")
+		}
+	})
+}
+
+// TestAttachNetworkSpellings checks that pools that write the network of
+// one address as "" and as "tcp" share one generation, so that neither
+// pool's reports are dropped as stale: the member of the pool that was
+// down before the other attached recovers with the address.
+func TestAttachNetworkSpellings(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		sw := newSwitchable()
+		sw.set("x", true)
+		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1, Rise: 1, Fall: 1}})
+		defer c.Close()
+		pa := newPool(t, upstream.Target[string]{ID: "a", Value: "x"})
+		pb := newPool(t, upstream.Target[string]{ID: "b", Value: "x"})
+		mustAttach(t, c, 2, pb, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) })
+		synctest.Wait()
+		if healthOf(t, pb, "b") != down {
+			t.Fatal("b is not down")
+		}
+		mustAttach(t, c, 1, pa, func(b *upstream.Backend[string]) Target {
+			t := sw.target(b.Value())
+			t.Network = "tcp"
+			return t
+		})
+		synctest.Wait()
+		_ = pa.Put(upstream.Target[string]{ID: "a", Value: "x", Weight: 2}) // another AddToGroup
+		synctest.Wait()
+		sw.set("x", false)
+		clk.Advance(time.Second)
+		synctest.Wait()
+		s, _ := c.Status("x")
+		if s.Generation != 1 || healthOf(t, pa, "a") != up || healthOf(t, pb, "b") != up {
+			t.Fatalf("generation %d, health a %v, b %v", s.Generation, healthOf(t, pa, "a"), healthOf(t, pb, "b"))
+		}
+		if _, err := pb.Pick(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestAttachClosed checks that Attach reports a closed Checker or pool
+// instead of returning a detach function that does nothing.
+func TestAttachClosed(t *testing.T) {
+	c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+	p := newPool(t)
+	c.Close()
+	if _, err := Attach(c, 1, p, nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Attach to a closed checker = %v", err)
+	}
+	c = New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+	defer c.Close()
+	p.Close()
+	if _, err := Attach(c, 1, p, nil); !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("Attach of a closed pool = %v", err)
+	}
+}
+
+// TestAttachAddresser checks that a pool of values with an Address method
+// is checked without a target function.
+func TestAttachAddresser(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New(), Options: Options{Disabled: true}})
+		defer c.Close()
+		p := upstream.New[zoned](upstream.Config{})
+		defer p.Close()
+		_ = p.Put(upstream.Target[zoned]{ID: "a", Value: zoned{addr: "10.0.0.1:80", zone: "z1"}})
+		mustAttach(t, c, 1, p, nil)
+		synctest.Wait()
+		if keys := c.GroupKeys(1); !slices.Equal(keys, []string{"10.0.0.1:80"}) {
+			t.Fatalf("keys %v", keys)
+		}
+	})
+}
+
+type zoned struct{ addr, zone string }
+
+func (z zoned) Address() string { return z.addr }

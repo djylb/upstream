@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,7 +20,7 @@ func TestAttemptsAreDistinct(t *testing.T) {
 	for name, bal := range testBalancers() {
 		t.Run(name, func(t *testing.T) {
 			p := newTestPool(t, Config{Balancer: bal, Retry: RetryConfig{Attempts: 10}}, "a", "b", "c", "d")
-			a := p.Attempts("client")
+			a := p.Request("client")
 			var seen []string
 			for {
 				l, err := a.Next()
@@ -32,7 +34,7 @@ func TestAttemptsAreDistinct(t *testing.T) {
 				l.Release(Failure)
 			}
 			slices.Sort(seen)
-			if !slices.Equal(seen, []string{"a", "b", "c", "d"}) || a.Count() != 4 {
+			if !slices.Equal(seen, []string{"a", "b", "c", "d"}) || a.Tried() != 4 {
 				t.Fatalf("attempts visited %v", seen)
 			}
 		})
@@ -41,7 +43,7 @@ func TestAttemptsAreDistinct(t *testing.T) {
 
 func TestAttemptsLimit(t *testing.T) {
 	p := newTestPool(t, Config{Retry: RetryConfig{Attempts: 2}}, "a", "b", "c")
-	a := p.Attempts("")
+	a := p.Request("")
 	for range 2 {
 		l, err := a.Next()
 		if err != nil {
@@ -54,7 +56,7 @@ func TestAttemptsLimit(t *testing.T) {
 	}
 	// Without a RetryConfig there are no retries.
 	q := newTestPool(t, Config{}, "a", "b")
-	b := q.Attempts("")
+	b := q.Request("")
 	l, _ := b.Next()
 	l.Release(Failure)
 	if _, err := b.Next(); !errors.Is(err, ErrRetryLimit) {
@@ -68,7 +70,7 @@ func TestAttemptsManyTries(t *testing.T) {
 		ids[i] = strconv.Itoa(i)
 	}
 	p := newTestPool(t, Config{Balancer: Failover(), Retry: RetryConfig{Attempts: 100}}, ids...)
-	a := p.Attempts("")
+	a := p.Request("")
 	for i := range ids {
 		l, err := a.Next()
 		if err != nil {
@@ -86,7 +88,7 @@ func TestRetryBudget(t *testing.T) {
 	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Attempts: 3, Budget: 0.5, MinRetries: -1}}, "a", "b", "c")
 	retries := 0
 	for range 10 {
-		a := p.Attempts("")
+		a := p.Request("")
 		l, err := a.Next()
 		if err != nil {
 			t.Fatal(err)
@@ -112,7 +114,7 @@ func TestRetryBudget(t *testing.T) {
 	l, _ := p.Pick()
 	l.Release(Success)
 	_ = p.Do(context.Background(), func(*Backend[string]) error { return nil }) // a request
-	a := p.Attempts("")
+	a := p.Request("")
 	l, _ = a.Next()
 	l.Release(Failure)
 	if l, err := a.Next(); err != nil {
@@ -126,7 +128,7 @@ func TestRetryBudgetMinimum(t *testing.T) {
 	p := newTestPool(t, Config{Clock: fakeclock.New(), Retry: RetryConfig{Attempts: 2, Budget: 0.01}}, "a", "b")
 	n := 0
 	for range 20 {
-		a := p.Attempts("")
+		a := p.Request("")
 		l, _ := a.Next()
 		l.Release(Failure)
 		if l, err := a.Next(); err == nil {
@@ -198,10 +200,10 @@ func TestDoRetries(t *testing.T) {
 	}
 }
 
-func TestAttemptsDoNotAllocate(t *testing.T) {
+func TestRequestDoesNotAllocate(t *testing.T) {
 	p := newTestPool(t, Config{Balancer: ConsistentHash(HashConfig{}), Retry: RetryConfig{Attempts: 4, Budget: 100}}, "a", "b", "c", "d", "e")
 	allocs := testing.AllocsPerRun(1000, func() {
-		a := p.Attempts("client")
+		a := p.Request("client")
 		for range 4 {
 			l, err := a.Next()
 			if err != nil {
@@ -378,9 +380,9 @@ func TestWithOutcome(t *testing.T) {
 	}
 }
 
-// FuzzAttempts checks that retries visit every member exactly once, for
+// FuzzRequest checks that retries visit every member exactly once, for
 // every balancer, before reporting that none is left.
-func FuzzAttempts(f *testing.F) {
+func FuzzRequest(f *testing.F) {
 	f.Add([]byte{1, 2, 3}, "k", uint8(0))
 	f.Add([]byte{0, 255, 9, 9, 1, 1}, "", uint8(7))
 	balancers := []Balancer{RoundRobin(), WeightedRoundRobin(), Random(), PowerOfTwo(), LeastConn(), Failover(),
@@ -398,7 +400,7 @@ func FuzzAttempts(f *testing.F) {
 		if err := p.Sync(ts); err != nil {
 			t.Fatal(err)
 		}
-		a := p.Attempts(key)
+		a := p.Request(key)
 		seen := make(map[string]bool, len(weights))
 		var held []Lease[string]
 		for {
@@ -423,4 +425,79 @@ func FuzzAttempts(f *testing.F) {
 			held[i].Release(Failure)
 		}
 	})
+}
+
+func TestBudgetOvershoot(t *testing.T) {
+	p := New[string](Config{Retry: RetryConfig{Attempts: 2, Budget: 1e-9, MinRetries: 1}})
+	defer p.Close()
+	var ts []Target[string]
+	for i := range 4 {
+		ts = append(ts, Target[string]{ID: string('a' + rune(i))})
+	}
+	_ = p.Sync(ts)
+	const n = 64
+	var granted atomic.Int32
+	var start, wg sync.WaitGroup
+	start.Add(1)
+	for range n {
+		wg.Go(func() {
+			a := p.Request("")
+			l, err := a.Next()
+			if err != nil {
+				return
+			}
+			l.Release(Failure)
+			start.Wait()
+			if l2, err := a.Next(); err == nil {
+				granted.Add(1)
+				l2.Release(Success)
+			}
+		})
+	}
+	start.Done()
+	wg.Wait()
+	if g := granted.Load(); g > 1 {
+		t.Fatalf("budget of 1 retry granted %d", g)
+	}
+}
+
+func TestDoWithoutKeyDoesNotAllocate(t *testing.T) {
+	p := New[string](Config{Retry: RetryConfig{Attempts: 3, Budget: 0.5}})
+	defer p.Close()
+	_ = p.Sync([]Target[string]{{ID: "a"}, {ID: "b"}, {ID: "c"}})
+	n := testing.AllocsPerRun(1000, func() {
+		a := p.Request("k")
+		l, _ := a.Next()
+		l.Release(Failure)
+		l, _ = a.Next()
+		l.Release(Success)
+	})
+	fn := func(*Backend[string]) error { return nil }
+	m := testing.AllocsPerRun(1000, func() { _ = p.Do(context.Background(), fn) })
+	t.Logf("attempts %v, do %v", n, m)
+	if n != 0 || m != 0 {
+		t.Fatalf("allocs attempts %v do %v", n, m)
+	}
+}
+
+// TestDoNeverReturnsNilOnFailure checks that Do reports an error when fn
+// asks for a retry without an error and none can be made.
+func TestDoNeverReturnsNilOnFailure(t *testing.T) {
+	p := newTestPool(t, Config{Retry: RetryConfig{Attempts: 1}}, "a", "b")
+	r0 := p.Request("")
+	err := r0.Do(context.Background(), func(*Lease[string]) (bool, error) { return true, nil })
+	if !errors.Is(err, ErrRetryLimit) {
+		t.Fatalf("Do = %v, want ErrRetryLimit", err)
+	}
+	r := p.Request("")
+	l, err := r.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Release(Success)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.Do(ctx, func(*Lease[string]) (bool, error) { return false, nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Do after Next with a done ctx = %v", err)
+	}
 }

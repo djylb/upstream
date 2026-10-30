@@ -1,12 +1,14 @@
 package upstream
 
+import "time"
+
 // A Lease is a backend picked for one request or connection. It holds one
 // of the backend's in-flight slots until Release returns it with the
 // request's outcome.
 //
 // Every lease returned without error must be released exactly once, or the
 // backend's in-flight count stays raised and a drain never completes;
-// Pool.Do and Pool.DoKey do this for the caller. Release zeroes the lease,
+// Pool.Do, Pool.DoKey and Request.Do do this for the caller. Release zeroes the lease,
 // so releasing the same variable again does nothing. Copies of a lease
 // share one slot: release only one of them. Making every copy idempotent
 // would need state shared by the copies, one allocation per pick, so the
@@ -66,12 +68,23 @@ func (l *Lease[T]) Release(o Outcome) {
 	b.core.release(t, o)
 }
 
-// run calls fn with the leased backend and releases the lease with the
-// outcome of fn's error, or with Failure if fn panics.
-func (l *Lease[T]) run(fn func(*Backend[T]) error) (err error) {
-	o := Failure
-	defer func() { l.Release(o) }()
-	err = fn(l.b)
-	o = OutcomeOf(err)
-	return err
+// Observe records a latency sample of the backend, such as the time to a
+// response's first byte or to an established connection, for latency-aware
+// balancers: it feeds the moving average that Candidate.Latency,
+// Backend.Latency and Status.Latency report. Observe may be called any
+// number of times before Release, and does nothing on a released or zero
+// Lease.
+func (l *Lease[T]) Observe(d time.Duration) {
+	if l.b != nil {
+		l.b.core.observe(d)
+	}
+}
+
+// Take returns the lease and leaves l zero, handing the lease to a new
+// owner, such as a connection that releases it when closed. Releasing l
+// afterwards does nothing.
+func (l *Lease[T]) Take() Lease[T] {
+	t := *l
+	*l = Lease[T]{}
+	return t
 }

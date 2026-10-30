@@ -356,3 +356,46 @@ func TestBoundedHashAttemptsAreDistinct(t *testing.T) {
 		c[owner].InFlight.Store(0)
 	}
 }
+
+// TestConsistentHashRebuildMatchesBuild checks that updating a ring gives
+// the ring that building it again would, as members come, go and change
+// weight.
+func TestConsistentHashRebuildMatchesBuild(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	for _, cfg := range []HashConfig{{}, {VirtualNodes: 7}} {
+		bal := ConsistentHash(cfg).(Rebuilder)
+		var cands []Candidate
+		for i := range 40 {
+			cands = append(cands, Candidate{ID: "c" + strconv.Itoa(i), Weight: 1})
+		}
+		prev := bal.Build(cands)
+		next := 40
+		for step := range 200 {
+			cands = slices.Clone(cands)
+			switch k := r.IntN(len(cands)); r.IntN(4) {
+			case 0:
+				if len(cands) > 1 {
+					cands = slices.Delete(cands, k, k+1)
+				}
+			case 1:
+				cands = slices.Insert(cands, k, Candidate{ID: "c" + strconv.Itoa(next), Weight: 1})
+				next++
+			case 2:
+				cands[k].Weight = 1 + r.IntN(4)
+			case 3:
+				r.Shuffle(len(cands), func(i, j int) { cands[i], cands[j] = cands[j], cands[i] })
+			}
+			got := bal.Rebuild(prev, cands).(*ringPicker)
+			want := bal.Build(cands).(*ringPicker)
+			if !slices.Equal(got.hashes, want.hashes) || !slices.Equal(got.owners, want.owners) || !slices.Equal(got.counts, want.counts) {
+				t.Fatalf("%+v step %d: rebuilt ring differs", cfg, step)
+			}
+			prev = got
+		}
+	}
+	// A Picker of another balancer is built afresh.
+	c := candidates(1, 1)
+	if _, ok := ConsistentHash(HashConfig{}).(Rebuilder).Rebuild(RoundRobin().Build(c), c).(*ringPicker); !ok {
+		t.Fatal("foreign picker")
+	}
+}

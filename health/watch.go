@@ -8,16 +8,16 @@ import (
 	"github.com/djylb/upstream"
 )
 
-// ErrNoTarget means Attach or Watch got no target function for a pool
-// whose values are not strings.
-var ErrNoTarget = errors.New("health: target is nil and the backend values are not strings")
+// ErrClosed means Attach was given a closed Checker.
+var ErrClosed = errors.New("health: checker closed")
 
 // Attach makes group g of c follow the membership of pool: every member is
 // checked with the Target that target returns for it, and every result is
 // reported to the pool with Pool.ReportCheck, which takes members out of
-// rotation while they are down. A nil target checks each member's value as
-// a TCP address; that needs a pool of strings, and Attach returns
-// ErrNoTarget for other pools.
+// rotation while they are down. A nil target checks each member's address,
+// as upstream.AddressOf finds it, over TCP; for a pool whose values have
+// no address, Attach returns upstream.ErrNoAddress. Attach returns
+// ErrClosed if c is closed and upstream.ErrClosed if pool is.
 //
 // The Checker holds the targets under their address, written as
 // TargetKey writes it, so that several pools attached to one Checker under
@@ -30,7 +30,10 @@ var ErrNoTarget = errors.New("health: target is nil and the backend values are n
 //
 // Reports are matched to members by generation: a report about a target
 // that has since been removed and added again never reaches the new
-// members. The pool owns group g; do not change the group by other means.
+// members, and a report of a newer generation than the attachment has
+// seen, which another pool sharing the address started, replaces the
+// generation it knows. The pool owns group g; do not change the group by
+// other means.
 //
 // The attachment ends when detach is called, when the pool closes or when
 // the Checker closes; detach is idempotent and safe to call from any
@@ -41,33 +44,40 @@ var ErrNoTarget = errors.New("health: target is nil and the backend values are n
 func Attach[G comparable, T any](c *Checker[string, G], g G, pool *upstream.Pool[T], target func(*upstream.Backend[T]) Target) (detach func(), err error) {
 	if target == nil {
 		if target = addressTarget[T](); target == nil {
-			return nil, ErrNoTarget
+			return nil, upstream.ErrNoAddress
 		}
 	}
+	select {
+	case <-pool.Done():
+		return nil, upstream.ErrClosed
+	default:
+	}
 	a := newAttachment(c, g, pool, target, func(_ string, t Target) string { return TargetKey(t) })
-	return a.start(), nil
+	if !a.start() {
+		return nil, ErrClosed
+	}
+	return a.detach, nil
 }
 
 // TargetKey returns the key under which Attach holds t in a Checker: its
 // address, preceded by its network and a slash unless that is "tcp" or
 // empty, such as "10.0.0.5:22" or "udp/10.0.0.9:53".
 func TargetKey(t Target) string {
-	if t.Network == "" || t.Network == "tcp" {
-		return t.Address
+	if n := normNetwork(t.Network); n != "tcp" {
+		return n + "/" + t.Address
 	}
-	return t.Network + "/" + t.Address
+	return t.Address
 }
 
 // addressTarget returns the target function for a nil target, or nil if
-// the pool's values are not strings.
+// the pool's values have no address.
 func addressTarget[T any]() func(*upstream.Backend[T]) Target {
-	var zero T
-	if _, ok := any(zero).(string); !ok {
+	if !upstream.Addressable[T]() {
 		return nil
 	}
 	return func(b *upstream.Backend[T]) Target {
-		s, _ := any(b.Value()).(string)
-		return Target{Address: s}
+		addr, _ := upstream.AddressOf(b.Value())
+		return Target{Address: addr}
 	}
 }
 
@@ -123,9 +133,11 @@ func newAttachment[G comparable, T any](c *Checker[string, G], g G, pool *upstre
 	return a
 }
 
-func (a *attachment[G, T]) start() func() {
+// start connects the attachment and reports false if the Checker is
+// closed.
+func (a *attachment[G, T]) start() bool {
 	if !a.c.addSink(a.sink) {
-		return func() {}
+		return false
 	}
 	cancel := a.pool.Subscribe(a.onEvent)
 	a.mu.Lock()
@@ -138,8 +150,11 @@ func (a *attachment[G, T]) start() func() {
 		cancel()
 	}
 	go a.wait()
-	return func() { a.end(false) }
+	return true
 }
+
+// detach ends the attachment from the outside.
+func (a *attachment[G, T]) detach() { a.end(false) }
 
 // wait ends the attachment with the pool or the Checker. It runs as one
 // of the Checker's goroutines, announced by addSink.
@@ -212,9 +227,9 @@ func resetHealth[T any](pool *upstream.Pool[T], bs []*upstream.Backend[T]) {
 
 // onEvent follows the pool's membership.
 func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
-	id := ev.Backend.ID()
 	switch ev.Kind {
 	case upstream.EventAdded, upstream.EventUpdated:
+		id := ev.Backend.ID()
 		t := a.target(ev.Backend)
 		key := a.keyOf(id, t)
 		if a.isOff() {
@@ -237,8 +252,8 @@ func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
 			a.keys[key] = ks
 		}
 		ks.ids[id] = struct{}{}
-		fresh := !had || old.key != key || ks.gen != gen
-		ks.gen = gen
+		fresh := !had || old.key != key || gen > ks.gen
+		ks.gen = max(ks.gen, gen)
 		drop := ""
 		if had && old.key != key && a.leaveKeyLocked(id, old.key) {
 			drop = old.key
@@ -255,6 +270,7 @@ func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
 			a.c.replay(key)
 		}
 	case upstream.EventRemoved:
+		id := ev.Backend.ID()
 		a.mu.Lock()
 		m, had := a.members[id]
 		if a.off || !had {
@@ -268,6 +284,9 @@ func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
 			a.c.RemoveFromGroup(a.g, m.key)
 		}
 	case upstream.EventStateChanged:
+		// The Checker set the state; nothing to follow.
+	case upstream.EventBalancerPanic:
+		// Concerns no member; Backend is nil.
 	}
 }
 
@@ -293,15 +312,21 @@ func (a *attachment[G, T]) isOff() bool {
 }
 
 // report passes a report on to the members checked under its key. A
-// report of a generation that onEvent has not recorded yet is dropped:
-// onEvent then asks the Checker to replay the key's current state.
+// report of an older generation than the one recorded is about a target
+// that has since been replaced, and is dropped. A newer one is adopted: the
+// Checker's generations only grow, and with keys that name the address
+// (Attach) or the member (Watch) a newer generation is the same target
+// started again, such as by another pool that shares the address or by a
+// changed network. A member that joins a key gets the key's current state
+// replayed by onEvent.
 func (a *attachment[G, T]) report(r Report[string]) {
 	a.mu.Lock()
 	ks := a.keys[r.Key]
-	if a.off || ks == nil || r.Generation != ks.gen {
+	if a.off || ks == nil || r.Generation < ks.gen {
 		a.mu.Unlock()
 		return
 	}
+	ks.gen = r.Generation
 	bs := a.keyBackendsLocked(ks)
 	a.reporting++
 	a.mu.Unlock()
@@ -312,7 +337,7 @@ func (a *attachment[G, T]) report(r Report[string]) {
 func (a *attachment[G, T]) apply(bs []*upstream.Backend[T], r Report[string]) {
 	defer a.applied()
 	for _, b := range bs {
-		a.pool.ReportCheck(b, r.Health, upstream.CheckResult{Time: r.Time, Err: r.Err, Latency: r.Latency})
+		a.pool.ReportCheck(b, r.Health, r.CheckResult)
 	}
 }
 
@@ -332,9 +357,10 @@ func (a *attachment[G, T]) applied() {
 // describes, and returns it as a Watcher. Unlike Attach, it holds each
 // member under its ID, so cfg's callbacks, which see every report, and
 // the Watcher's methods take member IDs. A nil target checks each member's
-// value as a TCP address; that needs a pool of strings, and Watch returns
-// ErrNoTarget for other pools. The pool then announces health transitions
-// as upstream.EventStateChanged events.
+// address over TCP, as Attach does; for a pool whose values have no
+// address, Watch returns upstream.ErrNoAddress. It returns ctx's error if
+// ctx is done and upstream.ErrClosed if pool is closed. The pool then
+// announces health transitions as upstream.EventStateChanged events.
 //
 // The Watcher belongs to the pool: it closes when the pool closes.
 // Closing it earlier ends its checks and sets the members' health back to
@@ -342,13 +368,25 @@ func (a *attachment[G, T]) applied() {
 func Watch[T any](ctx context.Context, pool *upstream.Pool[T], target func(*upstream.Backend[T]) Target, cfg Config[string]) (*Watcher, error) {
 	if target == nil {
 		if target = addressTarget[T](); target == nil {
-			return nil, ErrNoTarget
+			return nil, upstream.ErrNoAddress
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-pool.Done():
+		return nil, upstream.ErrClosed
+	default:
 	}
 	c := New[string, struct{}](ctx, cfg)
 	a := newAttachment(c, struct{}{}, pool, target, func(id string, _ Target) string { return id })
 	a.onEnd = c.Close
-	a.start()
+	if !a.start() {
+		// ctx ended in between.
+		c.Close()
+		return nil, context.Cause(ctx)
+	}
 	return &Watcher{c: c}, nil
 }
 

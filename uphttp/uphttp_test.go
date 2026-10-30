@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,5 +271,48 @@ func TestTransportCacheRace(t *testing.T) {
 	wg.Wait()
 	if c.Len() > 3 {
 		t.Fatalf("Len %d over capacity", c.Len())
+	}
+}
+
+// The default client clones http.DefaultTransport, whose Proxy is
+// ProxyFromEnvironment: with HTTP_PROXY set, checks go to the proxy and an
+// unreachable backend is reported healthy.
+func TestDefaultClientIgnoresEnvProxy(t *testing.T) {
+	var hits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	probe := Probe(Check{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// 192.0.2.1 is TEST-NET-1: nothing answers there.
+	_, err := probe(ctx, health.Target{Address: "192.0.2.1:9"})
+	if err == nil || hits.Load() > 0 {
+		t.Fatalf("check of an unreachable backend went through the proxy: err=%v proxyHits=%d", err, hits.Load())
+	}
+}
+
+// TestCheckServerName checks the TLS server name of the default client.
+func TestCheckServerName(t *testing.T) {
+	for _, tc := range []struct {
+		c    Check
+		want string
+	}{
+		{Check{}, ""},
+		{Check{Host: "svc.example"}, "svc.example"},
+		{Check{Host: "svc.example:8443"}, "svc.example"},
+		{Check{Host: "svc.example", ServerName: "tls.example"}, "tls.example"},
+	} {
+		tr := defaultClient(serverName(tc.c)).Transport.(*http.Transport)
+		got := ""
+		if tr.TLSClientConfig != nil {
+			got = tr.TLSClientConfig.ServerName
+		}
+		if got != tc.want {
+			t.Errorf("%+v: server name %q, want %q", tc.c, got, tc.want)
+		}
 	}
 }

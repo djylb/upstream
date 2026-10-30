@@ -31,7 +31,8 @@ type Target struct {
 	// check at all for other networks.
 	Probe Probe
 
-	// Network is the target's network, as for net.Dial. Empty means "tcp".
+	// Network is the target's network, as for net.Dial. Empty means "tcp":
+	// the Checker treats the two as the same network.
 	Network string
 
 	// Address is the target's address, usually a host and port. A host
@@ -56,7 +57,10 @@ type Options struct {
 	UnhealthyInterval time.Duration
 
 	// Timeout bounds each check. The default is the smaller of 5s and
-	// Interval.
+	// Interval. The probe's context comes from the Checker's
+	// Clock.WithTimeout, so its Deadline reports when the check ends; the
+	// error of a probe that fails after that wraps
+	// context.DeadlineExceeded, so it reads as ReasonTimeout.
 	Timeout time.Duration
 
 	// Jitter changes each interval by a random amount between -Jitter and
@@ -129,13 +133,14 @@ func (o Options) withDefaults() Options {
 // fixed when the Checker is created; SetConfig changes the rest.
 type Config[K comparable] struct {
 	// Clock schedules checks and timestamps results. Nil means
-	// upstream.SystemClock. Check timeouts and the latency the TCP check
-	// measures use real time.
+	// upstream.SystemClock. It is the Checker's only time source: check
+	// timeouts and the latency the default TCP check measures use it too,
+	// whatever TCP.Clock says.
 	Clock upstream.Clock
 
 	// OnResult, if not nil, is called after every check, and when a
 	// target's health becomes upstream.HealthUnknown because its checks
-	// stopped or its address changed.
+	// stopped or its network or address changed.
 	//
 	// All callbacks run one at a time, in the order of the events, on one
 	// goroutine the Checker owns, without any lock held. They may call any
@@ -154,9 +159,12 @@ type Config[K comparable] struct {
 	// change the health: one call per transition.
 	OnChange func(Report[K])
 
-	// OnRemove, if not nil, is called once for every target that leaves the
-	// Checker by Remove, RemoveFromGroup, RemoveGroup or SyncGroup, with its key
-	// and generation. No other callback for that generation follows it.
+	// OnRemove, if not nil, is called once for every generation of a
+	// target that ends: when the target leaves the Checker by Remove,
+	// RemoveFromGroup, RemoveGroup or SyncGroup, and when a change of its
+	// network or address starts a new generation under the same key. It
+	// gets the key and the generation that ended; no other callback for
+	// that generation follows it.
 	OnRemove func(key K, generation uint64)
 
 	// TCP configures the default TCP check.
@@ -209,22 +217,17 @@ const (
 )
 
 // Result is the outcome of one check and the target's health after it.
+//
+// The embedded CheckResult holds what the probe saw, as a pool keeps it:
+// Time is when the check started, Err why it failed, Addr the address
+// that answered, if the probe reported it, and Latency the time the target
+// took to answer; for the default TCP check, the time from starting the
+// connection to the address that answered until it was established,
+// excluding name resolution. Latency has the resolution of the platform's
+// monotonic clock, which is coarse on Windows, so a local target may read
+// as zero.
 type Result struct {
-	// Time is when the check started.
-	Time time.Time
-
-	// Err is why the check failed, or nil.
-	Err error
-
-	// Addr is the address that answered, if the probe reported it.
-	Addr string
-
-	// Latency is the time the target took to answer; for the default TCP
-	// check, the time from starting the connection to the address that
-	// answered until it was established, excluding name resolution. Its
-	// resolution is that of the platform's monotonic clock, which is coarse
-	// on Windows, so a local target may read as zero.
-	Latency time.Duration
+	upstream.CheckResult
 
 	// Reason classifies Err.
 	Reason Reason

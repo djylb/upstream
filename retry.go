@@ -1,12 +1,13 @@
 package upstream
 
 import (
+	"context"
 	"errors"
 	"math"
 	"time"
 )
 
-// Errors returned by Attempts.Next when it declines a retry.
+// Errors returned by Request.Next when it declines a retry.
 var (
 	// ErrRetryLimit means the request has tried RetryConfig.Attempts
 	// backends.
@@ -17,7 +18,7 @@ var (
 )
 
 // RetryConfig configures retries on other backends, by Pool.Do,
-// Pool.DoKey and Attempts. The zero value allows no retries.
+// Pool.DoKey and Request. The zero value allows no retries.
 //
 // A retry budget bounds the extra load that retries put on the backends
 // when many requests fail at once: within any Window, retries may number
@@ -43,6 +44,8 @@ type RetryConfig struct {
 	MinRetries int
 }
 
+// retryParams is a normalized RetryConfig. It is immutable once
+// published; a change publishes a new one.
 type retryParams struct {
 	epoch    time.Time
 	clock    Clock
@@ -52,11 +55,10 @@ type retryParams struct {
 	attempts int
 }
 
-func newRetryParams(c RetryConfig, clock Clock) retryParams {
-	p := retryParams{clock: clock, window: c.Window, attempts: max(c.Attempts, 1)}
+func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
+	p := &retryParams{clock: clock, window: c.Window, attempts: max(c.Attempts, 1), epoch: epoch}
 	if c.Budget > 0 && !math.IsInf(c.Budget, 1) {
 		p.budget = c.Budget
-		p.epoch = clock.Now()
 	}
 	if p.window <= 0 {
 		p.window = 10 * time.Second
@@ -70,17 +72,16 @@ func newRetryParams(c RetryConfig, clock Clock) retryParams {
 	return p
 }
 
-// Attempts picks distinct backends for one request: the first Next is a
+// A Request picks distinct backends for one request: the first Next is a
 // pick like PickKey, and every later Next is a retry that leases a backend
-// this Attempts has not returned before, as the pool's RetryConfig allows.
-// It reads the pool's current routing view on every call, so a retry
-// avoids backends that went down meanwhile.
+// this Request has not returned before, as the pool's RetryConfig allows.
+// It reads the pool's current routing view and retry settings on every
+// call, so a retry avoids backends that went down meanwhile.
 //
-// Pool.Do is Attempts with a function; use Attempts directly when a lease
-// outlives a function call, such as for a connection or a response body.
-// An Attempts is for one goroutine. It does not allocate for up to four
-// attempts.
-type Attempts[T any] struct {
+// Do runs the whole retry loop; Pool.Do is Do with a function of the
+// backend. Use Next directly for loops that Do cannot express. A Request
+// is for one goroutine. It does not allocate for up to four attempts.
+type Request[T any] struct {
 	p     *Pool[T]
 	more  []*core // tried after the first four
 	tried [4]*core
@@ -88,78 +89,131 @@ type Attempts[T any] struct {
 	n     int
 }
 
-// Attempts returns the picker for one request routed by key; an empty key
+// Request returns the picker for one request routed by key; an empty key
 // carries no affinity, as with PickKey.
-func (p *Pool[T]) Attempts(key string) Attempts[T] {
-	return Attempts[T]{p: p, hash: keyHash(key)}
+func (p *Pool[T]) Request(key string) Request[T] {
+	return Request[T]{p: p, hash: keyHash(key)}
 }
 
-// Count returns the number of leases Next has returned.
-func (a *Attempts[T]) Count() int { return a.n }
+// Tried returns the number of leases Next has returned.
+func (r *Request[T]) Tried() int { return r.n }
 
 // Next leases the next backend. The first call fails like PickHash; a
 // retry fails with ErrRetryLimit after RetryConfig.Attempts leases, with
 // ErrRetryBudget when the budget is spent, and with ErrUnavailable when
 // every backend that takes traffic has been tried. Release the previous
 // lease, usually with Failure, before or after calling Next.
-func (a *Attempts[T]) Next() (Lease[T], error) {
-	p := a.p
-	r := &p.retry
+func (r *Request[T]) Next() (Lease[T], error) {
+	p := r.p
+	rp := p.retry.Load()
 	var now time.Duration
-	if a.n > 0 {
-		if a.n >= r.attempts {
+	if rp.budget > 0 {
+		now = rp.clock.Now().Sub(rp.epoch)
+	}
+	if r.n > 0 {
+		if r.n >= rp.attempts {
 			return Lease[T]{}, ErrRetryLimit
 		}
-		if r.budget > 0 {
-			// The retry is counted before the pick, atomically with the
-			// check, so concurrent retries cannot overrun the budget; it is
-			// given back if no backend is left.
-			now = r.clock.Now().Sub(r.epoch)
-			if !p.budget.addPartWithin(now, r.window, r.min, r.budget) {
-				return Lease[T]{}, ErrRetryBudget
-			}
+		// The retry is counted before the pick, atomically with the
+		// check, so concurrent retries cannot overrun the budget; it is
+		// given back if no backend is left.
+		if rp.budget > 0 && !p.budget.addPartWithin(now, rp.window, rp.min, rp.budget) {
+			return Lease[T]{}, ErrRetryBudget
 		}
-	} else if r.budget > 0 {
-		now = r.clock.Now().Sub(r.epoch)
 	}
 	v := p.view.Load()
-	tried := a
-	if a.n == 0 {
+	tried := r
+	if r.n == 0 {
 		tried = nil
 	}
-	var l Lease[T]
-	ok := false
-	if len(v.members) > 0 {
-		l, ok = pickFrom(v, a.hash, tried)
-	}
-	if !ok {
-		if a.n > 0 && r.budget > 0 {
+	l, err := v.pick(r.hash, tried)
+	if err != nil {
+		if r.n > 0 && rp.budget > 0 {
 			p.budget.removePart()
 		}
-		if len(v.members) == 0 {
-			return Lease[T]{}, v.err
-		}
-		return Lease[T]{}, ErrUnavailable
+		return Lease[T]{}, err
 	}
-	if a.n == 0 && r.budget > 0 {
-		p.budget.add(now, r.window, windowTotal)
+	if r.n == 0 && rp.budget > 0 {
+		p.budget.add(now, rp.window, windowTotal)
 	}
-	if a.n < len(a.tried) {
-		a.tried[a.n] = l.b.core
+	if r.n < len(r.tried) {
+		r.tried[r.n] = l.b.core
 	} else {
-		a.more = append(a.more, l.b.core)
+		r.more = append(r.more, l.b.core)
 	}
-	a.n++
+	r.n++
 	return l, nil
 }
 
-func (a *Attempts[T]) has(c *core) bool {
-	for _, t := range a.tried[:min(a.n, len(a.tried))] {
+// Do calls fn with a lease from Next, again with a new lease for as long as
+// fn asks for a retry, ctx is not done and Next allows one. fn owns its
+// lease: it may release it, or hand it on with Lease.Take, as for a
+// connection that outlives fn. A lease fn leaves unreleased is released
+// when fn returns, with OutcomeOf of fn's error, or with Failure if fn
+// panics, in which case the panic goes on.
+//
+// Do returns fn's error once fn asks for no retry. When a retry is
+// declined, it returns fn's last error, or, if that was nil, ctx's error
+// or the pick's; so does it when no lease could be picked at all. Do never
+// returns nil unless fn's last call did.
+func (r *Request[T]) Do(ctx context.Context, fn func(l *Lease[T]) (retry bool, err error)) error {
+	return r.loop(ctx, func(l Lease[T]) (bool, error) { return runLease(&l, fn) })
+}
+
+// loop is Do with fn's lease passed by value, so that callers that do not
+// hand the lease's address to unknown code, such as Pool.DoKey, do not
+// allocate.
+func (r *Request[T]) loop(ctx context.Context, attempt func(Lease[T]) (bool, error)) error {
+	var last error
+	for {
+		if err := ctx.Err(); err != nil {
+			if last != nil {
+				return last
+			}
+			return err
+		}
+		l, err := r.Next()
+		if err != nil {
+			if last != nil {
+				return last
+			}
+			return err
+		}
+		retry, err := attempt(l)
+		if !retry {
+			return err
+		}
+		last = err
+	}
+}
+
+// runLease calls fn and releases the lease if fn left it, with OutcomeOf
+// of fn's error, or with Failure if fn panics.
+func runLease[T any](l *Lease[T], fn func(*Lease[T]) (bool, error)) (retry bool, err error) {
+	o := Failure
+	defer func() { l.Release(o) }()
+	retry, err = fn(l)
+	o = OutcomeOf(err)
+	return retry, err
+}
+
+// runBackend calls fn with the backend of l and releases l with OutcomeOf
+// of fn's error, or with Failure if fn panics.
+func runBackend[T any](l Lease[T], fn func(*Backend[T]) error) (retry bool, err error) {
+	o := Failure
+	defer func() { l.Release(o) }()
+	err = fn(l.b)
+	o = OutcomeOf(err)
+	return o == Failure, err
+}
+
+func (r *Request[T]) has(c *core) bool {
+	for _, t := range r.tried[:min(r.n, len(r.tried))] {
 		if t == c {
 			return true
 		}
 	}
-	for _, t := range a.more {
+	for _, t := range r.more {
 		if t == c {
 			return true
 		}
