@@ -40,13 +40,12 @@ func Example() {
 
 func ExamplePool_Do() {
 	pool := upstream.New[string](upstream.Config{
-		Balancer: upstream.Failover(),
-		Retry:    upstream.RetryConfig{Attempts: 3, Budget: 0.2},
+		Retry: upstream.RetryConfig{Attempts: 3, Budget: 0.2},
 	})
 	defer pool.Close()
 	_ = pool.Sync([]upstream.Target[string]{
 		{ID: "primary", Value: "10.0.0.1:8080"},
-		{ID: "backup", Value: "10.0.0.2:8080"},
+		{ID: "backup", Value: "10.0.0.2:8080", Priority: 1},
 	})
 
 	// Do releases each lease with the outcome of the function's error and
@@ -229,4 +228,54 @@ func ExampleConsistentHash() {
 	backup := ring.Pick(key, 1) // where the key goes if the primary leaves
 	fmt.Println(primary != backup)
 	// Output: true
+}
+
+func ExampleTarget_priority() {
+	// Two primaries share the load; the backup takes traffic when both are
+	// down, and, with Overflow, when both are at their MaxInFlight.
+	pool := upstream.New[string](upstream.Config{Overflow: true})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{
+		{ID: "primary-1", Value: "10.0.0.1:8080", MaxInFlight: 1},
+		{ID: "primary-2", Value: "10.0.0.2:8080", MaxInFlight: 1},
+		{ID: "backup", Value: "10.0.0.9:8080", Priority: 1},
+	})
+
+	var leases []upstream.Lease[string]
+	for range 3 {
+		l, err := pool.Pick()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		leases = append(leases, l)
+	}
+	fmt.Println("third pick:", leases[2].Backend().ID())
+	for i := range leases {
+		leases[i].Release(upstream.Success)
+	}
+	// Output:
+	// third pick: backup
+}
+
+func ExamplePool_MarkOffline() {
+	pool := upstream.New[string](upstream.Config{})
+	defer pool.Close()
+	_ = pool.Sync([]upstream.Target[string]{{ID: "edge-1", Value: "edge-1"}})
+	defer pool.Subscribe(func(ev upstream.Event[string]) {
+		if ev.Kind == upstream.EventStateChanged {
+			fmt.Println(ev.Backend.ID(), ev.From, "->", ev.To, ev.Err)
+		}
+	})()
+
+	// The session the backend is reached through dropped, and came back.
+	b, _ := pool.Backend("edge-1")
+	pool.MarkOffline(b, errors.New("session closed"))
+	_, err := pool.Pick()
+	fmt.Println(err)
+	pool.MarkOnline(b)
+	// Output:
+	// edge-1 healthy -> offline session closed
+	// upstream: no backend available
+	// edge-1 offline -> healthy <nil>
 }

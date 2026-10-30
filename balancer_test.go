@@ -161,15 +161,6 @@ func TestLeastConn(t *testing.T) {
 	}
 }
 
-func TestFailover(t *testing.T) {
-	p := Failover().Build(candidates(1, 1, 1))
-	for attempt, want := range []int{0, 1, 2, 0} {
-		if got := p.Pick(rand.Uint64(), attempt); got != want {
-			t.Fatalf("attempt %d: picked %d, want %d", attempt, got, want)
-		}
-	}
-}
-
 func ringOwners(b Balancer, c []Candidate, keys int) map[int]string {
 	p := b.Build(c)
 	m := make(map[int]string, keys)
@@ -293,7 +284,7 @@ func TestHashStringIsFNV1a(t *testing.T) {
 func FuzzBalancers(f *testing.F) {
 	f.Add([]byte{1, 2, 3}, uint64(7), uint8(0))
 	f.Add([]byte{0, 255, 9, 9}, uint64(0), uint8(3))
-	balancers := []Balancer{RoundRobin(), WeightedRoundRobin(), Random(), PowerOfTwo(), LeastConn(), Failover(),
+	balancers := []Balancer{RoundRobin(), WeightedRoundRobin(), Random(), PowerOfTwo(), LeastConn(),
 		ConsistentHash(HashConfig{VirtualNodes: 8}), ConsistentHash(HashConfig{VirtualNodes: 3, LoadFactor: 1.1})}
 	f.Fuzz(func(t *testing.T, weights []byte, key uint64, attempt uint8) {
 		if len(weights) == 0 || len(weights) > 64 {

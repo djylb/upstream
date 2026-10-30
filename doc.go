@@ -7,7 +7,7 @@
 //
 //   - A [Balancer] builds a [Picker] from [Candidate] values and needs no
 //     pool: [RoundRobin], [WeightedRoundRobin], [Random], [PowerOfTwo],
-//     [LeastConn], [Failover] and [ConsistentHash] (a hash ring with
+//     [LeastConn] and [ConsistentHash] (a hash ring with
 //     optional bounded loads), or any implementation of the interface.
 //     Candidates carry in-flight counts, a moving average latency and the
 //     pool's backend, so custom balancers can route by load, latency or
@@ -42,13 +42,20 @@
 // coalesced. [Pool.SetConfig] changes the balancer, health, retry and
 // fallback settings of a running pool.
 //
+// Target.Priority puts members in tiers: picks go to the most preferred
+// tier with a member that can take them, balanced within it, which makes
+// active-backup pools. Target.MaxInFlight caps a member's leases, and
+// Config.Overflow lets picks go on to the next tier when a tier is full.
+//
 // # Health
 //
-// A backend is eligible when it is not draining, not reported unhealthy by
-// active checks and not ejected by passive checks. A half-open backend
-// takes up to OutlierConfig.HalfOpenRequests trial requests at a time.
-// When no backend is eligible, Pick fails with [ErrUnavailable], or, with
-// [FallbackAll], picks among all members that are not draining; panic
+// A backend is eligible when it is not draining, not marked offline with
+// [Pool.MarkOffline], not reported unhealthy by active checks and not
+// ejected by passive checks; each of these vetoes picks on its own. A
+// half-open backend takes up to OutlierConfig.HalfOpenRequests trial
+// requests at a time. When no backend is eligible, Pick fails with
+// [ErrUnavailable], or, with [FallbackAll], picks among all members that
+// are neither draining nor offline; panic
 // mode also covers too few eligible members (Config.PanicThreshold) and
 // eligible members that all refuse a pick. OutlierConfig.MaxEjectionPercent
 // keeps passive health checking from ejecting too much of a pool.

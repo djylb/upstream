@@ -10,8 +10,10 @@ the state of every backend.
 - Lock-free, allocation-free picks; membership and health changes publish a new
   immutable view atomically, so updates never disturb picks in flight.
 - Balancers: round-robin, smooth weighted round-robin, weighted random,
-  power-of-two-choices, least connections, failover (active-backup) and
-  consistent hashing with optional bounded loads, or your own.
+  power-of-two-choices, least connections and consistent hashing with
+  optional bounded loads, or your own.
+- Priority tiers for active-backup setups, with per-backend caps on requests
+  in flight and optional overflow to the next tier.
 - Passive health: ejection on consecutive failures or a failure rate, with
   exponential, capped backoff and half-open trials.
 - Active health: TCP connect checks by default, HTTP checks or any function on
@@ -59,7 +61,7 @@ err := pool.Sync([]upstream.Target[string]{
 
 lease, err := pool.Pick() // or PickKey(clientIP) for affinity
 if err != nil {
-	return err // ErrNoBackends, ErrUnavailable or ErrClosed
+	return err // ErrNoBackends, ErrUnavailable, ErrSaturated or ErrClosed
 }
 conn, err := net.Dial("tcp", lease.Value())
 lease.Report(upstream.OutcomeOf(err)) // the dial decides the outcome
@@ -195,7 +197,6 @@ client := &http.Client{Transport: &uphttp.RoundTripper[string]{
 | `Random()`             | Weighted random, constant time.                                           |
 | `PowerOfTwo()`         | Two random candidates, the one with fewer requests in flight per weight.  |
 | `LeastConn()`          | Fewest requests in flight per weight, random tie-break; scans all.        |
-| `Failover()`           | First eligible backend in membership order (active-backup).               |
 | `ConsistentHash(cfg)`  | Hash ring keyed by `PickKey`/`PickHash`; optional bounded loads.          |
 
 Consistent hashing places backends by ID, so every process with the same IDs
@@ -207,34 +208,83 @@ A `Balancer` builds a `Picker` from `Candidate` values and can be used without
 a pool. Implement the two interfaces for custom strategies. A candidate carries
 the backend's in-flight count and moving average latency, both read live at
 pick time, and `Meta`, which a pool sets to the `*Backend[T]`: a zone-aware or
-least-latency balancer reads what it needs from there. A pool calls `Build`
-only when its routing view changes, never two at once, and coalesces changes
-that arrive during a build into one more. A balancer whose build is costly also
+least-latency balancer reads what it needs from there. A pool builds one picker
+per tier and calls `Build` for a tier only when its candidates change, never
+two at once, and coalesces changes that arrive during a build into one more. A balancer whose build is costly also
 implements `Rebuilder` to update the previous picker instead;
 `ConsistentHash` does, so a member that goes down or comes back on a large ring
 costs a linear merge, not a new sort.
+
+### Tiers
+
+`Target.Priority` puts backends in tiers; lower values are preferred and the
+default, 0, puts every backend in one tier. A pick goes to the most preferred
+tier that has an eligible backend and is balanced within that tier by the
+pool's balancer. It moves to the next tier when no backend of the tier can
+take it: all are down, ejected, offline, draining or half-open without a free
+trial slot, or a retry has tried them all. Distinct priorities make an
+active-backup pool.
+
+`Target.MaxInFlight` caps a backend's leases in flight; a backend at its cap
+refuses picks, in panic mode too, and the pick goes to the other backends of
+its tier. When every backend of a tier that the pick may use is full, the
+pick fails with `ErrSaturated`, so that a backup takes traffic only when the
+tier above is down, not when it is busy; `Config.Overflow` lets such picks go
+on to the next tier instead, and they fail with `ErrSaturated` only if they
+found a tier full and no tier could take them.
+
+`ErrUnavailable` means no backend can take the pick for reasons of health,
+drains or offline marks; `ErrSaturated` means backends refused it for capacity
+and calls for backpressure: it clears as leases are released.
+`errors.Is(ErrSaturated, ErrUnavailable)` holds, so code that only asks
+whether a pick failed for lack of backends needs one check.
+
+```go
+pool := upstream.New[string](upstream.Config{Overflow: true})
+err := pool.Sync([]upstream.Target[string]{
+	{ID: "a", Value: "10.0.0.1:8080", MaxInFlight: 100},
+	{ID: "b", Value: "10.0.0.2:8080", MaxInFlight: 100},
+	{ID: "backup", Value: "10.0.0.9:8080", Priority: 1},
+})
+```
 
 ## Health and eligibility
 
 A backend takes new picks when it is
 
 - not draining or removed,
+- not marked offline by the caller with `MarkOffline`,
 - not reported down by active health checks (`HealthUnknown` and `HealthUp`
   both take traffic), and
 - not ejected by passive health checking. A half-open backend takes up to
   `HalfOpenRequests` trial requests at a time.
 
+Each of the last three is a veto of its own, and none overrides another:
+`MarkOnline` lifts only the caller's mark, and a backend that
+checks report down stays out. A backend's `State` names the first that applies,
+in the order draining, offline, unhealthy, ejected, half-open.
+
+`MarkOffline` is for what the caller knows better than any probe, such as a
+backend reached through a session that dropped. Like `ReportCheck`, it takes
+the `*Backend` and ignores calls for a member that has since been removed or
+added again, so a late call from an old session cannot take a new one out.
+The mark follows the member's ID across updates, emits `EventStateChanged`
+with the given cause (or `ErrOffline`), and rebuilds the view like any other
+change. A backend that comes back online ramps up under slow start.
+
 **When too few backends are eligible**, `Config.Fallback` decides:
 
 - `FallbackNone` (default): `Pick` returns `ErrUnavailable` when no member can
   take the request.
-- `FallbackAll`: panic mode. `Pick` chooses among all members that are not
-  draining, ignoring health, on the grounds that a signal marking everything
-  down is more often wrong than right. The pool panics when no member is
-  eligible, when fewer than `Config.PanicThreshold` percent of the members
-  that are not draining are, and for a pick that every eligible member
-  refuses, such as half-open members out of trial slots after a whole-pool
-  ejection. Outcomes still count.
+- `FallbackAll`: panic mode. `Pick` chooses among all members that are
+  neither draining nor offline, ignoring health, on the grounds that a signal
+  marking everything down is more often wrong than right; tiers still apply.
+  The pool panics when no member is eligible, when fewer than
+  `Config.PanicThreshold` percent of the members that are neither draining
+  nor offline are, and for a pick that every eligible member refuses, such as
+  half-open members out of trial slots after a whole-pool ejection. Outcomes
+  still count. Offline marks are not health signals: panic mode never picks
+  an offline member.
 
 An empty pool returns `ErrNoBackends`; a closed one `ErrClosed`.
 
@@ -414,7 +464,7 @@ least recently used beyond `MaxEntries`. Dropping a transport closes its idle
 connections; give transports an `IdleConnTimeout` so that connections still in
 use when it was dropped close once they go idle. Keyed by backend ID, remove a
 transport on `EventRemoved` and on `EventUpdated`, which a pool emits only when
-a member's value or weight really changed.
+a member's value, weight, priority or cap really changed.
 
 ## Concurrency and lifetimes
 
@@ -458,8 +508,9 @@ a member's value or weight really changed.
   allocate.
 - A `Request` allocates from the fifth attempt of one request on; `Pool.Do`
   does not allocate, `Request.Do` allocates once.
-- Slow start works through weights, so it has no effect with `RoundRobin` and
-  `Failover`.
+- Slow start works through weights within a tier, so it has no effect with
+  `RoundRobin`, on a backend alone in its tier, or between tiers: traffic
+  moves back to a recovered tier at once.
 - The failure-rate window counts up to 2³²−1 requests per window and backend;
   the retry budget, up to 2³²−1 requests per window and pool.
 - The checker compares targets by key; two groups that give different

@@ -100,8 +100,9 @@ func (r *Request[T]) Tried() int { return r.n }
 
 // Next leases the next backend. The first call fails like PickHash; a
 // retry fails with ErrRetryLimit after RetryConfig.Attempts leases, with
-// ErrRetryBudget when the budget is spent, and with ErrUnavailable when
-// every backend that takes traffic has been tried. Release the previous
+// ErrRetryBudget when the budget is spent, with ErrUnavailable when
+// every backend that takes traffic has been tried, and with ErrSaturated
+// when those left are full. Release the previous
 // lease, usually with Failure, before or after calling Next.
 func (r *Request[T]) Next() (Lease[T], error) {
 	p := r.p

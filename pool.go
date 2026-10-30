@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -20,9 +21,19 @@ var (
 	// ErrNoBackends means the pool has no members.
 	ErrNoBackends = errors.New("upstream: no backends")
 
-	// ErrUnavailable means no member can take traffic now: every one is
-	// unhealthy, ejected, draining or out of half-open trial slots.
+	// ErrUnavailable means no member can take the pick now: every one is
+	// unhealthy, ejected, draining, offline, out of half-open trial slots
+	// or, for a retry, already tried. ErrSaturated is an ErrUnavailable
+	// whose cause is capacity.
 	ErrUnavailable = errors.New("upstream: no backend available")
+
+	// ErrSaturated means that members that could take the pick refused it
+	// because they were at their Target.MaxInFlight: the pick reached a
+	// full tier and Config.Overflow is off, or every tier it could go on to
+	// was full or unavailable too. It clears as leases are released, so it
+	// calls for backpressure rather than for an alarm.
+	// errors.Is(ErrSaturated, ErrUnavailable) holds.
+	ErrSaturated = fmt.Errorf("upstream: backends at capacity: %w", ErrUnavailable)
 
 	// ErrClosed means the pool was closed.
 	ErrClosed = errors.New("upstream: pool closed")
@@ -43,9 +54,25 @@ type Target[T any] struct {
 	// new ID when its value stops meaning the same server.
 	ID string
 
-	// Weight is the backend's relative capacity, from 0 to MaxWeight. Zero
-	// means 1; to stop sending traffic to a backend, drain it.
+	// Weight is the backend's relative capacity within its tier, from 0 to
+	// MaxWeight. Zero means 1; to stop sending traffic to a backend, drain
+	// it.
 	Weight int
+
+	// Priority is the backend's tier. Picks go to the tier with the lowest
+	// Priority that has an eligible member, balanced among that tier's
+	// members, and move to the next tier only when no member of the tier
+	// can take the pick; see Config.Overflow for tiers that are full.
+	// Members of different priorities make an active-backup setup. The
+	// default, 0, puts every member in one tier.
+	Priority int
+
+	// MaxInFlight, if positive, caps the backend's leases in flight: a
+	// backend at its cap refuses picks, in panic mode too, until a lease
+	// is released. Zero means no cap. The in-flight count may read above
+	// the cap for a moment while a pick that lost a race for the last slot
+	// backs out; the leases never exceed it.
+	MaxInFlight int
 
 	// Value is what callers connect to, such as an address.
 	Value T
@@ -121,8 +148,9 @@ type Config struct {
 	// small fraction to its full value over SlowStart, so a cold backend is
 	// not flooded. The pool rebuilds its view 16 times over the ramp. With
 	// ConsistentHash the ramp moves keys to the backend gradually. Slow
-	// start works through weights, so it has no effect with balancers that
-	// ignore them, RoundRobin and Failover.
+	// start works through weights within a tier, so it has no effect with
+	// RoundRobin, which ignores weights, on a backend alone in its tier, or
+	// between tiers.
 	SlowStart time.Duration
 
 	// PanicThreshold, from 1 to 100, makes a pool with FallbackAll panic
@@ -134,6 +162,14 @@ type Config struct {
 
 	// Fallback says what to do when too few backends are eligible.
 	Fallback Fallback
+
+	// Overflow lets a pick move to the next tier when every member of its
+	// tier that it may use is at its Target.MaxInFlight. Without Overflow
+	// such a pick fails with ErrSaturated, so that a lower tier, such as
+	// a costly backup, takes traffic only when the tier above is down, not
+	// when it is busy. Members that are down, ejected, out of half-open
+	// trial slots or already tried by the request always pass the pick on.
+	Overflow bool
 }
 
 // settings are the parts of a Config that the pool reads under its mutex.
@@ -144,6 +180,7 @@ type settings[T any] struct {
 	slowStart time.Duration
 	threshold int // panic threshold in percent
 	fallback  Fallback
+	overflow  bool
 	gen       uint64 // changes with the balancer
 }
 
@@ -197,8 +234,8 @@ type Pool[T any] struct {
 	closed   bool
 
 	// Owned by the building goroutine.
-	picker    Picker // the latest Picker built
-	pickerGen uint64 // settings.gen of picker
+	built    map[int]builtTier // the latest Picker built for each priority
+	builtGen uint64            // settings.gen of built
 
 	qmu      sync.Mutex
 	queue    []delivery[T]
@@ -212,13 +249,29 @@ type Pool[T any] struct {
 
 // view is an immutable routing snapshot.
 type view[T any] struct {
-	picker  Picker
-	err     error         // returned when nothing can be picked
-	members []*Backend[T] // the candidates of picker
+	err   error     // returned when nothing can be picked
+	tiers []tier[T] // by ascending priority; none is empty
 	// fallback, under FallbackAll outside panic mode, holds the members
-	// that are not draining, for a pick that every member refuses.
-	fallback     []*Backend[T]
-	ignoreHealth bool // panic mode: members are all that are not draining
+	// that are not draining or offline, by tier, for a pick that every
+	// member refuses. Its tiers have no Picker.
+	fallback     []tier[T]
+	eligible     int  // members of tiers, for Available
+	ignoreHealth bool // panic mode: tiers hold all that are not draining or offline
+	overflow     bool // Config.Overflow
+}
+
+// A tier is the members of one priority and their Picker.
+type tier[T any] struct {
+	picker   Picker
+	members  []*Backend[T] // the candidates of picker
+	priority int
+}
+
+// builtTier is a Picker a build made, kept for the next build of its
+// priority to reuse or rebuild.
+type builtTier struct {
+	picker Picker
+	cands  []Candidate
 }
 
 // New returns an empty pool.
@@ -251,6 +304,7 @@ func (p *Pool[T]) setLocked(cfg Config) {
 	s.slowStart = max(cfg.SlowStart, 0)
 	s.threshold = min(max(cfg.PanicThreshold, 0), 100)
 	s.fallback = cfg.Fallback
+	s.overflow = cfg.Overflow
 }
 
 // sameBalancer reports whether a and b are the same comparable Balancer,
@@ -313,6 +367,8 @@ func validate[T any](t Target[T]) error {
 		return fmt.Errorf("%w: empty ID", ErrInvalidTarget)
 	case t.Weight < 0 || t.Weight > MaxWeight:
 		return fmt.Errorf("%w: %q: weight %d out of range", ErrInvalidTarget, t.ID, t.Weight)
+	case t.MaxInFlight < 0:
+		return fmt.Errorf("%w: %q: negative MaxInFlight %d", ErrInvalidTarget, t.ID, t.MaxInFlight)
 	}
 	return nil
 }
@@ -327,7 +383,7 @@ func (p *Pool[T]) newBackendLocked(t Target[T], c *core) *Backend[T] {
 			c.rampStart.Store(-1)
 		}
 	}
-	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), value: t.Value}
+	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, limit: int64(t.MaxInFlight), value: t.Value}
 }
 
 // Sync replaces the pool's membership with targets, in order. Members
@@ -375,8 +431,8 @@ func (p *Pool[T]) Sync(targets []Target[T]) error {
 
 // Put adds a target, or replaces the member with the same ID, keeping its
 // position, health state and counters. It emits EventAdded or
-// EventUpdated; a Put that changes neither the weight nor the value of a
-// member does nothing.
+// EventUpdated; a Put that changes none of the weight, priority, cap and
+// value of a member does nothing.
 func (p *Pool[T]) Put(t Target[T]) error {
 	if err := validate(t); err != nil {
 		return err
@@ -406,7 +462,7 @@ func (p *Pool[T]) Put(t Target[T]) error {
 // places it in order.
 func (p *Pool[T]) putLocked(t Target[T]) *Backend[T] {
 	if old := p.byID[t.ID]; old != nil {
-		if old.weight == max(t.Weight, 1) && p.cfg.equal(old.value, t.Value) {
+		if old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && p.cfg.equal(old.value, t.Value) {
 			return old
 		}
 		b := p.newBackendLocked(t, old.core)
@@ -507,14 +563,13 @@ func (p *Pool[T]) Resume(id string) bool {
 // backend out of rotation; HealthUp and HealthUnknown keep it in, so a
 // change between them only updates the health and rebuilds nothing.
 // Reports for a backend that has been removed, or replaced by a new
-// member with the same ID, are ignored.
-func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) {
+// member with the same ID, are ignored; ReportCheck reports whether b was
+// a current member of an open pool.
+func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) bool {
 	c := b.core
 	want := healthFlags(h)
-	p.mu.Lock()
-	if cur := p.byID[b.id]; p.closed || cur == nil || cur.core != c {
-		p.mu.Unlock()
-		return
+	if !p.lockMember(b) {
+		return false
 	}
 	c.check.Store(&r)
 	for {
@@ -522,17 +577,79 @@ func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) {
 		f := old&^(flagUp|flagUnhealthy) | want
 		if old == f {
 			p.mu.Unlock()
-			return
+			return true
 		}
 		if c.flags.CompareAndSwap(old, f) {
 			if (old^f)&flagUnhealthy == 0 {
 				p.mu.Unlock()
-				return
+				return true
 			}
 			break
 		}
 	}
 	p.unlockAndCommit()
+	return true
+}
+
+// lockMember locks mu if b is the current version, or an earlier one, of a
+// member of the open pool, and reports whether it did.
+func (p *Pool[T]) lockMember(b *Backend[T]) bool {
+	p.mu.Lock()
+	if cur := p.byID[b.id]; p.closed || cur == nil || cur.core != b.core {
+		p.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// MarkOffline takes b out of rotation on the caller's word, for example
+// because the session the backend is reached through dropped, until
+// MarkOnline. It is one of three inputs that each veto picks: an offline
+// backend, one that active checks report down and one that passive checks
+// ejected take no new picks, and MarkOnline lifts only its own veto. While
+// several apply, the backend's State is the first in the order
+// StateDraining, StateOffline, StateUnhealthy, StateEjected,
+// StateHalfOpen. Unlike the health verdicts, the mark also holds in panic
+// mode: FallbackAll never picks an offline backend, which also does not
+// count towards Config.PanicThreshold.
+//
+// Taking b offline emits EventStateChanged with cause as its Err, or
+// ErrOffline if cause is nil, and rebuilds the view like any other change;
+// marking an offline backend again only replaces the cause, which the next
+// event reports. The mark follows the member's ID across updates. A call
+// for a backend that has been removed, or replaced by a new member with the
+// same ID, is ignored; MarkOffline reports whether b was a current member
+// of an open pool.
+func (p *Pool[T]) MarkOffline(b *Backend[T], cause error) bool {
+	if !p.lockMember(b) {
+		return false
+	}
+	c := b.core
+	c.offline.Store(&cause)
+	if c.flags.Or(flagOffline)&flagOffline != 0 {
+		p.mu.Unlock()
+		return true
+	}
+	p.unlockAndCommit()
+	return true
+}
+
+// MarkOnline lifts the mark of MarkOffline; a backend that comes back
+// online ramps up under Config.SlowStart. Like MarkOffline, it ignores
+// backends that are no longer members, and reports whether b was a current
+// member of an open pool.
+func (p *Pool[T]) MarkOnline(b *Backend[T]) bool {
+	if !p.lockMember(b) {
+		return false
+	}
+	c := b.core
+	if c.flags.And(^flagOffline)&flagOffline == 0 {
+		p.mu.Unlock()
+		return true
+	}
+	c.offline.Store(nil)
+	p.unlockAndCommit()
+	return true
 }
 
 // ResetOutlier clears the passive health ejection of the backend with the
@@ -593,6 +710,7 @@ type snapshot[T any] struct {
 	balancer  Balancer
 	gen       uint64
 	slowStart time.Duration
+	members   []*Backend[T] // what v.tiers are made of, in membership order
 }
 
 // buildLoop builds and publishes views while the view is out of date, at
@@ -677,54 +795,95 @@ func (p *Pool[T]) handOff() {
 
 // snapshotLocked selects the members of the next view.
 func (p *Pool[T]) snapshotLocked() snapshot[T] {
-	s := snapshot[T]{v: &view[T]{err: ErrUnavailable}, balancer: p.cfg.balancer, gen: p.cfg.gen, slowStart: p.cfg.slowStart}
+	s := snapshot[T]{v: &view[T]{err: ErrUnavailable, overflow: p.cfg.overflow}, balancer: p.cfg.balancer, gen: p.cfg.gen, slowStart: p.cfg.slowStart}
 	v := s.v
 	if len(p.order) == 0 {
 		v.err = ErrNoBackends
 	}
 	p.guard.members.Store(int32(min(len(p.order), math.MaxInt32)))
-	var open []*Backend[T] // not draining
+	var open []*Backend[T] // not draining or offline
 	for _, b := range p.order {
 		c := b.core
-		if c.flags.Load()&blockAlways != 0 {
+		if c.flags.Load()&blockPick != 0 {
 			continue
 		}
 		open = append(open, b)
 		if c.eligible() {
-			v.members = append(v.members, b)
+			s.members = append(s.members, b)
 		}
 	}
 	if p.cfg.fallback == FallbackAll && len(open) > 0 {
-		if len(v.members) == 0 || len(v.members)*100 < p.cfg.threshold*len(open) {
-			v.members = open
+		if len(s.members) == 0 || len(s.members)*100 < p.cfg.threshold*len(open) {
+			s.members = open
 			v.ignoreHealth = true
 		} else {
-			v.fallback = open
+			v.fallback = groupTiers(open)
 		}
 	}
 	return s
 }
 
-// build makes the Picker of s.v, without mu.
+// groupTiers returns bs grouped by ascending priority, keeping their
+// order within each priority.
+func groupTiers[T any](bs []*Backend[T]) []tier[T] {
+	if len(bs) == 0 {
+		return nil
+	}
+	bs = slices.Clone(bs)
+	slices.SortStableFunc(bs, func(a, b *Backend[T]) int { return cmp.Compare(a.priority, b.priority) })
+	var ts []tier[T]
+	for i := 0; i < len(bs); {
+		j := i + 1
+		for j < len(bs) && bs[j].priority == bs[i].priority {
+			j++
+		}
+		ts = append(ts, tier[T]{members: bs[i:j:j], priority: bs[i].priority})
+		i = j
+	}
+	return ts
+}
+
+// build makes the tiers of s.v and their Pickers, without mu. A tier whose
+// candidates are those of the Picker built last for its priority by the
+// same Balancer keeps that Picker; otherwise a Rebuilder rebuilds that
+// Picker and other Balancers build a new one. The Pickers are kept only if
+// every tier builds.
 func (p *Pool[T]) build(s snapshot[T]) {
 	v := s.v
-	if len(v.members) == 0 {
+	v.tiers = groupTiers(s.members)
+	v.eligible = len(s.members)
+	if len(v.tiers) == 0 {
+		p.built = nil
 		return
 	}
-	cands := make([]Candidate, len(v.members))
-	for i, b := range v.members {
-		c := b.core
-		cands[i] = Candidate{InFlight: &c.inflight, Latency: &c.latency, Meta: b, ID: b.id, Weight: b.weight}
+	prev := p.built
+	if p.builtGen != s.gen {
+		prev = nil
 	}
-	if s.slowStart > 0 {
-		p.applySlowStart(v.members, cands, s.slowStart)
+	built := make(map[int]builtTier, len(v.tiers))
+	for i := range v.tiers {
+		t := &v.tiers[i]
+		cands := make([]Candidate, len(t.members))
+		for k, b := range t.members {
+			c := b.core
+			cands[k] = Candidate{InFlight: &c.inflight, Latency: &c.latency, Meta: b, ID: b.id, Weight: b.weight}
+		}
+		if s.slowStart > 0 {
+			p.applySlowStart(t.members, cands, s.slowStart)
+		}
+		old, ok := prev[t.priority]
+		switch r, rebuilder := s.balancer.(Rebuilder); {
+		case ok && slices.Equal(old.cands, cands):
+			t.picker = old.picker
+			cands = old.cands
+		case ok && rebuilder:
+			t.picker = r.Rebuild(old.picker, cands)
+		default:
+			t.picker = s.balancer.Build(cands)
+		}
+		built[t.priority] = builtTier{picker: t.picker, cands: cands}
 	}
-	if r, ok := s.balancer.(Rebuilder); ok && p.picker != nil && p.pickerGen == s.gen {
-		v.picker = r.Rebuild(p.picker, cands)
-	} else {
-		v.picker = s.balancer.Build(cands)
-	}
-	p.picker, p.pickerGen = v.picker, s.gen
+	p.built, p.builtGen = built, s.gen
 }
 
 // applySlowStart lowers the candidate weights of backends that are ramping
@@ -812,40 +971,75 @@ func keyHash(key string) uint64 {
 	return hashString(key)
 }
 
-// pick leases a member of v that is not in tried, which may be nil: the
-// balancer's choices first, then every member in turn, for when the
-// balancer kept choosing backends that could not take the request, such as
-// half-open ones out of trial slots or ones already tried, and last, under
-// FallbackAll, any member that is not draining.
+// pick leases a member of v that is not in tried, which may be nil, from
+// the first tier that has one that can take the request, and last, under
+// FallbackAll, any member that is not draining or offline, again tier by
+// tier. Within a tier it takes the balancer's choices first, then every
+// member in turn, for when the balancer kept choosing backends that could
+// not take the request, such as half-open ones out of trial slots, full
+// ones or ones already tried. A tier that refuses because members are full
+// ends the pick with ErrSaturated unless v.overflow lets it go on to the
+// next tier; the pick also fails with ErrSaturated if it found members
+// full on its way, and with ErrUnavailable otherwise.
 func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
-	n := len(v.members)
-	if n == 0 {
+	if len(v.tiers) == 0 {
 		return Lease[T]{}, v.err
 	}
-	for attempt := range n {
-		b := v.members[v.picker.Pick(hash, attempt)]
-		if tried != nil && tried.has(b.core) {
-			continue
+	full := false
+	for i := range v.tiers {
+		l, r := v.tiers[i].pick(hash, tried, v.ignoreHealth)
+		if r == admitted {
+			return l, nil
 		}
-		if t, ok := b.core.acquire(v.ignoreHealth); ok {
-			return Lease[T]{b: b, t: t}, nil
+		if r == saturated {
+			if !v.overflow {
+				return Lease[T]{}, ErrSaturated
+			}
+			full = true
 		}
 	}
-	if l, ok := scan(v.members, hash, tried, v.ignoreHealth); ok {
-		return l, nil
+	for i := range v.fallback {
+		l, r := scan(v.fallback[i].members, hash, tried, true)
+		if r == admitted {
+			return l, nil
+		}
+		if r == saturated {
+			if !v.overflow {
+				return Lease[T]{}, ErrSaturated
+			}
+			full = true
+		}
 	}
-	if l, ok := scan(v.fallback, hash, tried, true); ok {
-		return l, nil
+	if full {
+		return Lease[T]{}, ErrSaturated
 	}
 	return Lease[T]{}, ErrUnavailable
 }
 
+// pick leases a member of t not in tried. It returns saturated if no
+// member took the pick and one of them refused because it was full.
+func (t *tier[T]) pick(hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], refusal) {
+	n := len(t.members)
+	for attempt := range n {
+		b := t.members[t.picker.Pick(hash, attempt)]
+		if tried != nil && tried.has(b.core) {
+			continue
+		}
+		if tk, r := b.acquire(ignoreHealth); r == admitted {
+			return Lease[T]{b: b, t: tk}, admitted
+		}
+	}
+	return scan(t.members, hash, tried, ignoreHealth)
+}
+
 // scan tries every backend of bs not in tried once, starting at a place
-// that hash chooses.
-func scan[T any](bs []*Backend[T], hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
+// that hash chooses. It returns saturated if none took the pick and one of
+// them refused because it was full.
+func scan[T any](bs []*Backend[T], hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], refusal) {
 	n := len(bs)
+	res := refused
 	if n == 0 {
-		return Lease[T]{}, false
+		return Lease[T]{}, res
 	}
 	start := int(hash % uint64(n))
 	for k := range n {
@@ -857,11 +1051,16 @@ func scan[T any](bs []*Backend[T], hash uint64, tried *Request[T], ignoreHealth 
 		if tried != nil && tried.has(b.core) {
 			continue
 		}
-		if t, ok := b.core.acquire(ignoreHealth); ok {
-			return Lease[T]{b: b, t: t}, true
+		t, r := b.acquire(ignoreHealth)
+		switch r {
+		case admitted:
+			return Lease[T]{b: b, t: t}, admitted
+		case saturated:
+			res = saturated
+		case refused:
 		}
 	}
-	return Lease[T]{}, false
+	return Lease[T]{}, res
 }
 
 // Do picks a backend, calls fn with it and releases the lease with
@@ -903,9 +1102,10 @@ func (p *Pool[T]) Len() int {
 }
 
 // Available returns the number of members that are eligible for new
-// picks, as the routing view sees them: not draining, not down and not
-// ejected. A half-open member counts although it takes only its trial
-// requests. Available is zero while the pool is empty or closed and in
+// picks, as the routing view sees them: not draining, not offline, not
+// down and not ejected, in every tier. A half-open member counts although
+// it takes only its trial requests, and a full one although it takes no
+// pick until a lease is released. Available is zero while the pool is empty or closed and in
 // panic mode, when Pick, under FallbackAll, still picks among members that
 // are not eligible; a readiness check that should fail in panic mode tests
 // Available() > 0.
@@ -914,7 +1114,7 @@ func (p *Pool[T]) Available() int {
 	if v.ignoreHealth {
 		return 0
 	}
-	return len(v.members)
+	return v.eligible
 }
 
 // Status returns a snapshot of every member, in order.

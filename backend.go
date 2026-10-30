@@ -9,10 +9,11 @@ import (
 	"time"
 )
 
-// State is the routing state of a backend, combining its membership, its
-// active health and its passive health. When several conditions hold, the
-// state is the first that applies in this order: removed, draining,
-// unhealthy, ejected, half-open, healthy.
+// State is the routing state of a backend, combining its membership, the
+// caller's availability input, its active health and its passive health.
+// When several conditions hold, the state is the first that applies in this
+// order: removed, draining, offline, unhealthy, ejected, half-open,
+// healthy.
 type State uint8
 
 const (
@@ -35,6 +36,11 @@ const (
 
 	// StateRemoved means the backend is no longer a member of its pool.
 	StateRemoved
+
+	// StateOffline means the caller marked the backend unavailable with
+	// Pool.MarkOffline, for example because the session it is reached
+	// through dropped.
+	StateOffline
 )
 
 // String returns the name of the state.
@@ -54,6 +60,8 @@ func (s State) String() string {
 		return "draining"
 	case StateRemoved:
 		return "removed"
+	case StateOffline:
+		return "offline"
 	}
 	return "State(" + strconv.Itoa(int(s)) + ")"
 }
@@ -132,6 +140,13 @@ type Status struct {
 	// Weight is the backend's weight.
 	Weight int
 
+	// Priority is the backend's tier: lower values are preferred.
+	Priority int
+
+	// MaxInFlight is the backend's cap on leases in flight; zero means
+	// none.
+	MaxInFlight int
+
 	// InFlight is the number of leases not yet released.
 	InFlight int64
 
@@ -155,6 +170,10 @@ type Status struct {
 
 	// Draining reports whether the backend is draining or removed.
 	Draining bool
+
+	// Offline reports whether Pool.MarkOffline marked the backend
+	// unavailable, whatever the State.
+	Offline bool
 }
 
 const (
@@ -162,6 +181,7 @@ const (
 	flagRemoved
 	flagUnhealthy // active health is HealthDown
 	flagUp        // active health is HealthUp
+	flagOffline   // the caller marked the backend unavailable
 )
 
 func healthOf(f uint32) Health {
@@ -191,10 +211,12 @@ func healthFlags(h Health) uint32 {
 // keep the version they were issued with; an update that changes neither
 // keeps the Backend.
 type Backend[T any] struct {
-	core   *core
-	id     string
-	weight int
-	value  T
+	core     *core
+	id       string
+	weight   int
+	priority int
+	limit    int64 // MaxInFlight; 0 means none
+	value    T
 }
 
 // ID returns the backend's ID.
@@ -205,6 +227,13 @@ func (b *Backend[T]) Value() T { return b.value }
 
 // Weight returns the backend's weight, which is at least 1.
 func (b *Backend[T]) Weight() int { return b.weight }
+
+// Priority returns the backend's tier: lower values are preferred.
+func (b *Backend[T]) Priority() int { return b.priority }
+
+// MaxInFlight returns the backend's cap on leases in flight, or zero if it
+// has none.
+func (b *Backend[T]) MaxInFlight() int { return int(b.limit) }
 
 // InFlight returns the number of leases on the backend not yet released.
 func (b *Backend[T]) InFlight() int64 { return b.core.inflight.Load() }
@@ -221,16 +250,19 @@ func (b *Backend[T]) Status() Status {
 	c := b.core
 	f := c.flags.Load()
 	s := Status{
-		ID:        b.id,
-		Weight:    b.weight,
-		InFlight:  c.inflight.Load(),
-		Latency:   time.Duration(c.latency.Load()),
-		Successes: c.successes.Load(),
-		Failures:  c.failures.Load(),
-		Neutrals:  c.neutrals.Load(),
-		State:     stateOf(f, c.det.State()),
-		Health:    healthOf(f),
-		Draining:  f&(flagDraining|flagRemoved) != 0,
+		ID:          b.id,
+		Weight:      b.weight,
+		Priority:    b.priority,
+		MaxInFlight: int(b.limit),
+		InFlight:    c.inflight.Load(),
+		Latency:     time.Duration(c.latency.Load()),
+		Successes:   c.successes.Load(),
+		Failures:    c.failures.Load(),
+		Neutrals:    c.neutrals.Load(),
+		State:       stateOf(f, c.det.State()),
+		Health:      healthOf(f),
+		Draining:    f&(flagDraining|flagRemoved) != 0,
+		Offline:     f&flagOffline != 0,
 	}
 	if r := c.check.Load(); r != nil {
 		s.LastCheck = *r
@@ -254,7 +286,8 @@ type core struct {
 	check     atomic.Pointer[CheckResult]
 	rampStart atomic.Int64 // slow start: 0 none, -1 pending, else unix nanoseconds
 	neutrals  atomic.Uint64
-	reported  State // last state announced in an event; guarded by the pool's mutex
+	offline   atomic.Pointer[error] // the cause given to MarkOffline; set before flagOffline
+	reported  State                 // last state announced in an event; guarded by the pool's mutex
 }
 
 func stateOf(f uint32, o OutlierState) State {
@@ -263,6 +296,8 @@ func stateOf(f uint32, o OutlierState) State {
 		return StateRemoved
 	case f&flagDraining != 0:
 		return StateDraining
+	case f&flagOffline != 0:
+		return StateOffline
 	case f&flagUnhealthy != 0:
 		return StateUnhealthy
 	}
@@ -288,6 +323,11 @@ func (c *core) cause(s State) error {
 		}
 	case StateEjected, StateHalfOpen:
 		return c.det.Status().Cause
+	case StateOffline:
+		if e := c.offline.Load(); e != nil && *e != nil {
+			return *e
+		}
+		return ErrOffline
 	case StateHealthy, StateDraining, StateRemoved:
 	}
 	return nil
@@ -300,38 +340,63 @@ func (c *core) eligible() bool {
 
 const blockAlways = flagDraining | flagRemoved
 
-// acquire takes an in-flight slot. With ignoreHealth it admits any backend
-// that is neither draining nor removed; its outcome still counts for
-// passive health checking.
+// blockPick are the flags that keep a backend from every pick, panic mode
+// and fallback included. Only blockAlways completes drains.
+const blockPick = blockAlways | flagOffline
+
+// refusal says why acquire turned a pick down.
+type refusal uint8
+
+const (
+	admitted  refusal = iota
+	refused           // draining, offline, unhealthy, ejected or out of trial slots
+	saturated         // at its MaxInFlight
+)
+
+// acquire takes an in-flight slot of b. With ignoreHealth it admits any
+// backend that is neither draining, removed nor offline; its outcome still
+// counts for passive health checking. A backend at its MaxInFlight refuses
+// whatever ignoreHealth says.
 //
-// The slot is counted before draining is checked a second time: drain sets
-// the flag before it reads the count, so either drain sees the slot or
-// acquire sees the flag and gives the slot back.
-func (c *core) acquire(ignoreHealth bool) (Ticket, bool) {
+// The slot is counted before draining and the cap are checked a second
+// time: drain sets the flag before it reads the count, so either drain sees
+// the slot or acquire sees the flag and gives the slot back; and of picks
+// that race for the last slots under the cap, those that counted beyond it
+// give theirs back.
+func (b *Backend[T]) acquire(ignoreHealth bool) (Ticket, refusal) {
+	c := b.core
 	f := c.flags.Load()
-	if f&blockAlways != 0 {
-		return Ticket{}, false
+	if f&blockPick != 0 {
+		return Ticket{}, refused
 	}
 	var t Ticket
 	if !ignoreHealth && f&flagUnhealthy != 0 {
-		return Ticket{}, false
+		return Ticket{}, refused
+	}
+	if b.limit > 0 && c.inflight.Load() >= b.limit {
+		return Ticket{}, saturated
 	}
 	if c.det.enabled.Load() {
 		if !ignoreHealth {
 			var ok bool
 			if t, ok = c.det.Admit(); !ok {
-				return Ticket{}, false
+				return Ticket{}, refused
 			}
 		}
 		t.admitted = true
 	}
-	c.inflight.Add(1)
+	n := c.inflight.Add(1)
 	if c.flags.Load()&blockAlways != 0 {
 		c.leave()
 		c.record(t, Neutral)
-		return Ticket{}, false
+		return Ticket{}, refused
 	}
-	return t, true
+	if b.limit > 0 && n > b.limit {
+		c.leave()
+		c.record(t, Neutral)
+		return Ticket{}, saturated
+	}
+	return t, admitted
 }
 
 // record passes an outcome to the detector if it admitted the request.
@@ -448,6 +513,10 @@ func (d *Drain) Canceled() bool {
 		return false
 	}
 }
+
+// ErrOffline is the Err of an EventStateChanged to StateOffline when
+// Pool.MarkOffline was given no cause.
+var ErrOffline = errors.New("upstream: backend offline")
 
 // ErrDrainCanceled is returned by Drain.Wait when Resume ended the drain
 // before the backend's leases were all released.

@@ -69,7 +69,7 @@ func TestAttemptsManyTries(t *testing.T) {
 	for i := range ids {
 		ids[i] = strconv.Itoa(i)
 	}
-	p := newTestPool(t, Config{Balancer: Failover(), Retry: RetryConfig{Attempts: 100}}, ids...)
+	p := newOrderedPool(t, Config{Retry: RetryConfig{Attempts: 100}}, ids...)
 	a := p.Request("")
 	for i := range ids {
 		l, err := a.Next()
@@ -142,7 +142,7 @@ func TestRetryBudgetMinimum(t *testing.T) {
 }
 
 func TestDoRetries(t *testing.T) {
-	p := newTestPool(t, Config{Balancer: Failover(), Retry: RetryConfig{Attempts: 3}}, "a", "b", "c")
+	p := newOrderedPool(t, Config{Retry: RetryConfig{Attempts: 3}}, "a", "b", "c")
 	var tried []string
 	err := p.Do(context.Background(), func(b *Backend[string]) error {
 		tried = append(tried, b.ID())
@@ -224,9 +224,9 @@ func TestRequestDoesNotAllocate(t *testing.T) {
 func TestReportEndsTrial(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
-		p := New[string](Config{Clock: clk, Balancer: Failover(), Outlier: OutlierConfig{ConsecutiveFailures: 1}})
+		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
 		defer p.Close()
-		if err := p.Sync(targets("a", "b")); err != nil {
+		if err := p.Sync(ordered("a", "b")); err != nil {
 			t.Fatal(err)
 		}
 		ejectToHalfOpen(t, p, clk, "a")
@@ -314,7 +314,7 @@ func TestDrainWait(t *testing.T) {
 }
 
 func TestNamesRoundTrip(t *testing.T) {
-	for _, name := range []string{"round-robin", "weighted-round-robin", "random", "power-of-two", "least-conn", "failover", "consistent-hash"} {
+	for _, name := range []string{"round-robin", "weighted-round-robin", "random", "power-of-two", "least-conn", "consistent-hash"} {
 		b, err := ParseBalancer(name)
 		if err != nil {
 			t.Fatal(err)
@@ -385,7 +385,7 @@ func TestWithOutcome(t *testing.T) {
 func FuzzRequest(f *testing.F) {
 	f.Add([]byte{1, 2, 3}, "k", uint8(0))
 	f.Add([]byte{0, 255, 9, 9, 1, 1}, "", uint8(7))
-	balancers := []Balancer{RoundRobin(), WeightedRoundRobin(), Random(), PowerOfTwo(), LeastConn(), Failover(),
+	balancers := []Balancer{RoundRobin(), WeightedRoundRobin(), Random(), PowerOfTwo(), LeastConn(),
 		ConsistentHash(HashConfig{VirtualNodes: 8}), ConsistentHash(HashConfig{VirtualNodes: 3, LoadFactor: 1.1})}
 	f.Fuzz(func(t *testing.T, weights []byte, key string, which uint8) {
 		if len(weights) == 0 || len(weights) > 300 {
@@ -395,7 +395,7 @@ func FuzzRequest(f *testing.F) {
 		defer p.Close()
 		ts := make([]Target[string], len(weights))
 		for i, w := range weights {
-			ts[i] = Target[string]{ID: strconv.Itoa(i), Weight: int(w)}
+			ts[i] = Target[string]{ID: strconv.Itoa(i), Weight: int(w), Priority: int(w>>6) % (int(which)%4 + 1)}
 		}
 		if err := p.Sync(ts); err != nil {
 			t.Fatal(err)

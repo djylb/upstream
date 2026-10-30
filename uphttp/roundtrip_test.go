@@ -55,11 +55,26 @@ func (f *fakeBackends) requests() []string {
 
 func newRTPool(t *testing.T, cfg upstream.Config, values ...string) *upstream.Pool[string] {
 	t.Helper()
+	return newTieredRTPool(t, cfg, false, values...)
+}
+
+// newOrderedRTPool puts the backends in tiers of one, in order: an
+// active-backup pool.
+func newOrderedRTPool(t *testing.T, cfg upstream.Config, values ...string) *upstream.Pool[string] {
+	t.Helper()
+	return newTieredRTPool(t, cfg, true, values...)
+}
+
+func newTieredRTPool(t *testing.T, cfg upstream.Config, ordered bool, values ...string) *upstream.Pool[string] {
+	t.Helper()
 	p := upstream.New[string](cfg)
 	t.Cleanup(p.Close)
 	ts := make([]upstream.Target[string], len(values))
 	for i, v := range values {
 		ts[i] = upstream.Target[string]{ID: v, Value: v}
+		if ordered {
+			ts[i].Priority = i
+		}
 	}
 	if err := p.Sync(ts); err != nil {
 		t.Fatal(err)
@@ -69,7 +84,7 @@ func newRTPool(t *testing.T, cfg upstream.Config, values ...string) *upstream.Po
 
 func TestRoundTripperRetries(t *testing.T) {
 	fb := &fakeBackends{status: map[string]int{"busy": 503, "ok": 200}}
-	p := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 3}}, "busy", "ok")
+	p := newOrderedRTPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 3}}, "busy", "ok")
 	client := &http.Client{Transport: &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return fb }}}
 
 	resp, err := client.Get("http://service/path")
@@ -103,7 +118,7 @@ func TestRoundTripperRetries(t *testing.T) {
 	}
 
 	// A POST that never reached a backend is, with its body again.
-	q := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 3}}, "down", "ok")
+	q := newOrderedRTPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 3}}, "down", "ok")
 	client.Transport = &RoundTripper[string]{Pool: q, Transport: func(*upstream.Backend[string]) http.RoundTripper { return fb }}
 	resp, err = client.Post("http://service/", "text/plain", strings.NewReader("data"))
 	if err != nil {
@@ -306,7 +321,7 @@ func TestTransportPanicReleasesLease(t *testing.T) {
 // counting against its backend.
 func TestRoundTripperRetryAndOutcomeApart(t *testing.T) {
 	fb := &fakeBackends{status: map[string]int{"busy": 503, "ok": 200}}
-	p := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "busy", "ok")
+	p := newOrderedRTPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}}, "busy", "ok")
 	rt := &RoundTripper[string]{
 		Pool:      p,
 		Transport: func(*upstream.Backend[string]) http.RoundTripper { return fb },
@@ -349,7 +364,7 @@ func TestRoundTripperRetryAndOutcomeApart(t *testing.T) {
 // TestRoundTripperAttemptTimeout checks that a backend that does not
 // answer costs one attempt, not the request's whole deadline.
 func TestRoundTripperAttemptTimeout(t *testing.T) {
-	p := newRTPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
+	p := newOrderedRTPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
 	tr := rtFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "hole" {
 			<-r.Context().Done()
@@ -479,7 +494,7 @@ func (b *slowBody) Close() error { return nil }
 // context has no deadline, and that the timer does not outlive the attempt.
 func TestRoundTripperHeaderTimeout(t *testing.T) {
 	clk := fakeclock.New()
-	p := newRTPool(t, upstream.Config{Clock: clk, Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
+	p := newOrderedRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
 	tr := rtFunc(func(r *http.Request) (*http.Response, error) {
 		if _, ok := r.Context().Deadline(); ok {
 			t.Error("attempt context has a deadline")

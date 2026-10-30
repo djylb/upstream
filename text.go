@@ -23,7 +23,7 @@ func parseName[E enum](s string, n E, what string) (E, error) {
 //
 //goland:noinspection GoMixedReceiverTypes
 func (s *State) UnmarshalText(b []byte) (err error) {
-	*s, err = parseName(string(b), StateRemoved+1, "state")
+	*s, err = parseName(string(b), StateOffline+1, "state")
 	return err
 }
 

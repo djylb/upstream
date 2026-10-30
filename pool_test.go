@@ -24,6 +24,27 @@ func targets(ids ...string) []Target[string] {
 	return ts
 }
 
+// ordered returns targets for ids with priorities in their order, an
+// active-backup setup.
+func ordered(ids ...string) []Target[string] {
+	ts := targets(ids...)
+	for i := range ts {
+		ts[i].Priority = i
+	}
+	return ts
+}
+
+// newOrderedPool is newTestPool with the members in tiers of one, in order.
+func newOrderedPool(t *testing.T, cfg Config, ids ...string) *Pool[string] {
+	t.Helper()
+	p := New[string](cfg)
+	t.Cleanup(p.Close)
+	if err := p.Sync(ordered(ids...)); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func newTestPool(t *testing.T, cfg Config, ids ...string) *Pool[string] {
 	t.Helper()
 	p := New[string](cfg)
@@ -536,22 +557,30 @@ func testBalancers() map[string]Balancer {
 		"Random":             Random(),
 		"PowerOfTwo":         PowerOfTwo(),
 		"LeastConn":          LeastConn(),
-		"Failover":           Failover(),
 		"ConsistentHash":     ConsistentHash(HashConfig{}),
 		"BoundedHash":        ConsistentHash(HashConfig{LoadFactor: 1.25}),
 	}
 }
 
 // TestConcurrentUpdatesWhilePicking hammers picks and releases while the
-// membership, weights, drains and health change underneath, then checks
-// that every slot came back.
+// membership, weights, tiers, caps, drains, health and offline marks
+// change underneath, then checks that every slot came back.
 func TestConcurrentUpdatesWhilePicking(t *testing.T) {
 	for name, bal := range testBalancers() {
 		t.Run(name, func(t *testing.T) {
-			p := New[string](Config{Balancer: bal, Fallback: FallbackAll, Outlier: OutlierConfig{ConsecutiveFailures: 3, BaseEjection: time.Millisecond}})
+			p := New[string](Config{Balancer: bal, Fallback: FallbackAll, Overflow: true, Outlier: OutlierConfig{ConsecutiveFailures: 3, BaseEjection: time.Millisecond}})
 			defer p.Close()
 			ids := []string{"a", "b", "c", "d", "e"}
-			if err := p.Sync(targets(ids...)); err != nil {
+			// Two tiers, caps on some members, overflow on.
+			tiered := func(ids ...string) []Target[string] {
+				ts := targets(ids...)
+				for i := range ts {
+					ts[i].Priority = i % 2
+					ts[i].MaxInFlight = i % 3
+				}
+				return ts
+			}
+			if err := p.Sync(tiered(ids...)); err != nil {
 				t.Fatal(err)
 			}
 			var events atomic.Int64
@@ -586,11 +615,19 @@ func TestConcurrentUpdatesWhilePicking(t *testing.T) {
 				for i := range 3000 {
 					runtime.Gosched()
 					id := ids[i%len(ids)]
-					switch i % 6 {
+					switch i % 7 {
 					case 0:
-						_ = p.Sync(targets(ids[:1+i%len(ids)]...))
+						_ = p.Sync(tiered(ids[:1+i%len(ids)]...))
 					case 1:
-						_ = p.Put(Target[string]{ID: id, Weight: i%5 + 1})
+						_ = p.Put(Target[string]{ID: id, Weight: i%5 + 1, Priority: i % 3, MaxInFlight: i % 4})
+					case 6:
+						if b, ok := p.Backend(id); ok {
+							if i%2 == 0 {
+								p.MarkOffline(b, nil)
+							} else {
+								p.MarkOnline(b)
+							}
+						}
 					case 2:
 						p.Drain(id)
 					case 3:
@@ -1115,11 +1152,11 @@ func TestPanicThreshold(t *testing.T) {
 func TestSetConfig(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
-		p := newTestPool(t, Config{Clock: clk, Balancer: Failover()}, "a", "b")
+		p := newTestPool(t, Config{Clock: clk, Balancer: inOrder{}}, "a", "b")
 		a, _ := p.Backend("a")
 		l := mustPick(t, p)
 		if l.Backend() != a {
-			t.Fatal("failover picked b")
+			t.Fatal("in-order balancer picked b")
 		}
 
 		if err := p.SetConfig(Config{Balancer: RoundRobin(), Outlier: OutlierConfig{ConsecutiveFailures: 1}, Retry: RetryConfig{Attempts: 2}}); err != nil {
@@ -1397,6 +1434,15 @@ func TestCommitBuildsAreBounded(t *testing.T) {
 	})
 }
 
+// inOrder is a Balancer that picks its candidates in order.
+type inOrder struct{}
+
+func (inOrder) Build(c []Candidate) Picker { return inOrderPicker(len(c)) }
+
+type inOrderPicker int
+
+func (n inOrderPicker) Pick(_ uint64, attempt int) int { return attempt % int(n) }
+
 // rebuildCounter counts full and incremental builds.
 type rebuildCounter struct{ builds, rebuilds atomic.Int32 }
 
@@ -1411,7 +1457,8 @@ func (b *rebuildCounter) Rebuild(_ Picker, c []Candidate) Picker {
 }
 
 // TestSetConfigSameBalancerRebuilds checks that SetConfig with the
-// current Balancer keeps rebuilding incrementally, and a new one builds.
+// current Balancer keeps its Picker, which later changes rebuild
+// incrementally, and a new one builds.
 func TestSetConfigSameBalancerRebuilds(t *testing.T) {
 	bal := &rebuildCounter{}
 	p := newTestPool(t, Config{Balancer: bal}, "a")
@@ -1419,7 +1466,7 @@ func TestSetConfigSameBalancerRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = p.Put(Target[string]{ID: "b", Value: "b"})
-	if b, r := bal.builds.Load(), bal.rebuilds.Load(); b != 1 || r != 2 {
+	if b, r := bal.builds.Load(), bal.rebuilds.Load(); b != 1 || r != 1 {
 		t.Fatalf("same balancer: %d builds, %d rebuilds", b, r)
 	}
 	if err := p.SetConfig(Config{Balancer: &rebuildCounter{}}); err != nil {

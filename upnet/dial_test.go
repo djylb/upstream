@@ -50,8 +50,8 @@ func newPool(t *testing.T, cfg upstream.Config, ts ...upstream.Target[string]) *
 func TestDialRetriesAndHoldsLease(t *testing.T) {
 	pd := &pipeDialer{served: make(chan string, 4)}
 	defer pd.wg.Wait()
-	p := newPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}},
-		upstream.Target[string]{ID: "a", Value: "bad"}, upstream.Target[string]{ID: "b", Value: "good"})
+	p := newPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}},
+		upstream.Target[string]{ID: "a", Value: "bad"}, upstream.Target[string]{ID: "b", Value: "good", Priority: 1})
 	d := &Dialer[string]{Pool: p, DialContext: pd.dial}
 	conn, err := d.Dial(context.Background())
 	if err != nil {
@@ -286,8 +286,8 @@ func TestDialClosesConnWithError(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	pd := &pipeDialer{served: make(chan string, 1)}
 	defer pd.wg.Wait()
-	p := newPool(t, upstream.Config{Balancer: upstream.Failover(), Retry: upstream.RetryConfig{Attempts: 2}},
-		upstream.Target[string]{ID: "a", Value: "half"}, upstream.Target[string]{ID: "b", Value: "b"})
+	p := newPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}},
+		upstream.Target[string]{ID: "a", Value: "half"}, upstream.Target[string]{ID: "b", Value: "b", Priority: 1})
 	d := &Dialer[string]{Pool: p, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		if address == "half" {
 			return client, errRefused

@@ -34,10 +34,11 @@ func (c *Candidate) weight() int64 {
 	return max(int64(c.Weight), 1)
 }
 
-// A Balancer builds Pickers for sets of candidates. A Pool calls Build
-// when its routing view changes: when members join, leave or change
-// weight, go down or come back, are ejected or restored, and at the steps
-// of a slow start. Calls never overlap for one pool and never happen
+// A Balancer builds Pickers for sets of candidates. A Pool builds one
+// Picker per tier (Target.Priority) and calls Build for a tier when its
+// candidates change: when members join, leave or change weight, go down or
+// come back, are ejected or restored, and at the steps of a slow start; a
+// tier whose candidates did not change keeps its Picker. Calls never overlap for one pool and never happen
 // while the pool holds a lock; picks use the previous Picker until Build
 // returns. If Build or Rebuild panics, the pool recovers, keeps the
 // previous Picker, reports an [EventBalancerPanic] and calls the Balancer
@@ -368,21 +369,9 @@ func (p *leastConnPicker) Pick(_ uint64, attempt int) int {
 	return best
 }
 
-// Failover returns a Balancer for active-backup setups: it always picks the
-// first candidate, in membership order, that can take traffic. A Pool
-// leaves unhealthy and drained backends out of the candidates, so traffic
-// moves to the next backend in order and returns when the first recovers.
-func Failover() Balancer { return failover{} }
-
-type failover struct{}
-
-func (failover) Build(c []Candidate) Picker { return failoverPicker{n: len(c)} }
-
-func (failover) String() string { return "failover" }
-
 // ParseBalancer returns the built-in Balancer with the given name, as its
 // String method writes it: "round-robin", "weighted-round-robin",
-// "random", "power-of-two", "least-conn", "failover" or "consistent-hash"
+// "random", "power-of-two", "least-conn" or "consistent-hash"
 // (with the default HashConfig). It suits configuration files; build a
 // ConsistentHash with options in code.
 func ParseBalancer(name string) (Balancer, error) {
@@ -397,14 +386,8 @@ func ParseBalancer(name string) (Balancer, error) {
 		return PowerOfTwo(), nil
 	case "least-conn":
 		return LeastConn(), nil
-	case "failover":
-		return Failover(), nil
 	case "consistent-hash":
 		return ConsistentHash(HashConfig{}), nil
 	}
 	return nil, fmt.Errorf("upstream: unknown balancer %q", name)
 }
-
-type failoverPicker struct{ n int }
-
-func (p failoverPicker) Pick(_ uint64, attempt int) int { return attempt % p.n }
