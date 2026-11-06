@@ -69,6 +69,7 @@ type Checker[K, G comparable] struct {
 type entry[K, G comparable] struct {
 	last       Result
 	lastEnd    time.Time
+	touched    time.Time // the latest Touch while the target was up
 	target     Target
 	lat        latencyWindow
 	stop       func() bool        // pending timer
@@ -492,6 +493,29 @@ func (c *Checker[K, G]) CheckNow(key K) bool {
 	return true
 }
 
+// Touch records that real traffic just reached the target held under key:
+// while the target is up, its next check moves to an interval from now, so
+// that a target in use is not probed and only an idle one is. It costs a
+// lock and no timer, so it suits a hot path. Touch does not change the
+// target's health, and a target that is down or not yet judged is checked as
+// scheduled. A target with failures below Fall still counts as up, so traffic
+// also delays the checks that would confirm it down: call Touch only when the
+// traffic proves what the probe would, and CheckNow when traffic fails. It
+// reports whether the target was up; false also means there is no such key.
+func (c *Checker[K, G]) Touch(key K) bool {
+	now := c.clock.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.entries[key]
+	if c.closed || e == nil || e.health != upstream.HealthUp {
+		return false
+	}
+	if now.After(e.touched) {
+		e.touched = now
+	}
+	return true
+}
+
 // addSink registers s unless the Checker is closed, and then also
 // announces a goroutine that will call enter.
 func (c *Checker[K, G]) addSink(s *sink[K]) bool {
@@ -787,18 +811,39 @@ func (c *Checker[K, G]) delayLocked(e *entry[K, G], now time.Time) time.Duration
 	if j := min(o.Jitter, d); j > 0 {
 		d += rand.N(2*j+1) - j
 	}
-	return max(e.lastEnd.Add(d).Sub(now), 0)
+	from := e.lastEnd
+	if e.health == upstream.HealthUp && e.touched.After(from) {
+		from = e.touched
+	}
+	return max(from.Add(d).Sub(now), 0)
+}
+
+// touchedLocked reports whether traffic since the timer was set still
+// postpones e's check. It allows for the largest jitter, so a timer that the
+// jitter set early does not spin until the interval has passed.
+func (c *Checker[K, G]) touchedLocked(e *entry[K, G], now time.Time) bool {
+	if e.now || e.health != upstream.HealthUp || e.touched.IsZero() {
+		return false
+	}
+	o := c.optionsLocked(e)
+	return e.touched.Add(o.Interval - max(min(o.Jitter, o.Interval), 0)).After(now)
 }
 
 func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 	c.enter()
 	defer c.leave()
+	now := c.clock.Now()
 	c.mu.Lock()
 	if c.closed || e.gone || e.timer != timer || e.running || !c.checkableLocked(e) {
 		c.mu.Unlock()
 		return
 	}
 	e.stop = nil
+	if c.touchedLocked(e, now) {
+		c.mu.Unlock()
+		c.schedule(e)
+		return
+	}
 	e.running = true
 	e.now = false
 	t := e.target

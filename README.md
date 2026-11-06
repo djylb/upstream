@@ -437,7 +437,9 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
   jitter, and changed at any time with
   `Put`, `AddToGroup`, `SyncGroup` or `SetConfig`; the next check is
   rescheduled at once. `CheckNow` checks a target ahead of schedule, for
-  example after real traffic to it failed. A target whose checks stop goes
+  example after real traffic to it failed; `Touch` postpones the next check of
+  a healthy target after real traffic reached it, so that only idle targets
+  are probed. A target whose checks stop goes
   back to `HealthUnknown`.
 - **Removal** cancels the target's check in progress through its context,
   discards the result, stops its timer and frees its slot. Once `Remove`,

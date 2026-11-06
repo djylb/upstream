@@ -1391,3 +1391,47 @@ func TestProbeSeesDeadline(t *testing.T) {
 		t.Fatalf("probe deadline %v, want about a minute from %v", d, before)
 	}
 }
+
+func TestTouchPostponesChecksWhileUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, Config[string]{Options: Options{Interval: 10 * time.Second, UnhealthyInterval: time.Second, Fall: 1, Rise: 1}})
+		if h.c.Touch("a") {
+			t.Fatal("Touch of a missing key")
+		}
+		h.c.Put("a", h.sw.target("a"))
+		synctest.Wait()
+		if got := h.sw.count("a"); got != 1 {
+			t.Fatalf("first check: %d", got)
+		}
+		// Traffic every 5s keeps the target from being probed.
+		for range 6 {
+			h.tick(5)
+			if !h.c.Touch("a") {
+				t.Fatal("Touch of an up target")
+			}
+		}
+		if got := h.sw.count("a"); got != 1 {
+			t.Fatalf("checks during traffic: %d, want 1", got)
+		}
+		// Idle again: the check comes an interval after the last traffic.
+		h.tick(9)
+		if got := h.sw.count("a"); got != 1 {
+			t.Fatalf("checks before the interval passed: %d", got)
+		}
+		h.tick(1)
+		if got := h.sw.count("a"); got != 2 {
+			t.Fatalf("checks after the interval: %d, want 2", got)
+		}
+		// A down target is not postponed.
+		h.sw.set("a", true)
+		h.tick(10)
+		if h.c.Touch("a") {
+			t.Fatal("Touch of a down target")
+		}
+		before := h.sw.count("a")
+		h.tick(3)
+		if got := h.sw.count("a"); got != before+3 {
+			t.Fatalf("checks of a down target: %d, want %d", got, before+3)
+		}
+	})
+}
