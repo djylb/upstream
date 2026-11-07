@@ -22,8 +22,7 @@ func Classify(err error) Reason {
 	if errors.Is(err, ErrBadResponse) {
 		return ReasonResponse
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return ReasonDNS
 	}
 	if r, ok := errnoReason(err); ok {

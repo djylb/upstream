@@ -870,9 +870,7 @@ func TestDrainNeverClosesEarly(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	for g := range holding {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for !stop.Load() {
 				l, err := p.Pick()
 				if err != nil {
@@ -883,7 +881,7 @@ func TestDrainNeverClosesEarly(t *testing.T) {
 				holding[g].Store(0)
 				l.Release(Success)
 			}
-		}()
+		})
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	early := 0

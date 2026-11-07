@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -209,15 +210,8 @@ func runBackend[T any](l Lease[T], fn func(*Backend[T]) error) (retry bool, err 
 }
 
 func (r *Request[T]) has(c *core) bool {
-	for _, t := range r.tried[:min(r.n, len(r.tried))] {
-		if t == c {
-			return true
-		}
+	if slices.Contains(r.tried[:min(r.n, len(r.tried))], c) {
+		return true
 	}
-	for _, t := range r.more {
-		if t == c {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(r.more, c)
 }
