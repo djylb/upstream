@@ -94,7 +94,8 @@ type Check struct {
 // carried the request. The Check is copied; changing it later has no
 // effect.
 func Probe(c Check) health.Probe {
-	if c.Client == nil {
+	ownClient := c.Client == nil
+	if ownClient {
 		c.Client = defaultClient(serverName(c))
 	}
 	if c.Method == "" {
@@ -124,7 +125,7 @@ func Probe(c Check) health.Probe {
 				mu.Unlock()
 			}
 		}})
-		err := c.do(ctx, t.Address, expect)
+		err := c.do(ctx, t.Address, expect, ownClient)
 		mu.Lock()
 		defer mu.Unlock()
 		return obs, err
@@ -164,7 +165,9 @@ func defaultClient(serverName string) *http.Client {
 	}
 }
 
-func (c *Check) do(ctx context.Context, address string, expect []byte) error {
+// do sends one check. ownClient tells that c.Client is the default client,
+// which do may tidy.
+func (c *Check) do(ctx context.Context, address string, expect []byte, ownClient bool) error {
 	req, err := http.NewRequestWithContext(ctx, c.Method, c.Scheme+"://"+address+c.Path, http.NoBody)
 	if err != nil {
 		return err
@@ -180,6 +183,14 @@ func (c *Check) do(ctx context.Context, address string, expect []byte) error {
 	}
 	resp, err := c.Client.Do(req)
 	if err != nil {
+		if ownClient {
+			// A transport goes on dialing after the request's context
+			// ends, until the dial completes or the system gives up,
+			// which against an unreachable backend outlasts the check
+			// by far. This cancels the dials no request waits for any
+			// more; those of concurrent checks go on.
+			c.Client.CloseIdleConnections()
+		}
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
