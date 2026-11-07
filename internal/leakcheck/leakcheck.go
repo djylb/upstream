@@ -29,14 +29,16 @@ const settleWait = 5 * time.Second
 // up to settleWait, besides the caller, the test framework's and the
 // runtime's, or nil once there are none.
 func Find() error {
-	return find(settleWait)
+	return find(settleWait, nil)
 }
 
-func find(wait time.Duration) error {
+// find is Find with its wait, ignoring the goroutines whose ids are in
+// ignore.
+func find(wait time.Duration, ignore map[uint64]bool) error {
 	deadline := time.Now().Add(wait)
 	pause := time.Millisecond
 	for {
-		left := slices.DeleteFunc(goroutines(), goroutine.expected)
+		left := slices.DeleteFunc(goroutines(), func(g goroutine) bool { return ignore[g.id] || g.expected() })
 		if len(left) == 0 {
 			return nil
 		}
@@ -91,12 +93,14 @@ func leakProfile() string {
 
 // goroutine is one goroutine of a runtime.Stack dump.
 type goroutine struct {
+	id    uint64
 	top   string // the function running, without its arguments
 	stack string // the goroutine's whole dump
 }
 
 // expected reports a goroutine that is no leak: one of the test framework
-// waiting for its tests, or the runtime's signal and trace handling.
+// waiting for its tests, or the runtime's signal, trace and js/wasm event
+// handling.
 func (g goroutine) expected() bool {
 	switch g.top {
 	case "testing.RunTests", "testing.(*T).Run", "testing.(*T).Parallel", "testing.runFuzzTests", "testing.runFuzzing",
@@ -104,7 +108,7 @@ func (g goroutine) expected() bool {
 		"os/signal.signal_recv", "os/signal.loop", "runtime.ensureSigM", "runtime.ReadTrace":
 		return true
 	}
-	return strings.Contains(g.stack, "runtime/trace.Start")
+	return strings.Contains(g.stack, "runtime/trace.Start") || strings.Contains(g.stack, "runtime.handleEvent")
 }
 
 // goroutines returns every goroutine but the caller's.
@@ -138,12 +142,13 @@ func parse(dump string) (goroutine, bool) {
 		return goroutine{}, false
 	}
 	idText, _, ok := strings.Cut(strings.TrimPrefix(head, "goroutine "), " ")
-	if _, err := strconv.ParseUint(idText, 10, 64); !ok || err != nil {
+	id, err := strconv.ParseUint(idText, 10, 64)
+	if !ok || err != nil {
 		return goroutine{}, false
 	}
 	fn, _, _ := strings.Cut(rest, "\n")
 	if i := strings.LastIndexByte(fn, '('); i > 0 {
 		fn = fn[:i]
 	}
-	return goroutine{top: fn, stack: dump}, true
+	return goroutine{id: id, top: fn, stack: dump}, true
 }
