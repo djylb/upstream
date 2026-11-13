@@ -371,9 +371,10 @@ func (p *leastConnPicker) Pick(_ uint64, attempt int) int {
 
 // ParseBalancer returns the built-in Balancer with the given name, as its
 // String method writes it: "round-robin", "weighted-round-robin",
-// "random", "power-of-two", "least-conn" or "consistent-hash"
-// (with the default HashConfig). It suits configuration files; build a
-// ConsistentHash with options in code.
+// "random", "power-of-two", "least-conn", "consistent-hash" (with the
+// default HashConfig) or "rendezvous" (with the zero key). It suits
+// configuration files; build a ConsistentHash or Rendezvous with options in
+// code.
 func ParseBalancer(name string) (Balancer, error) {
 	switch name {
 	case "round-robin":
@@ -388,6 +389,8 @@ func ParseBalancer(name string) (Balancer, error) {
 		return LeastConn(), nil
 	case "consistent-hash":
 		return ConsistentHash(HashConfig{}), nil
+	case "rendezvous":
+		return Rendezvous(RendezvousConfig{}), nil
 	}
 	return nil, fmt.Errorf("upstream: unknown balancer %q", name)
 }

@@ -559,6 +559,7 @@ func testBalancers() map[string]Balancer {
 		"LeastConn":          LeastConn(),
 		"ConsistentHash":     ConsistentHash(HashConfig{}),
 		"BoundedHash":        ConsistentHash(HashConfig{LoadFactor: 1.25}),
+		"Rendezvous":         Rendezvous(RendezvousConfig{}),
 	}
 }
 

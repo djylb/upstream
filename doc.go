@@ -8,7 +8,7 @@
 //   - A [Balancer] builds a [Picker] from [Candidate] values and needs no
 //     pool: [RoundRobin], [WeightedRoundRobin], [Random], [PowerOfTwo],
 //     [LeastConn] and [ConsistentHash] (a hash ring with
-//     optional bounded loads), or any implementation of the interface.
+//     optional bounded loads), [Rendezvous] (highest random weight), or any implementation of the interface.
 //     Candidates carry in-flight counts, a moving average latency and the
 //     pool's backend, so custom balancers can route by load, latency or
 //     the backend's value; a [Rebuilder] updates its Picker incrementally.

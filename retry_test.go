@@ -314,7 +314,7 @@ func TestDrainWait(t *testing.T) {
 }
 
 func TestNamesRoundTrip(t *testing.T) {
-	for _, name := range []string{"round-robin", "weighted-round-robin", "random", "power-of-two", "least-conn", "consistent-hash"} {
+	for _, name := range []string{"round-robin", "weighted-round-robin", "random", "power-of-two", "least-conn", "consistent-hash", "rendezvous"} {
 		b, err := ParseBalancer(name)
 		if err != nil {
 			t.Fatal(err)

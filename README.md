@@ -11,7 +11,7 @@ the state of every backend.
   immutable view atomically, so updates never disturb picks in flight.
 - Balancers: round-robin, smooth weighted round-robin, weighted random,
   power-of-two-choices, least connections and consistent hashing with
-  optional bounded loads, or your own.
+  optional bounded loads, rendezvous hashing, or your own.
 - Priority tiers for active-backup setups, with per-backend caps on requests
   in flight and optional overflow to the next tier.
 - Passive health: ejection on consecutive failures or a failure rate, with
@@ -198,6 +198,7 @@ client := &http.Client{Transport: &uphttp.RoundTripper[string]{
 | `PowerOfTwo()`         | Two random candidates, the one with fewer requests in flight per weight.  |
 | `LeastConn()`          | Fewest requests in flight per weight, random tie-break; scans all.        |
 | `ConsistentHash(cfg)`  | Hash ring keyed by `PickKey`/`PickHash`; optional bounded loads.          |
+| `Rendezvous(cfg)`      | Weighted rendezvous (HRW) hashing with a SipHash key: key-affine, proportional to weight, minimal movement when members change; no ring to build. |
 
 Consistent hashing places backends by ID, so every process with the same IDs
 maps a key to the same backend, and adding or removing one of n backends moves

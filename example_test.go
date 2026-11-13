@@ -279,3 +279,21 @@ func ExamplePool_MarkOffline() {
 	// upstream: no backend available
 	// edge-1 offline -> healthy <nil>
 }
+
+func ExampleRendezvous() {
+	b := upstream.Rendezvous(upstream.RendezvousConfig{Key: [16]byte{1, 2, 3}})
+	members := []upstream.Candidate{{ID: "a", Weight: 1}, {ID: "b", Weight: 2}, {ID: "c", Weight: 1}}
+	before := b.Build(members)
+	after := b.Build(members[:2]) // c leaves
+
+	// Only the keys that were on c move.
+	moved := 0
+	for key := range uint64(1000) {
+		i, j := before.Pick(key, 0), after.Pick(key, 0)
+		if i != 2 && i != j {
+			moved++
+		}
+	}
+	fmt.Println(moved)
+	// Output: 0
+}
