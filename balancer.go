@@ -97,17 +97,17 @@ type counterPicker struct {
 }
 
 func newCounterPicker(n int) *counterPicker {
-	p := &counterPicker{n: uint64(n)}
+	p := &counterPicker{n: u64(n)}
 	p.next.Store(rand.Uint64())
 	return p
 }
 
-func (p *counterPicker) Pick(_ uint64, _ int) int { return int(p.next.Add(1) % p.n) }
+func (p *counterPicker) Pick(_ uint64, _ int) int { return index(p.next.Add(1) % p.n) }
 
 // WeightedRoundRobin returns a Balancer that implements smooth weighted
 // round-robin: over each cycle every candidate is picked in proportion to
 // its weight, and its picks are spread through the cycle instead of
-// bunched together. For weights 5, 1, 1 a cycle is a a b a c a a.
+// bunched together. For weights 5, 1, 1 a cycle is "aabacaa".
 //
 // The cycle is precomputed, which makes Pick a single atomic add, when it is
 // short enough: the sum of the weights divided by their greatest common
@@ -144,7 +144,7 @@ func (weightedRoundRobin) Build(c []Candidate) Picker {
 		s := newSmooth(w)
 		seq := make([]int32, cycle)
 		for i := range seq {
-			seq[i] = int32(s.next())
+			seq[i] = i32(s.next())
 		}
 		p := &sequencePicker{seq: seq, n: uint64(cycle)}
 		p.next.Store(rand.Uint64())
@@ -392,5 +392,5 @@ func ParseBalancer(name string) (Balancer, error) {
 	case "rendezvous":
 		return Rendezvous(RendezvousConfig{}), nil
 	}
-	return nil, fmt.Errorf("upstream: unknown balancer %q", name)
+	return nil, fmt.Errorf("upstream: unknown balancer %q", name) //nolint:err113 // a parse error names the text it rejected
 }

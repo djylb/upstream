@@ -108,12 +108,17 @@ func (c *TransportCache[K]) Get(key K) *http.Transport {
 	return t
 }
 
+// entryOf returns the cache entry that el holds.
+func entryOf[K comparable](el *list.Element) *cacheEntry[K] {
+	return el.Value.(*cacheEntry[K]) //nolint:forcetypeassert // the list holds only entries, pushed by Get
+}
+
 func (c *TransportCache[K]) useLocked(key K, now time.Time) *http.Transport {
 	el := c.entries[key]
 	if el == nil {
 		return nil
 	}
-	e := el.Value.(*cacheEntry[K])
+	e := entryOf[K](el)
 	if now.After(e.used) {
 		e.used = now
 	}
@@ -127,7 +132,7 @@ func (c *TransportCache[K]) expireLocked(now time.Time) []*http.Transport {
 	}
 	var dropped []*http.Transport
 	for el := c.lru.Back(); el != nil; el = c.lru.Back() {
-		if now.Sub(el.Value.(*cacheEntry[K]).used) < c.ttl {
+		if now.Sub(entryOf[K](el).used) < c.ttl {
 			break
 		}
 		dropped = append(dropped, c.dropLocked(el))
@@ -136,7 +141,8 @@ func (c *TransportCache[K]) expireLocked(now time.Time) []*http.Transport {
 }
 
 func (c *TransportCache[K]) dropLocked(el *list.Element) *http.Transport {
-	e := c.lru.Remove(el).(*cacheEntry[K])
+	c.lru.Remove(el)
+	e := entryOf[K](el)
 	delete(c.entries, e.key)
 	return e.transport
 }

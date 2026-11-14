@@ -78,5 +78,5 @@ func (r *Reason) UnmarshalText(b []byte) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("health: unknown reason %q", b)
+	return fmt.Errorf("health: unknown reason %q", b) //nolint:err113 // a parse error names the text it rejected
 }

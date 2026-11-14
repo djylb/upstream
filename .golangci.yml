@@ -1,0 +1,103 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # Formatting and naming style that gofmt and the code's idiom already
+    # settle: blank-line placement, short names in short scopes, the
+    # if err := f(); err != nil form, embedded-field spacing.
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - varnamelen
+    - noinlineerr
+    - embeddedstructfieldcheck
+    - lll
+    # Zero values are ready to use throughout the module; literals name
+    # only the fields they set.
+    - exhaustruct
+    - exhaustruct_v5
+    # Functions are ordered by topic, next to the code they serve.
+    - funcorder
+    # Pick, dial and report paths are written out in one function on
+    # purpose, so that they read top to bottom; size metrics flag exactly
+    # those.
+    - cyclop
+    - gocognit
+    - gocyclo
+    - nestif
+    - funlen
+    - maintidx
+    # Tests drive fake clocks and share fixtures, and internal tests need
+    # the packages' unexported state.
+    - paralleltest
+    - tparallel
+    - testpackage
+    # Errors from the connections, requests and contexts the package wraps
+    # are returned as they are, so that callers see the same errors as
+    # without it.
+    - wrapcheck
+    # Balancer, Picker and Clock are the package's interfaces: constructors
+    # and views return them.
+    - ireturn
+    # Named results document what a function returns and let deferred
+    # code set it.
+    - nonamedreturns
+    # Constants are explained where they are used: hash seeds, bit widths
+    # and percentages.
+    - mnd
+    # No import rules: the module has no dependencies.
+    - depguard
+    # Deprecated, replaced by gomodguard_v2.
+    - gomodguard
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # Checked on its own, as fieldalignment; what remains are
+        # pointer-byte reports, for which fields keep their order of
+        # meaning.
+        - fieldalignment
+    gosec:
+      excludes:
+        # math/rand picks backends and spreads jitter; none of it needs
+        # to be unpredictable.
+        - G404
+    exhaustive:
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    rules:
+      # Tests build errors in place, repeat their case names, addresses
+      # and paths, read globals as tables, unpack fixtures they partly
+      # ignore, call the net and net/http helpers that carry no context,
+      # close response bodies through helpers, assert types that the
+      # fixture fixed, marshal their own fixture types, and run the go
+      # tool and local servers.
+      - path: _test\.go
+        linters:
+          - err113
+          - goconst
+          - gochecknoglobals
+          - noctx
+          - bodyclose
+          - forcetypeassert
+          - musttag
+          - nilnil
+          - prealloc
+          - unparam
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G204|G304|G404|G705"
+      - path: internal/leakcheck/
+        linters:
+          - err113
+          - mnd
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

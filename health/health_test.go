@@ -105,6 +105,7 @@ type harness struct {
 // newHarness starts a checker with a fake clock and a 1s interval without
 // jitter.
 func newHarness(t *testing.T, cfg Config[string]) *harness {
+	t.Helper()
 	h := &harness{clk: fakeclock.New(), sw: newSwitchable(), rep: new(reports)}
 	cfg.Clock = h.clk
 	if cfg.Interval == 0 {
@@ -661,7 +662,7 @@ func TestWatchPool(t *testing.T) {
 		sw := newSwitchable()
 		sw.set("2", true)
 		target := func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} }
-		c := mustWatch(t, t.Context(), p, target, Config[string]{Clock: clk, Options: Options{Interval: time.Second, Fall: 2, Jitter: -1}})
+		c := mustWatch(t.Context(), t, p, target, Config[string]{Clock: clk, Options: Options{Interval: time.Second, Fall: 2, Jitter: -1}})
 		synctest.Wait()
 		b, _ := p.Backend("b")
 		if b.State() != upstream.StateUnhealthy || !errors.Is(b.Status().LastCheck.Err, errDown) || b.Status().Health != down {
@@ -817,6 +818,7 @@ func TestTCP(t *testing.T) {
 // checkGoroutines returns a function that fails the test if goroutines
 // started since remain after a grace period.
 func checkGoroutines(t *testing.T) func() {
+	t.Helper()
 	before := runtime.NumGoroutine()
 	return func() {
 		deadline := time.Now().Add(5 * time.Second)
@@ -875,7 +877,7 @@ func TestWatchIgnoresStaleAddress(t *testing.T) {
 		}
 		sw := newSwitchable()
 		sw.set("old", true)
-		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: fakeclock.New()})
 		defer c.Close()
 		synctest.Wait()
@@ -1067,7 +1069,7 @@ func TestWatchCloseFromPoolSubscriber(t *testing.T) {
 				once.Do(func() { w.Close(); close(closed) }) // on the dispatcher, through ReportCheck
 			}
 		})
-		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: fakeclock.New(), Options: Options{Rise: 1}})
 		synctest.Wait()
 		cp.Store(c)
@@ -1093,7 +1095,7 @@ func TestConcurrentCloseFromTwoProbes(t *testing.T) {
 	var barrier sync.WaitGroup
 	barrier.Add(2)
 	done := make(chan struct{}, 2)
-	probe := func(ctx context.Context, _ Target) (Observation, error) {
+	probe := func(_ context.Context, _ Target) (Observation, error) {
 		barrier.Done()
 		barrier.Wait()
 		c.Close()
@@ -1127,7 +1129,7 @@ func TestCloseFromCallbackAndProbe(t *testing.T) {
 	var c *Checker[string, string]
 	inProbe := make(chan struct{})
 	done := make(chan struct{}, 2)
-	probe := func(ctx context.Context, tg Target) (Observation, error) {
+	probe := func(_ context.Context, tg Target) (Observation, error) {
 		if tg.Address == "slow" {
 			close(inProbe)
 			time.Sleep(100 * time.Millisecond) // let the callback reach Close
@@ -1179,7 +1181,7 @@ func TestPerTargetIntervalDefaults(t *testing.T) {
 func TestDoneAndWait(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		gate := make(chan struct{})
-		probe := func(ctx context.Context, _ Target) (Observation, error) {
+		probe := func(_ context.Context, _ Target) (Observation, error) {
 			<-gate // ignores ctx on purpose: Done must wait for it
 			return Observation{}, nil
 		}

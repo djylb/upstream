@@ -31,7 +31,7 @@ func TestProbe(t *testing.T) {
 	var last *http.Request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		last = r.Clone(context.Background())
+		last = r.Clone(context.Background()) //nolint:contextcheck // kept after the handler returns, so detached from the request
 		mu.Unlock()
 		switch r.URL.Path {
 		case "/ok":
@@ -279,7 +279,7 @@ func TestTransportCacheRace(t *testing.T) {
 // unreachable backend is reported healthy.
 func TestDefaultClientIgnoresEnvProxy(t *testing.T) {
 	var hits atomic.Int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))

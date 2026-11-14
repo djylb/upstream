@@ -71,6 +71,7 @@ func ExampleWatch() {
 		return
 	}
 	defer watcher.Close()
+	// Output:
 }
 
 // A tunnel client keeps one pool per tunnel to balance new connections
@@ -79,7 +80,7 @@ func ExampleWatch() {
 func ExampleAttach() {
 	checker := health.New[string, int](context.Background(), health.Config[string]{
 		Options: health.Options{Interval: 10 * time.Second, Timeout: 3 * time.Second},
-		OnChange: func(r health.Report[string]) {
+		OnChange: func(health.Report[string]) {
 			// Report reachability upstream: r.Key, r.Previous -> r.Health,
 			// r.Reason, r.Stats.Average.
 		},

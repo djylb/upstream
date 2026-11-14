@@ -44,8 +44,8 @@ func TestTiersPreferLowestPriority(t *testing.T) {
 			a1, _ := p.Backend("a1")
 			a2, _ := p.Backend("a2")
 			p.ReportCheck(a1, HealthDown, CheckResult{})
-			if got := pickIDs(t, p, 50); got["a2"] != 50 {
-				t.Fatalf("picks %v, want all on a2", got)
+			if g := pickIDs(t, p, 50); g["a2"] != 50 {
+				t.Fatalf("picks %v, want all on a2", g)
 			}
 			// The whole tier down: the next tier takes over, balanced.
 			p.ReportCheck(a2, HealthDown, CheckResult{})
@@ -266,10 +266,10 @@ func TestTierOverflow(t *testing.T) {
 	}
 	l.Release(Success)
 	held.Release(Success)
-	if l := mustPick(t, p); l.Backend().ID() != "a" {
-		t.Fatalf("pick after release went to %s", l.Backend().ID())
+	if l2 := mustPick(t, p); l2.Backend().ID() != "a" {
+		t.Fatalf("pick after release went to %s", l2.Backend().ID())
 	} else {
-		held = l
+		held = l2
 	}
 
 	// Panic mode: every member down, a full, b takes the overflow.
@@ -277,10 +277,10 @@ func TestTierOverflow(t *testing.T) {
 		bk, _ := p.Backend(id)
 		p.ReportCheck(bk, HealthDown, CheckResult{})
 	}
-	if l := mustPick(t, p); l.Backend().ID() != "b" {
-		t.Fatalf("panic pick went to %s", l.Backend().ID())
+	if l2 := mustPick(t, p); l2.Backend().ID() != "b" {
+		t.Fatalf("panic pick went to %s", l2.Backend().ID())
 	} else {
-		l.Release(Success)
+		l2.Release(Success)
 	}
 	if err := p.SetConfig(Config{Fallback: FallbackAll}); err != nil {
 		t.Fatal(err)

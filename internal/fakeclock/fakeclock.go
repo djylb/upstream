@@ -89,7 +89,7 @@ func (c *Clock) WithTimeout(parent context.Context, d time.Duration) (context.Co
 // which reports context.DeadlineExceeded rather than context.Canceled when
 // the fake deadline passed. Cause comes from the inner context.
 type timeoutCtx struct {
-	context.Context // inner, canceled with the cause
+	context.Context //nolint:containedctx // the inner context, canceled with the cause; timeoutCtx is a context itself
 	deadline        time.Time
 	once            sync.Once
 	done            chan struct{}

@@ -281,13 +281,13 @@ type core struct {
 	successes atomic.Uint64
 	failures  atomic.Uint64
 	flags     atomic.Uint32
+	reported  State // last state announced in an event; guarded by the pool's mutex
 	det       OutlierDetector
 	drain     atomic.Pointer[Drain]
 	check     atomic.Pointer[CheckResult]
 	rampStart atomic.Int64 // slow start: 0 none, -1 pending, else unix nanoseconds
 	neutrals  atomic.Uint64
 	offline   atomic.Pointer[error] // the cause given to MarkOffline; set before flagOffline
-	reported  State                 // last state announced in an event; guarded by the pool's mutex
 }
 
 func stateOf(f uint32, o OutlierState) State {

@@ -91,7 +91,7 @@ func TestRoundTripperRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 	if got := fb.requests(); len(got) != 2 || got[0] != "busy " || got[1] != "ok " {
@@ -113,7 +113,7 @@ func TestRoundTripperRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 503 || len(fb.requests()) != 1 {
+	if resp.StatusCode != http.StatusServiceUnavailable || len(fb.requests()) != 1 {
 		t.Fatalf("POST: status %d", resp.StatusCode)
 	}
 
@@ -125,14 +125,14 @@ func TestRoundTripperRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if got := fb.requests(); resp.StatusCode != 200 || len(got) != 2 || got[1] != "ok data" {
+	if got := fb.requests(); resp.StatusCode != http.StatusOK || len(got) != 2 || got[1] != "ok data" {
 		t.Fatalf("POST after a refused dial: %d, %q", resp.StatusCode, got)
 	}
 
 	// A body that cannot be read again is not retried.
 	req, _ := http.NewRequest(http.MethodPut, "http://service/", io.NopCloser(strings.NewReader("once")))
-	if _, err := client.Do(req); err == nil || len(fb.requests()) != 1 {
-		t.Fatalf("PUT without GetBody: %v", err)
+	if _, derr := client.Do(req); derr == nil || len(fb.requests()) != 1 {
+		t.Fatalf("PUT without GetBody: %v", derr)
 	}
 
 	// Without retries the failed response comes back.
@@ -143,7 +143,7 @@ func TestRoundTripperRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 503 || r.Status()[0].Failures != 1 || r.Status()[0].InFlight != 0 {
+	if resp.StatusCode != http.StatusServiceUnavailable || r.Status()[0].Failures != 1 || r.Status()[0].InFlight != 0 {
 		t.Fatalf("status %d, %+v", resp.StatusCode, r.Status()[0])
 	}
 }
@@ -274,7 +274,7 @@ func TestRoundTripperUpgrade(t *testing.T) {
 
 func TestRoundTripperPanicsRelease(t *testing.T) {
 	ok := rtFunc(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("x")), Request: r}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("x")), Request: r}, nil
 	})
 	for name, rt := range map[string]*RoundTripper[string]{
 		"Rewrite":   {Rewrite: func(*http.Request, *upstream.Backend[string]) { panic("boom") }},
@@ -326,19 +326,21 @@ func TestRoundTripperRetryAndOutcomeApart(t *testing.T) {
 		Pool:      p,
 		Transport: func(*upstream.Backend[string]) http.RoundTripper { return fb },
 		Outcome: func(resp *http.Response, err error) upstream.Outcome {
-			if err == nil && resp.StatusCode == 503 {
+			if err == nil && resp.StatusCode == http.StatusServiceUnavailable {
 				return upstream.Neutral
 			}
 			return upstream.OutcomeOf(err)
 		},
-		Retry: func(resp *http.Response, err error) bool { return err != nil || resp.StatusCode == 503 },
+		Retry: func(resp *http.Response, err error) bool {
+			return err != nil || resp.StatusCode == http.StatusServiceUnavailable
+		},
 	}
 	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 	if s := p.Status()[0]; s.Neutrals != 1 || s.Failures != 0 {
@@ -356,7 +358,7 @@ func TestRoundTripperRetryAndOutcomeApart(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 503 || p2.Status()[0].InFlight != 0 {
+	if resp.StatusCode != http.StatusServiceUnavailable || p2.Status()[0].InFlight != 0 {
 		t.Fatalf("status %d, %+v", resp.StatusCode, p2.Status()[0])
 	}
 }
@@ -373,7 +375,7 @@ func TestRoundTripperAttemptTimeout(t *testing.T) {
 		if _, ok := r.Context().Deadline(); !ok {
 			t.Error("attempt context has no deadline")
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})
 	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return tr }, AttemptTimeout: 10 * time.Millisecond}
 	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
@@ -420,7 +422,7 @@ func TestRoundTripperLatencyUsesPoolClock(t *testing.T) {
 	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
 			clk.Advance(9 * time.Millisecond)
-			return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
 		})
 	}}
 	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
@@ -465,7 +467,7 @@ func TestRoundTripperNilAddress(t *testing.T) {
 // slowBody is a response body that advances clk by step on each Read and
 // fails if its request's context has ended.
 type slowBody struct {
-	ctx   context.Context
+	ctx   context.Context //nolint:containedctx // a body reads on behalf of one request, as its Body does
 	clk   *fakeclock.Clock
 	step  time.Duration
 	reads int
@@ -504,7 +506,7 @@ func TestRoundTripperHeaderTimeout(t *testing.T) {
 			<-r.Context().Done()
 			return nil, r.Context().Err()
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})
 	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return tr }, HeaderTimeout: 10 * time.Millisecond}
 	resp, err := (&http.Client{Transport: rt}).Get("http://service/")
@@ -535,7 +537,7 @@ func TestRoundTripperHeaderTimeoutLoses(t *testing.T) {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
 			clk.Advance(time.Millisecond)
 			<-r.Context().Done() // fired, but answer anyway
-			return &http.Response{StatusCode: 200, Body: closeFunc(func() { closed = true }), Request: r}, nil
+			return &http.Response{StatusCode: http.StatusOK, Body: closeFunc(func() { closed = true }), Request: r}, nil
 		})
 	}}
 	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrHeaderTimeout) || !closed {
@@ -564,7 +566,7 @@ func TestRoundTripperHeaderTimeoutStreams(t *testing.T) {
 		rt := &RoundTripper[string]{Pool: p, HeaderTimeout: 10 * time.Millisecond, AttemptTimeout: tc.attempt, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 			return rtFunc(func(r *http.Request) (*http.Response, error) {
 				clk.Advance(5 * time.Millisecond)
-				return &http.Response{StatusCode: 200, Body: &slowBody{ctx: r.Context(), clk: clk, step: 10 * time.Millisecond, reads: 5}, Request: r}, nil
+				return &http.Response{StatusCode: http.StatusOK, Body: &slowBody{ctx: r.Context(), clk: clk, step: 10 * time.Millisecond, reads: 5}, Request: r}, nil
 			})
 		}}
 		resp, err := (&http.Client{Transport: rt}).Get("http://service/")
@@ -604,10 +606,10 @@ func TestRoundTripperGetBodyErrorStopsTimer(t *testing.T) {
 	p := newRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 3}}, "a", "b")
 	rt := &RoundTripper[string]{Pool: p, AttemptTimeout: time.Hour, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 503, Body: http.NoBody, Request: r}, nil
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody, Request: r}, nil
 		})
 	}}
-	req, _ := http.NewRequest("PUT", "http://service/", strings.NewReader("x"))
+	req, _ := http.NewRequest(http.MethodPut, "http://service/", strings.NewReader("x"))
 	req.Header.Set("Idempotency-Key", "1")
 	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("no body") }
 	resp, err := rt.RoundTrip(req)

@@ -96,7 +96,7 @@ func TestOutlierBackoffAndHalfOpen(t *testing.T) {
 			t1, ok1 := d.Admit()
 			t2, ok2 := d.Admit()
 			if _, ok3 := d.Admit(); !ok1 || !ok2 || ok3 {
-				t.Fatalf("half-open admits %v %v %v, want true true false", ok1, ok2, ok3)
+				t.Fatalf("half-open admits %v, %v, %v, want two admitted, then one refused", ok1, ok2, ok3)
 			}
 			d.Record(t1, Failure)
 			if d.State() != OutlierEjected || !errors.Is(d.Status().Cause, ErrTrialFailed) {

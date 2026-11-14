@@ -113,8 +113,8 @@ func newOutlierParams(c OutlierConfig, clock Clock, epoch time.Time) *outlierPar
 		minReq:   float64(c.MinRequests),
 		percent:  float64(min(max(c.FailurePercent, 0), 100)),
 		consec:   uint32(min(max(c.ConsecutiveFailures, 0), math.MaxInt32)),
-		trials:   int32(min(c.HalfOpenRequests, 1<<30)),
-		trialsOK: int32(min(c.HalfOpenSuccesses, 1<<30)),
+		trials:   i32(min(c.HalfOpenRequests, 1<<30)),
+		trialsOK: i32(min(c.HalfOpenSuccesses, 1<<30)),
 		epoch:    epoch,
 	}
 	if c.MaxEjectionPercent > 0 && c.MaxEjectionPercent < 100 {
@@ -240,7 +240,6 @@ type OutlierDetector struct {
 	trialsOK  atomic.Uint64 // half-open period<<32 | successful trials
 	refused   atomic.Uint64
 	params    atomic.Pointer[outlierParams]
-	enabled   atomic.Bool // params.enabled(); set with params under mu
 	onChange  func()
 	guard     *ejectionGuard // the pool's cap on ejections, or nil
 
@@ -250,6 +249,8 @@ type OutlierDetector struct {
 	level  uint        // ejections without recovery; guarded by mu
 	held   bool        // holds one of guard's ejections; guarded by mu
 	closed bool        // guarded by mu
+
+	enabled atomic.Bool // params.enabled(); set with params under mu
 }
 
 // ejectionGuard caps the share of a pool's members that are ejected or
@@ -358,7 +359,7 @@ func (d *OutlierDetector) admitTrial() (Ticket, bool) {
 	for {
 		v := d.trials.Load()
 		n := periodCount(v, gen)
-		if n >= uint32(d.params.Load().trials) {
+		if n >= u32(d.params.Load().trials) {
 			return Ticket{}, false
 		}
 		if d.trials.CompareAndSwap(v, uint64(gen)<<32|uint64(n+1)) {
@@ -378,7 +379,7 @@ func periodCount(v uint64, gen uint32) uint32 {
 	if uint32(v>>32) != gen {
 		return 0
 	}
-	return uint32(v)
+	return low32(v)
 }
 
 // releaseTrial returns the trial slot of a ticket from period gen. A
@@ -441,7 +442,7 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 			v := d.trialsOK.Load()
 			n := periodCount(v, gen) + 1
 			if d.trialsOK.CompareAndSwap(v, uint64(gen)<<32|uint64(n)) {
-				if n >= uint32(d.params.Load().trialsOK) {
+				if n >= u32(d.params.Load().trialsOK) {
 					d.recover(gen)
 				}
 				return
@@ -641,7 +642,7 @@ func (w *window) add(now, size time.Duration, delta uint64) (total, part float64
 	prev := w.prev.Load()
 	weight := 1 - float64(now%size)/float64(size)
 	total = float64(c>>32) + float64(prev>>32)*weight
-	part = float64(uint32(c)) + float64(uint32(prev))*weight
+	part = float64(low32(c)) + float64(low32(prev))*weight
 	return total, part
 }
 
@@ -668,7 +669,7 @@ func (w *window) addPartWithin(now, size time.Duration, base, ratio float64) boo
 		c := w.cur.Load()
 		prev := w.prev.Load()
 		total := float64(c>>32) + float64(prev>>32)*weight
-		part := float64(uint32(c)) + float64(uint32(prev))*weight
+		part := float64(low32(c)) + float64(low32(prev))*weight
 		if part+1 > base+ratio*total {
 			return false
 		}
@@ -683,7 +684,7 @@ func (w *window) addPartWithin(now, size time.Duration, base, ratio float64) boo
 func (w *window) removePart() {
 	for {
 		c := w.cur.Load()
-		if uint32(c) == 0 || w.cur.CompareAndSwap(c, c-windowPart) {
+		if low32(c) == 0 || w.cur.CompareAndSwap(c, c-windowPart) {
 			return
 		}
 	}

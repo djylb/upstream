@@ -41,7 +41,7 @@ import (
 // and none of them waits for a probe or callback. No lock is held while a
 // probe, the Clock or a callback runs.
 type Checker[K, G comparable] struct {
-	ctx       context.Context
+	ctx       context.Context //nolint:containedctx // the Checker's lifetime, canceled by Close; probes and callbacks derive from it
 	cancel    context.CancelFunc
 	stopAfter func() bool
 	clock     upstream.Clock
@@ -125,9 +125,9 @@ func New[K, G comparable](ctx context.Context, cfg Config[K]) *Checker[K, G] {
 	}
 	c.sem = make(chan struct{}, n)
 	c.setConfigLocked(cfg)
-	c.ctx, c.cancel = context.WithCancel(ctx)
-	c.pending = 2 // the dispatcher and the shutdown hook
-	c.stopAfter = context.AfterFunc(c.ctx, func() {
+	c.ctx, c.cancel = context.WithCancel(ctx)       //nolint:gosec // c.cancel is called by shutdown
+	c.pending = 2                                   // the dispatcher and the shutdown hook
+	c.stopAfter = context.AfterFunc(c.ctx, func() { //nolint:contextcheck // runs after the context ended; shutdown needs no live one
 		c.enter()
 		defer c.leave()
 		c.shutdown()

@@ -525,6 +525,7 @@ func TestPickDoesNotAllocate(t *testing.T) {
 }
 
 func testPickAllocs(t *testing.T, name string, b Balancer, n int) {
+	t.Helper()
 	{
 		p := New[string](Config{Balancer: b, Outlier: OutlierConfig{ConsecutiveFailures: 1000}})
 		ts := make([]Target[string], n)
@@ -1279,7 +1280,9 @@ func panicEvents(p *Pool[string]) func() []*BalancerPanicError {
 	p.Subscribe(func(ev Event[string]) {
 		if ev.Kind == EventBalancerPanic {
 			mu.Lock()
-			got = append(got, ev.Err.(*BalancerPanicError))
+			if pe, ok := errors.AsType[*BalancerPanicError](ev.Err); ok {
+				got = append(got, pe)
+			}
 			mu.Unlock()
 		}
 	})

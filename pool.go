@@ -216,13 +216,11 @@ const rampScale = 16
 // its status; neither calls out while held. rampMu (the slow-start timer)
 // is taken alone.
 type Pool[T any] struct {
-	view      atomic.Pointer[view[T]]
-	retry     atomic.Pointer[retryParams]
-	budget    window // retry budget: first attempts and retries
-	guard     ejectionGuard
-	clock     Clock
-	isClosed  atomic.Bool
-	rampArmed atomic.Bool
+	view   atomic.Pointer[view[T]]
+	retry  atomic.Pointer[retryParams]
+	budget window // retry budget: first attempts and retries
+	guard  ejectionGuard
+	clock  Clock
 
 	mu       sync.Mutex
 	cfg      settings[T]
@@ -233,13 +231,16 @@ type Pool[T any] struct {
 	building bool             // a goroutine is building the view
 	closed   bool
 
+	isClosed  atomic.Bool // Close has been called; read without mu
+	rampArmed atomic.Bool // a slow-start timer is pending
+	flushing  bool        // guarded by qmu
+
 	// Owned by the building goroutine.
 	built    map[int]builtTier // the latest Picker built for each priority
 	builtGen uint64            // settings.gen of built
 
-	qmu      sync.Mutex
-	queue    []delivery[T]
-	flushing bool
+	qmu   sync.Mutex
+	queue []delivery[T]
 
 	rampMu   sync.Mutex
 	rampStop func() bool
@@ -1041,7 +1042,7 @@ func scan[T any](bs []*Backend[T], hash uint64, tried *Request[T], ignoreHealth 
 	if n == 0 {
 		return Lease[T]{}, res
 	}
-	start := int(hash % uint64(n))
+	start := index(hash % u64(n))
 	for k := range n {
 		i := start + k
 		if i >= n {

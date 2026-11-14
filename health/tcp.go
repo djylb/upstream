@@ -122,10 +122,13 @@ func addrString(a net.Addr) string {
 // simulated networks of js and wasip1 refuse sockets that have one.
 const controlHooks = runtime.GOOS != "js" && runtime.GOOS != "wasip1"
 
+// defaultNetwork is the network that an empty Target.Network stands for.
+const defaultNetwork = "tcp"
+
 // normNetwork returns the network that an empty one stands for.
 func normNetwork(network string) string {
 	if network == "" {
-		return "tcp"
+		return defaultNetwork
 	}
 	return network
 }

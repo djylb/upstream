@@ -107,7 +107,7 @@ func TestRendezvousRetriesFollowRank(t *testing.T) {
 		for k := range uint64(200) {
 			seen := map[int]bool{}
 			var order []int
-			for a := range len(c) {
+			for a := range c {
 				i := p.Pick(k, a)
 				if seen[i] {
 					t.Fatalf("key %d attempt %d repeated candidate %d", k, a, i)

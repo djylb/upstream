@@ -16,7 +16,7 @@ func parseName[E enum](s string, n E, what string) (E, error) {
 			return v, nil
 		}
 	}
-	return 0, fmt.Errorf("upstream: unknown %s %q", what, s)
+	return 0, fmt.Errorf("upstream: unknown %s %q", what, s) //nolint:err113 // a parse error names the text it rejected
 }
 
 // UnmarshalText decodes a state from its name.

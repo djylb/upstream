@@ -113,7 +113,7 @@ type RoundTripper[T any] struct {
 
 // RoundTrip implements http.RoundTripper.
 func (rt *RoundTripper[T]) RoundTrip(req *http.Request) (*http.Response, error) {
-	rewrite := func(r *http.Request, b *upstream.Backend[T]) error { rt.Rewrite(r, b); return nil }
+	rewrite := func(r *http.Request, b *upstream.Backend[T]) error { rt.Rewrite(r, b); return nil } //nolint:unparam // shares its signature with defaultRewrite, which can fail
 	if rt.Rewrite == nil {
 		if rewrite = defaultRewrite[T](); rewrite == nil {
 			closeBody(req)
@@ -224,7 +224,7 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 		return a
 	}
 	start := clock.Now()
-	a.resp, a.err = rt.transport(b).RoundTrip(out)
+	a.resp, a.err = rt.transport(b).RoundTrip(out) //nolint:bodyclose // the response goes to the caller, who closes it
 	if hdr != nil && !hdr.headers() && req.Context().Err() == nil && errors.Is(context.Cause(ctx), ErrHeaderTimeout) {
 		if a.resp != nil && a.resp.Body != nil {
 			_ = a.resp.Body.Close()

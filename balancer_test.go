@@ -56,7 +56,6 @@ func TestWeightedRoundRobinIsSmooth(t *testing.T) {
 			t.Fatalf("cycle = %v, want a rotation of %v", got, want)
 		}
 	}
-
 }
 
 func TestWeightedRoundRobinCounts(t *testing.T) {
@@ -335,7 +334,7 @@ func TestBoundedHashAttemptsAreDistinct(t *testing.T) {
 		owner := p.Pick(key, 0)
 		c[owner].InFlight.Store(50) // over its cap
 		seen := map[int]bool{}
-		for attempt := range len(c) {
+		for attempt := range c {
 			seen[p.Pick(key, attempt)] = true
 		}
 		if len(seen) != len(c) {

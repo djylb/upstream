@@ -49,7 +49,7 @@ func ExampleProbe() {
 func ExampleTransportCache() {
 	pool := upstream.New[string](upstream.Config{})
 	defer pool.Close()
-	cache := uphttp.NewTransportCache(func(id string) *http.Transport {
+	cache := uphttp.NewTransportCache(func(string) *http.Transport {
 		return &http.Transport{MaxIdleConnsPerHost: 16, IdleConnTimeout: time.Minute}
 	}, uphttp.TransportCacheConfig{IdleTTL: 10 * time.Minute, MaxEntries: 1024})
 	defer cache.CloseIdleConnections()

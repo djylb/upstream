@@ -13,7 +13,7 @@ import (
 	"github.com/djylb/upstream/internal/fakeclock"
 )
 
-func mustWatch[T any](t *testing.T, ctx context.Context, p *upstream.Pool[T], target func(*upstream.Backend[T]) Target, cfg Config[string]) *Watcher {
+func mustWatch[T any](ctx context.Context, t *testing.T, p *upstream.Pool[T], target func(*upstream.Backend[T]) Target, cfg Config[string]) *Watcher {
 	t.Helper()
 	w, err := Watch(ctx, p, target, cfg)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestCloseResetsPoolHealth(t *testing.T) {
 			sw.set("a", true)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			w := mustWatch(t, ctx, p, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) },
+			w := mustWatch(ctx, t, p, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) },
 				Config[string]{Clock: fakeclock.New()})
 			synctest.Wait()
 			if _, err := p.Pick(); !errors.Is(err, upstream.ErrUnavailable) {
@@ -212,7 +212,7 @@ func TestAttachReplaysMissedReport(t *testing.T) {
 func TestAttachNilTarget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := newPool(t, upstream.Target[string]{ID: "a", Value: "192.0.2.1:22"})
-		w := mustWatch(t, t.Context(), p, nil, Config[string]{Clock: fakeclock.New(), Options: Options{Disabled: true}})
+		w := mustWatch(t.Context(), t, p, nil, Config[string]{Clock: fakeclock.New(), Options: Options{Disabled: true}})
 		defer w.Close()
 		synctest.Wait()
 		s, ok := w.Status("a")
@@ -400,7 +400,7 @@ func TestWatchEndsWithPool(t *testing.T) {
 		}
 		sw := newSwitchable()
 		clk := fakeclock.New()
-		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: clk})
 		synctest.Wait()
 		p.Close()
@@ -419,7 +419,7 @@ func TestWatchMatchesGenerations(t *testing.T) {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
-		c := mustWatch(t, t.Context(), p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
+		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: fakeclock.New()})
 		defer c.Close()
 		synctest.Wait()

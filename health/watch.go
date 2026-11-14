@@ -63,7 +63,7 @@ func Attach[G comparable, T any](c *Checker[string, G], g G, pool *upstream.Pool
 // address, preceded by its network and a slash unless that is "tcp" or
 // empty, such as "10.0.0.5:22" or "udp/10.0.0.9:53".
 func TargetKey(t Target) string {
-	if n := normNetwork(t.Network); n != "tcp" {
+	if n := normNetwork(t.Network); n != defaultNetwork {
 		return n + "/" + t.Address
 	}
 	return t.Address

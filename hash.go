@@ -76,7 +76,7 @@ func (h consistentHash) ringCounts(c []Candidate) (counts []int32, sum int64) {
 func appendPoints(points []ringPoint, id string, n int32, i int) []ringPoint {
 	base := hashString(id)
 	for r := range n {
-		points = append(points, ringPoint{hash: mix64(base + uint64(r)*0x9e3779b97f4a7c15), owner: int32(i)})
+		points = append(points, ringPoint{hash: mix64(base + uint64(r)*0x9e3779b97f4a7c15), owner: i32(i)})
 	}
 	return points
 }
@@ -276,7 +276,7 @@ func (p *ringPicker) walk(pos, skip int, budget float64, under bool) (owner, fou
 // ConsistentHash and Pool.PickKey and does not change.
 func hashString(s string) uint64 {
 	h := uint64(0xcbf29ce484222325)
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		h ^= uint64(s[i])
 		h *= 0x100000001b3
 	}

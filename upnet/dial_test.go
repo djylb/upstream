@@ -132,19 +132,19 @@ func TestDialTCP(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 	done := make(chan error, 1)
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			done <- err
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			done <- aerr
 			return
 		}
 		defer func() { _ = c.Close() }()
 		buf := make([]byte, 4)
-		if _, err := io.ReadFull(c, buf); err != nil {
-			done <- err
+		if _, rerr := io.ReadFull(c, buf); rerr != nil {
+			done <- rerr
 			return
 		}
-		_, err = c.Write(buf)
-		done <- err
+		_, werr := c.Write(buf)
+		done <- werr
 	}()
 	p := newPool(t, upstream.Config{Balancer: upstream.LeastConn()}, upstream.Target[string]{ID: "l", Value: ln.Addr().String()})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
