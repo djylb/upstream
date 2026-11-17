@@ -274,3 +274,62 @@ func TestStateChangeCostIsPerTier(t *testing.T) {
 		t.Fatalf("%d bytes per change beside large tiers, %d beside small ones", large, small)
 	}
 }
+
+// TestSmallTierRanksOnStack checks that a pick past the first choice on a
+// small Rendezvous tier does not allocate.
+func TestSmallTierRanksOnStack(t *testing.T) {
+	p := New[int](Config{Balancer: Rendezvous(RendezvousConfig{})})
+	defer p.Close()
+	const n = 8
+	for i := range n {
+		if err := p.Put(Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range n - 1 {
+		if _, err := p.Acquire(strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := uint64(0)
+	if a := testing.AllocsPerRun(100, func() {
+		key++
+		l, err := p.PickHash(key)
+		if err != nil || l.Backend().ID() != strconv.Itoa(n-1) {
+			t.Fatalf("pick %v: %v", l.Backend(), err)
+		}
+		l.Release(Success)
+	}); a != 0 {
+		t.Fatalf("%v allocations per pick", a)
+	}
+}
+
+// TestHealthyGroupSharesLists checks that a tier whose open members are
+// all eligible keeps one list for both, so that a small pool pays for one.
+func TestHealthyGroupSharesLists(t *testing.T) {
+	p := New[int](Config{})
+	defer p.Close()
+	if err := p.Sync([]Target[int]{{ID: "a"}, {ID: "b"}, {ID: "c"}}); err != nil {
+		t.Fatal(err)
+	}
+	shared := func(when string) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if g := p.groups[0]; !sameList(g.elig, g.open) {
+			t.Fatalf("%s: a healthy group keeps two lists", when)
+		}
+	}
+	shared("after Sync")
+	b, _ := p.Backend("b")
+	p.MarkOffline(b, nil)
+	p.MarkOnline(b)
+	shared("after a state change")
+	if err := p.SetConfig(Config{}); err != nil {
+		t.Fatal(err)
+	}
+	shared("after SetConfig")
+	c, _ := p.Backend("c")
+	p.ReportCheck(c, HealthDown, CheckResult{})
+	p.Remove("c") // the eligible list stays as it was; the open one shrinks to it
+	shared("after removing the only ineligible member")
+}

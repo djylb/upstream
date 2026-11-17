@@ -11,7 +11,7 @@
 //     optional bounded loads), [Rendezvous] (highest random weight), or any implementation of the interface.
 //     Candidates carry in-flight counts, a moving average latency and the
 //     pool's backend, so custom balancers can route by load, latency or
-//     the backend's value; a [Rebuilder] updates its Picker incrementally.
+//     the backend's value; an [Updater] updates its Picker incrementally.
 //   - An [OutlierDetector] is passive health checking for one backend:
 //     consecutive failures or a failure rate eject it, with exponential
 //     backoff, and half-open trials let it back in.

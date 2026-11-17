@@ -40,10 +40,10 @@ func (c *Candidate) weight() int64 {
 // come back, are ejected or restored, and at the steps of a slow start; a
 // tier whose candidates did not change keeps its Picker. Calls never overlap for one pool and never happen
 // while the pool holds a lock; picks use the previous Picker until Build
-// returns. If Build or Rebuild panics, the pool recovers, keeps the
+// returns. If Build or Update panics, the pool recovers, keeps the
 // previous Picker, reports an [EventBalancerPanic] and calls the Balancer
-// again on its next change. A Balancer that can update a Picker more cheaply than it builds
-// one also implements Rebuilder.
+// again on its next change. A Balancer that can update a Picker more
+// cheaply than it builds one also implements [Updater].
 //
 // Balancers can be used without a Pool: build a Picker from candidates and
 // call Pick.
@@ -53,19 +53,89 @@ type Balancer interface {
 	Build(candidates []Candidate) Picker
 }
 
-// A Rebuilder is a Balancer that derives a Picker from the previous one,
-// for balancers whose Build is expensive, such as hash rings. A Pool calls
-// Rebuild instead of Build when it has a Picker that the same Balancer
-// built. The result must be what Build would return for candidates;
-// Rebuild only saves work, such as by keeping the parts of prev whose
-// candidates did not change.
-type Rebuilder interface {
+// An Updater is a Balancer that derives a Picker from the previous one,
+// for balancers whose Build does work per candidate that a change of a
+// few candidates need not redo, such as hash rings. A Pool calls Update
+// instead of Build when it has a Picker that the same Balancer made for
+// the same tier, and passes the Delta between the two candidate lists when
+// it knows it, so that a change costs time in proportion to what changed,
+// plus copying. The result must be what Build would return for
+// candidates.
+type Updater interface {
 	Balancer
 
-	// Rebuild returns a Picker for candidates, which is never empty. prev
-	// was returned by Build or Rebuild of this Balancer and may still be
-	// in use by picks: Rebuild must not modify it.
-	Rebuild(prev Picker, candidates []Candidate) Picker
+	// Update returns a Picker for candidates, which is never empty. prev
+	// was returned by Build or Update of this Balancer and may still be
+	// in use by picks: Update must not modify it. d, if not nil, says how
+	// candidates differ from prev's candidates: deleting those at
+	// d.Removed and inserting candidates[i] for every i in d.Added gives
+	// candidates, and the others are unchanged, weight included. A nil d
+	// means the difference is not known.
+	Update(prev Picker, candidates []Candidate, d *Delta) Picker
+}
+
+// A Delta is the difference between two candidate lists that keep their
+// relative order: the old list without the candidates at Removed, with
+// candidates inserted at Added, is the new list. A candidate whose weight
+// changed is removed and added.
+type Delta struct {
+	// Removed holds indexes in the old list, ascending.
+	Removed []int
+
+	// Added holds indexes in the new list, ascending.
+	Added []int
+}
+
+// Remap calls fn with the old and new index of every candidate the change
+// kept, in order. It costs time linear in the new list.
+func (d *Delta) Remap(newLen int, fn func(oldIndex, newIndex int)) {
+	removed, added := d.Removed, d.Added
+	o := 0
+	for n := range newLen {
+		if len(added) > 0 && added[0] == n {
+			added = added[1:]
+			continue
+		}
+		for len(removed) > 0 && removed[0] == o {
+			removed = removed[1:]
+			o++
+		}
+		fn(o, n)
+		o++
+	}
+}
+
+// splice returns old with the changes of d applied: the elements at
+// d.Removed dropped and, at every index of d.Added, the element that add
+// returns for it. It copies runs of unchanged elements.
+func splice[E any](old []E, d *Delta, add func(newIndex int) E) []E {
+	out := make([]E, 0, len(old)-len(d.Removed)+len(d.Added))
+	removed, added := d.Removed, d.Added
+	o := 0
+	for len(removed) > 0 || len(added) > 0 {
+		// The next old index to drop, or the old index at which the
+		// next insertion falls.
+		nextR := len(old)
+		if len(removed) > 0 {
+			nextR = removed[0]
+		}
+		if len(added) > 0 {
+			// The insertion is at new index added[0]: copy old elements
+			// until out reaches it, unless a removal comes first.
+			need := added[0] - len(out)
+			if o+need <= nextR {
+				out = append(out, old[o:o+need]...)
+				o += need
+				out = append(out, add(added[0]))
+				added = added[1:]
+				continue
+			}
+		}
+		out = append(out, old[o:nextR]...)
+		o = nextR + 1
+		removed = removed[1:]
+	}
+	return append(out, old[o:]...)
 }
 
 // A Picker chooses among the candidates it was built from. It must be safe

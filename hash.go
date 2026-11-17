@@ -35,7 +35,7 @@ type HashConfig struct {
 // Pick hashes the key it is given again, so any 64-bit key works. Picks do
 // not allocate, except retries (attempts above 0) on rings of more than
 // 256 candidates, which need a scratch bitset. The Balancer is a
-// Rebuilder: when members come and go, a Pool updates the ring instead of
+// Updater: when members come and go, a Pool updates the ring instead of
 // building it again.
 func ConsistentHash(cfg HashConfig) Balancer {
 	if cfg.VirtualNodes <= 0 {
@@ -107,29 +107,43 @@ func (h consistentHash) Build(c []Candidate) Picker {
 	return h.picker(c, counts, sum, hashes, owners)
 }
 
-// Rebuild keeps the ring points of the candidates whose ID and number of
+// Update keeps the ring points of the candidates whose ID and number of
 // points did not change, and merges in the points of the others, in time
-// linear in the ring plus the sorting of the new points. It falls back to
-// Build when most points change, as with unequal weights after a member
-// joins or leaves, which changes every candidate's number of points.
-func (h consistentHash) Rebuild(prev Picker, c []Candidate) Picker {
+// linear in the ring plus the sorting of the new points. With a Delta it
+// matches candidates by position, without it by ID. It falls back to Build
+// when most points change, as with unequal weights after a member joins or
+// leaves, which changes every candidate's number of points.
+func (h consistentHash) Update(prev Picker, c []Candidate, d *Delta) Picker {
 	old, ok := prev.(*ringPicker)
 	if !ok || old.vnodes != h.cfg.VirtualNodes {
 		return h.Build(c)
 	}
 	counts, sum := h.ringCounts(c)
-	oldIndex := make(map[string]int32, len(old.ids))
-	for j, id := range old.ids {
-		oldIndex[id] = int32(j)
-	}
 	remap := make([]int32, len(old.ids)) // old owner to new owner, or -1
 	for j := range remap {
 		remap[j] = -1
 	}
+	from := make([]int32, len(c)) // new candidate to old, or -1
+	for i := range from {
+		from[i] = -1
+	}
+	if d != nil {
+		d.Remap(len(c), func(o, n int) { from[n] = i32(o) })
+	} else {
+		oldIndex := make(map[string]int32, len(old.ids))
+		for j, id := range old.ids {
+			oldIndex[id] = int32(j)
+		}
+		for i := range c {
+			if j, ok := oldIndex[c[i].ID]; ok {
+				from[i] = j
+			}
+		}
+	}
 	var fresh []ringPoint
 	changed := 0
 	for i := range c {
-		if j, ok := oldIndex[c[i].ID]; ok && old.counts[j] == counts[i] {
+		if j := from[i]; j >= 0 && old.counts[j] == counts[i] {
 			remap[j] = int32(i)
 			continue
 		}
@@ -182,7 +196,7 @@ type ringPicker struct {
 	hashes []uint64
 	owners []int32
 	loadPicker
-	ids       []string // for Rebuild
+	ids       []string // for Update
 	counts    []int32  // ring points per candidate, for Rebuild
 	factor    float64
 	weightSum float64

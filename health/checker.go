@@ -66,7 +66,7 @@ type Checker[K, G comparable] struct {
 
 	// The schedule, guarded by mu: entries waiting for their check, in a
 	// min-heap by due time, and the one timer armed for the earliest.
-	sched   []*entry[K, G]
+	sched   []slot[K, G]
 	armAt   time.Time   // when the armed timer fires
 	armStop func() bool // stops the armed timer; nil while it is being made
 	armSeq  uint64      // identifies the armed timer
@@ -74,6 +74,13 @@ type Checker[K, G comparable] struct {
 
 	closed bool // guarded by mu
 	ended  bool // done is closed; guarded by mu
+}
+
+// A slot is an entry waiting in the schedule, with its due time beside it
+// so that ordering the heap reads no entry.
+type slot[K, G comparable] struct {
+	due time.Time
+	e   *entry[K, G]
 }
 
 // entry is the state of one generation of a key. All fields are guarded
@@ -84,7 +91,6 @@ type entry[K, G comparable] struct {
 	touched    time.Time // the latest Touch while the target was up
 	target     Target
 	lat        latencyWindow
-	due        time.Time          // when the scheduled check is due
 	cancel     context.CancelFunc // check in progress
 	groups     map[G]struct{}
 	queued     *delivery[K, G] // a queued report that changes nothing, which a newer one replaces
@@ -786,9 +792,8 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 		c.finish(&w)
 		return
 	}
-	e.due = now.Add(c.delayLocked(e, now))
 	e.slot = len(c.sched) + 1
-	c.sched = append(c.sched, e)
+	c.sched = append(c.sched, slot[K, G]{due: now.Add(c.delayLocked(e, now)), e: e})
 	c.up(e.slot - 1)
 	a := c.armLocked(now)
 	c.mu.Unlock()
@@ -805,7 +810,7 @@ func (c *Checker[K, G]) unscheduleLocked(e *entry[K, G], w *work[K, G]) {
 	i := e.slot - 1
 	last := len(c.sched) - 1
 	c.swap(i, last)
-	c.sched[last] = nil
+	c.sched[last] = slot[K, G]{}
 	c.sched = c.sched[:last]
 	e.slot = 0
 	if i < last {
@@ -825,7 +830,7 @@ func (c *Checker[K, G]) less(i, j int) bool { return c.sched[i].due.Before(c.sch
 
 func (c *Checker[K, G]) swap(i, j int) {
 	c.sched[i], c.sched[j] = c.sched[j], c.sched[i]
-	c.sched[i].slot, c.sched[j].slot = i+1, j+1
+	c.sched[i].e.slot, c.sched[j].e.slot = i+1, j+1
 }
 
 func (c *Checker[K, G]) up(i int) {
@@ -922,7 +927,7 @@ func (c *Checker[K, G]) fire(seq uint64) {
 	}
 	var w work[K, G]
 	for len(c.sched) > 0 && !c.sched[0].due.After(now) {
-		e := c.sched[0]
+		e := c.sched[0].e
 		c.unscheduleLocked(e, &w)
 		c.pending++
 		go c.run(e, e.timer)

@@ -5,7 +5,6 @@ import (
 	"math"
 	"math/bits"
 	"slices"
-	"sync"
 )
 
 // RendezvousConfig configures Rendezvous.
@@ -36,7 +35,7 @@ type RendezvousConfig struct {
 // best candidates in score order, the ones the key
 // would move to if the earlier ones left; attempts past the last candidate
 // start over. Unlike ConsistentHash, nothing is precomputed beyond the
-// IDs, so Build is cheap and the Balancer needs no Rebuilder. Its Pickers
+// IDs, and Update prepares only the candidates that changed. Its Pickers
 // are Rankers, so a Pool that walks past the first choice ranks once.
 func Rendezvous(cfg RendezvousConfig) Balancer { return rendezvous{cfg: cfg} }
 
@@ -55,28 +54,59 @@ type rendezvousMember struct {
 }
 
 func (r rendezvous) Build(c []Candidate) Picker {
-	p := &rendezvousPicker{
+	p := r.newPicker(make([]rendezvousMember, len(c)))
+	for i := range c {
+		p.members[i] = newRendezvousMember(&c[i])
+	}
+	p.setEqual(c)
+	return p
+}
+
+// Update copies the prepared IDs of the candidates that d keeps and
+// prepares only the added ones; without d it builds.
+func (r rendezvous) Update(prev Picker, c []Candidate, d *Delta) Picker {
+	p := r.newPicker(nil)
+	old, ok := prev.(*rendezvousPicker)
+	if !ok || d == nil || old.k0 != p.k0 || old.k1 != p.k1 {
+		return r.Build(c)
+	}
+	p.members = splice(old.members, d, func(i int) rendezvousMember { return newRendezvousMember(&c[i]) })
+	p.setEqual(c)
+	return p
+}
+
+func (r rendezvous) newPicker(members []rendezvousMember) *rendezvousPicker {
+	return &rendezvousPicker{
 		k0:      binary.LittleEndian.Uint64(r.cfg.Key[:8]),
 		k1:      binary.LittleEndian.Uint64(r.cfg.Key[8:]),
-		members: make([]rendezvousMember, len(c)),
+		members: members,
 	}
-	first := c[0].weight()
+}
+
+func newRendezvousMember(c *Candidate) rendezvousMember {
+	id := c.ID
+	m := rendezvousMember{id: id, weight: float64(c.weight())}
+	for len(id) >= 8 {
+		m.words = append(m.words, leUint64(id))
+		id = id[8:]
+	}
+	for j := len(id) - 1; j >= 0; j-- {
+		m.last = m.last<<8 | uint64(id[j])
+	}
+	m.last |= uint64(8+len(c.ID)) << 56
+	return m
+}
+
+// setEqual records whether all weights are equal, so that the hash alone
+// orders the candidates.
+func (p *rendezvousPicker) setEqual(c []Candidate) {
 	p.equal = true
 	for i := range c {
-		id := c[i].ID
-		m := rendezvousMember{id: id, weight: float64(c[i].weight())}
-		for len(id) >= 8 {
-			m.words = append(m.words, leUint64(id))
-			id = id[8:]
+		if c[i].weight() != c[0].weight() {
+			p.equal = false
+			return
 		}
-		for j := len(id) - 1; j >= 0; j-- {
-			m.last = m.last<<8 | uint64(id[j])
-		}
-		m.last |= uint64(8+len(c[i].ID)) << 56
-		p.members[i] = m
-		p.equal = p.equal && c[i].weight() == first
 	}
-	return p
 }
 
 func leUint64(s string) uint64 {
@@ -173,21 +203,19 @@ func (p *rendezvousPicker) Pick(key uint64, attempt int) int {
 		}
 		return best
 	}
-	rs := p.ranked(key)
-	i := (*rs)[attempt].index
-	rankPool.Put(rs)
-	return i
+	var buf [rankStack]rankEntry
+	return p.ranked(key, buf[:0])[attempt].index
 }
 
 // Rank writes the candidates in score order, as Pick returns them for
 // attempts 0 to n-1: one hash per candidate and a sort, O(n log n), where
-// calling Pick for every attempt would cost O(n²) hashes.
+// calling Pick for every attempt would cost O(n²) hashes. It allocates only
+// for more than rankStack candidates.
 func (p *rendezvousPicker) Rank(key uint64, dst []int) {
-	rs := p.ranked(key)
-	for i, r := range *rs {
+	var buf [rankStack]rankEntry
+	for i, r := range p.ranked(key, buf[:0]) {
 		dst[i] = r.index
 	}
-	rankPool.Put(rs)
 }
 
 // rankEntry is a candidate's score for one key.
@@ -196,17 +224,15 @@ type rankEntry struct {
 	index int
 }
 
-// rankPool recycles the score buffers of Rank and Pick, so that ranking
-// does not allocate once the pool is warm.
-//
-//nolint:gochecknoglobals // a buffer pool shared by all Pickers, as sync.Pool is meant to be
-var rankPool = sync.Pool{New: func() any { return new([]rankEntry) }}
+// rankStack is the number of candidates ranked in a buffer on the stack;
+// larger tiers allocate a buffer of their size for each ranking, which the
+// O(n log n) ranking outweighs.
+const rankStack = 64
 
-// ranked returns the candidates sorted by rank for key, in a buffer of
-// rankPool that the caller puts back.
-func (p *rendezvousPicker) ranked(key uint64) *[]rankEntry {
-	rs, _ := rankPool.Get().(*[]rankEntry)
-	r := slices.Grow((*rs)[:0], len(p.members))[:len(p.members)]
+// ranked returns the candidates sorted by rank for key, in buf if it has
+// room.
+func (p *rendezvousPicker) ranked(key uint64, buf []rankEntry) []rankEntry {
+	r := slices.Grow(buf, len(p.members))[:len(p.members)]
 	for i := range p.members {
 		m := &p.members[i]
 		r[i] = rankEntry{score: p.score(p.hash(key, m), m.weight), index: i}
@@ -220,6 +246,5 @@ func (p *rendezvousPicker) ranked(key uint64) *[]rankEntry {
 		}
 		return 1
 	})
-	*rs = r
-	return rs
+	return r
 }

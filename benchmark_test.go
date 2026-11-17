@@ -90,12 +90,12 @@ func BenchmarkBuild(b *testing.B) {
 func BenchmarkRebuild(b *testing.B) {
 	full := candidates(slices.Repeat([]int{1}, 2000)...)
 	less := slices.Delete(slices.Clone(full), 1000, 1001)
-	bal := ConsistentHash(HashConfig{}).(Rebuilder)
+	bal := ConsistentHash(HashConfig{}).(Updater)
 	b.Run("Rebuild", func(b *testing.B) {
 		p := bal.Build(full)
 		b.ReportAllocs()
 		for b.Loop() {
-			p = bal.Rebuild(bal.Rebuild(p, less), full)
+			p = bal.Update(bal.Update(p, less, nil), full, nil)
 		}
 	})
 	b.Run("Build", func(b *testing.B) {

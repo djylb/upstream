@@ -353,7 +353,7 @@ func TestBoundedHashAttemptsAreDistinct(t *testing.T) {
 func TestConsistentHashRebuildMatchesBuild(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
 	for _, cfg := range []HashConfig{{}, {VirtualNodes: 7}} {
-		bal := ConsistentHash(cfg).(Rebuilder)
+		bal := ConsistentHash(cfg).(Updater)
 		var cands []Candidate
 		for i := range 40 {
 			cands = append(cands, Candidate{ID: "c" + strconv.Itoa(i), Weight: 1})
@@ -375,7 +375,7 @@ func TestConsistentHashRebuildMatchesBuild(t *testing.T) {
 			case 3:
 				r.Shuffle(len(cands), func(i, j int) { cands[i], cands[j] = cands[j], cands[i] })
 			}
-			got := bal.Rebuild(prev, cands).(*ringPicker)
+			got := bal.Update(prev, cands, nil).(*ringPicker)
 			want := bal.Build(cands).(*ringPicker)
 			if !slices.Equal(got.hashes, want.hashes) || !slices.Equal(got.owners, want.owners) || !slices.Equal(got.counts, want.counts) {
 				t.Fatalf("%+v step %d: rebuilt ring differs", cfg, step)
@@ -385,7 +385,7 @@ func TestConsistentHashRebuildMatchesBuild(t *testing.T) {
 	}
 	// A Picker of another balancer is built afresh.
 	c := candidates(1, 1)
-	if _, ok := ConsistentHash(HashConfig{}).(Rebuilder).Rebuild(RoundRobin().Build(c), c).(*ringPicker); !ok {
+	if _, ok := ConsistentHash(HashConfig{}).(Updater).Update(RoundRobin().Build(c), c, nil).(*ringPicker); !ok {
 		t.Fatal("foreign picker")
 	}
 }

@@ -218,10 +218,12 @@ the backend's in-flight count and moving average latency, both read live at
 pick time, and `Meta`, which a pool sets to the `*Backend[T]`: a zone-aware or
 least-latency balancer reads what it needs from there. A pool builds one picker
 per tier and calls `Build` for a tier only when its candidates change, never
-two at once, and coalesces changes that arrive during a build into one more. A balancer whose build is costly also
-implements `Rebuilder` to update the previous picker instead;
-`ConsistentHash` does, so a member that goes down or comes back on a large ring
-costs a linear merge, not a new sort. A picker that can order every candidate
+two at once, and coalesces changes that arrive during a build into one more. A balancer whose build does work per
+candidate also implements `Updater`: the pool then hands it the previous picker
+and a `Delta`, the positions of the candidates that left and joined, so that
+it redoes only the work for those. `Rendezvous` prepares only the new
+candidates; `ConsistentHash` keeps the ring points of the others and merges,
+in linear time without a new sort. A picker that can order every candidate
 for a key at once also implements `Ranker`; when a pick must look past the
 first choice, because backends are full, down or already tried, the pool
 ranks once instead of calling `Pick` for every attempt. `Rendezvous` does,
@@ -500,10 +502,13 @@ a member's value, weight, priority or cap really changed.
   that arrived during that build are still built, and otherwise the next
   change retries. Removals, drains and health verdicts take effect for picks
   at once regardless.
-- A health or drain change rebuilds only the tier of the backend that changed:
-  other tiers keep their member lists and pickers. Rebuilding a tier costs
-  time linear in its size, as `Build` takes all its candidates; membership
-  changes (`Sync`, `Put`, `Remove`) cost time linear in the pool.
+- A health or drain change touches only the tier of the backend that changed:
+  other tiers keep their member lists and pickers, and the changed tier's
+  lists and candidates are updated by a `Delta`, at the cost of the change
+  plus copying the tier's arrays; an `Updater` then updates its picker by the
+  same `Delta`, and other balancers build. Membership changes (`Sync`, `Put`,
+  `Remove`) compare the whole pool once and pass a `Delta` too, unless `Sync`
+  reorders members. Under slow start a changed tier is built anew.
 - The checker keeps its pending checks in one queue ordered by time behind a
   single timer, so it holds one timer however many targets it has. It owns
   that timer, one goroutine per running check and one goroutine for

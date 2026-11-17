@@ -215,6 +215,7 @@ type Backend[T any] struct {
 	id       string
 	weight   int
 	priority int
+	slot     int   // index among the members of its priority, -1 until placed; guarded by the pool's mutex
 	limit    int64 // MaxInFlight; 0 means none
 	value    T
 }

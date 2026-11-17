@@ -209,9 +209,10 @@ const rampScale = 16
 // because a pick checks the backend's state itself; only new members and
 // changed weights wait for the view.
 //
-// A health, drain or offline change recomputes only the tier of the
-// backend that changed; the other tiers keep their member lists and
-// Pickers. Membership changes cost time linear in the pool.
+// A health, drain or offline change updates only the tier of the backend
+// that changed, by a [Delta] that an [Updater] applies to its Picker; the
+// other tiers keep their member lists and Pickers. Membership changes
+// compare the pool once, in linear time.
 //
 // The pool starts no goroutines. It owns the passive health timers and the
 // slow-start timer, which Close stops. Pick never locks; Release locks only
@@ -247,8 +248,8 @@ type Pool[T any] struct {
 	flushing  bool        // guarded by qmu
 
 	// Owned by the building goroutine.
-	built    map[int]builtTier[T] // the latest Picker built for each priority
-	builtGen uint64               // settings.gen of built
+	built    []builtTier[T] // the latest Picker built for each priority, by ascending priority
+	builtGen uint64         // settings.gen of built
 
 	qmu   sync.Mutex
 	queue []delivery[T]
@@ -275,6 +276,7 @@ type view[T any] struct {
 // A tier is the members of one priority and their Picker.
 type tier[T any] struct {
 	picker   Picker
+	ranker   Ranker        // picker, if it is a Ranker
 	members  []*Backend[T] // the candidates of picker
 	priority int
 }
@@ -282,37 +284,163 @@ type tier[T any] struct {
 // builtTier is a Picker a build made, kept for the next build of its
 // priority to reuse or rebuild.
 type builtTier[T any] struct {
-	picker  Picker
-	cands   []Candidate
-	members []*Backend[T] // the tier's members, which the next build compares by identity
-	ramping bool          // slow start lowered weights: rebuild at the next step
+	picker   Picker
+	cands    []Candidate
+	priority int
+	members  []*Backend[T] // the tier's members, which the next build compares by identity
+	ramping  bool          // slow start lowered weights: rebuild at the next step
 }
 
 // A group is the members of one priority, with the lists a view takes
-// from them. The lists are recomputed, never modified, when the group is
-// dirty, so views share them; a group that did not change keeps its lists,
-// and a build keeps the Picker of a tier whose list it already built.
+// from them. A list is replaced, never modified, so views share it; each
+// update also records the Delta from the list before it, so that a build
+// can update the tier's candidates and Picker instead of making them
+// again. A state change updates the lists through pend, in time
+// O(changes · log n) plus copying; a membership change compares the whole
+// group once, in time O(n), like the change itself.
 type group[T any] struct {
-	members []*Backend[T] // in membership order
-	elig    []*Backend[T] // eligible members
-	open    []*Backend[T] // members that are not draining or offline
-	dirty   bool          // elig and open are out of date
+	members   []*Backend[T] // in membership order; their slot is their index once placed
+	elig      []*Backend[T] // eligible members
+	open      []*Backend[T] // members that are not draining or offline
+	eligPrev  []*Backend[T] // elig before the last update
+	openPrev  []*Backend[T] // open before the last update
+	eligDelta *Delta        // from eligPrev to elig; nil if not known
+	openDelta *Delta        // from openPrev to open; nil if not known
+	pend      []*Backend[T] // members whose state may have changed
+	rediff    bool          // members changed: compare every member
+	reweigh   bool          // a member starts a slow start: make the tier again
 }
 
-// refreshLocked recomputes the lists of g.
-func (g *group[T]) refreshLocked() {
-	g.elig, g.open = nil, nil
-	for _, b := range g.members {
-		c := b.core
-		if c.flags.Load()&blockPick != 0 {
+func isOpen[T any](b *Backend[T]) bool { return b.core.flags.Load()&blockPick == 0 }
+
+func isElig[T any](b *Backend[T]) bool { return isOpen(b) && b.core.eligible() }
+
+// updateLocked brings the lists of g up to date, recording their deltas.
+func (g *group[T]) updateLocked() {
+	switch {
+	case g.rediff:
+		open := make([]*Backend[T], 0, len(g.members))
+		all := true // every open member is eligible: one list serves both
+		for _, b := range g.members {
+			if isOpen(b) {
+				open = append(open, b)
+				all = all && b.core.eligible()
+			}
+		}
+		elig := open
+		if !all {
+			elig = nil
+			for _, b := range open {
+				if b.core.eligible() {
+					elig = append(elig, b)
+				}
+			}
+		}
+		switch {
+		case slices.Equal(elig, g.elig):
+			elig = g.elig // unchanged: the tier keeps its Picker
+		case all && slices.Equal(open, g.open):
+			elig = g.open
+		}
+		if all {
+			open = elig
+		} else if slices.Equal(open, g.open) {
+			open = g.open
+		}
+		eligDelta := diffLists(g.elig, elig)
+		openDelta := eligDelta
+		if !sameList(g.open, g.elig) || !sameList(open, elig) {
+			openDelta = diffLists(g.open, open)
+		}
+		g.eligPrev, g.eligDelta, g.elig = g.elig, eligDelta, elig
+		g.openPrev, g.openDelta, g.open = g.open, openDelta, open
+		for i, b := range g.members {
+			b.slot = i
+		}
+		g.rediff = false
+	case len(g.pend) > 0:
+		slices.SortFunc(g.pend, func(a, b *Backend[T]) int { return a.slot - b.slot })
+		g.pend = slices.Compact(g.pend)
+		g.eligPrev, g.eligDelta = g.elig, nil
+		g.openPrev, g.openDelta = g.open, nil
+		g.elig, g.eligDelta = applyPending(g.elig, g.pend, isElig[T])
+		g.open, g.openDelta = applyPending(g.open, g.pend, isOpen[T])
+		if len(g.open) == len(g.elig) {
+			g.open = g.elig // equal contents: one list serves both, openDelta still applies
+		}
+	default:
+		return
+	}
+	clear(g.pend)
+	g.pend = g.pend[:0]
+}
+
+// applyPending returns list with the members of pend, sorted by slot, in
+// or out of it as want says, and the Delta from list; list itself if
+// nothing changed.
+func applyPending[T any](list, pend []*Backend[T], want func(*Backend[T]) bool) ([]*Backend[T], *Delta) {
+	var d *Delta
+	var adds []*Backend[T]
+	removed := 0
+	for _, b := range pend {
+		q, _ := slices.BinarySearchFunc(list, b.slot, func(x *Backend[T], slot int) int { return x.slot - slot })
+		in := q < len(list) && list[q] == b
+		if in == want(b) {
 			continue
 		}
-		g.open = append(g.open, b)
-		if c.eligible() {
-			g.elig = append(g.elig, b)
+		if d == nil {
+			d = new(Delta)
+		}
+		if in {
+			d.Removed = append(d.Removed, q)
+			removed++
+		} else {
+			d.Added = append(d.Added, q-removed+len(adds))
+			adds = append(adds, b)
 		}
 	}
-	g.dirty = false
+	if d == nil {
+		return list, &Delta{}
+	}
+	k := 0
+	return splice(list, d, func(int) *Backend[T] { k++; return adds[k-1] }), d
+}
+
+// diffLists returns the Delta from a to b, two lists of one group, each in
+// slot order with slots as they were before a membership change; a member
+// new to the group has slot -1. It returns nil if b does not keep the
+// order of a, as after a Sync that reorders members.
+//
+// With a empty there is no Picker to update, and it returns nil too.
+func diffLists[T any](a, b []*Backend[T]) *Delta {
+	if len(a) == 0 {
+		return nil
+	}
+	d := new(Delta)
+	i, last := 0, -1
+	for j, x := range b {
+		if x.slot < 0 {
+			d.Added = append(d.Added, j)
+			continue
+		}
+		if x.slot < last {
+			return nil
+		}
+		last = x.slot
+		for i < len(a) && a[i].slot < x.slot {
+			d.Removed = append(d.Removed, i)
+			i++
+		}
+		if i < len(a) && a[i] == x {
+			i++
+			continue
+		}
+		d.Added = append(d.Added, j)
+	}
+	for ; i < len(a); i++ {
+		d.Removed = append(d.Removed, i)
+	}
+	return d
 }
 
 // New returns an empty pool.
@@ -320,7 +448,6 @@ func New[T any](cfg Config) *Pool[T] {
 	p := &Pool[T]{
 		clock:    clockOrSystem(cfg.Clock),
 		closedCh: make(chan struct{}),
-		groups:   make(map[int]*group[T]),
 	}
 	epoch := p.clock.Now()
 	p.cfg.outlier = newOutlierParams(cfg.Outlier, p.clock, epoch)
@@ -347,7 +474,7 @@ func (p *Pool[T]) setLocked(cfg Config) {
 	s.fallback = cfg.Fallback
 	s.overflow = cfg.Overflow
 	for _, g := range p.groups {
-		g.dirty = true
+		g.rediff = true
 	}
 	p.all = true
 }
@@ -429,7 +556,7 @@ func (p *Pool[T]) newBackendLocked(t Target[T], c *core) *Backend[T] {
 			c.rampStart.Store(-1)
 		}
 	}
-	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, limit: int64(t.MaxInFlight), value: t.Value}
+	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, slot: -1, limit: int64(t.MaxInFlight), value: t.Value}
 }
 
 // Sync replaces the pool's membership with targets, in order. Members
@@ -740,9 +867,17 @@ func (p *Pool[T]) touchLocked(b *Backend[T]) {
 // change, marking dirty the groups whose members changed. It costs O(n),
 // like the membership change itself.
 func (p *Pool[T]) regroupLocked() {
-	next := make(map[int][]*Backend[T], len(p.groups))
-	for _, b := range p.order {
-		next[b.priority] = append(next[b.priority], b)
+	if p.groups == nil {
+		p.groups = make(map[int]*group[T])
+	}
+	var next map[int][]*Backend[T]
+	if uniform := len(p.order) > 0 && !slices.ContainsFunc(p.order, func(b *Backend[T]) bool { return b.priority != p.order[0].priority }); uniform {
+		next = map[int][]*Backend[T]{p.order[0].priority: slices.Clone(p.order)} // one tier: no regrouping
+	} else {
+		next = make(map[int][]*Backend[T], len(p.groups))
+		for _, b := range p.order {
+			next[b.priority] = append(next[b.priority], b)
+		}
 	}
 	for prio := range p.groups {
 		if _, ok := next[prio]; !ok {
@@ -757,7 +892,7 @@ func (p *Pool[T]) regroupLocked() {
 		}
 		if !slices.Equal(g.members, ms) {
 			g.members = ms
-			g.dirty = true
+			g.rediff = true
 		}
 	}
 	p.prios = p.prios[:0]
@@ -787,10 +922,12 @@ func (p *Pool[T]) unlockAndCommit() {
 		for _, b := range p.order {
 			p.announceLocked(b)
 		}
-	} else {
-		for _, t := range p.touched {
-			if b := p.byID.load(t.id); b != nil {
-				p.groups[b.priority].dirty = true
+	}
+	for _, t := range p.touched {
+		if b := p.byID.load(t.id); b != nil {
+			g := p.groups[b.priority]
+			g.pend = append(g.pend, b)
+			if !p.all {
 				p.announceLocked(b)
 			}
 		}
@@ -813,6 +950,9 @@ func (p *Pool[T]) announceLocked(b *Backend[T]) {
 	if s := c.state(); s != c.reported {
 		if p.cfg.slowStart > 0 && s == StateHealthy {
 			c.rampStart.Store(-1)
+			// The member's weight changes while its list may not: make
+			// the tier again.
+			p.groups[b.priority].reweigh = true
 		}
 		p.emitLocked(Event[T]{Kind: EventStateChanged, Backend: b, From: c.reported, To: s, Err: c.cause(s)})
 		c.reported = s
@@ -828,7 +968,8 @@ const commitBuilds = 2
 
 // snapshot is what a build needs from the pool's state.
 type snapshot[T any] struct {
-	v         *view[T] // its tiers have members, and the Pickers to build
+	v         *view[T]        // its tiers have members, and the Pickers to build
+	changes   []tierChange[T] // how each tier of v changed
 	balancer  Balancer
 	gen       uint64
 	slowStart time.Duration
@@ -927,9 +1068,7 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 	elig, open := 0, 0
 	for _, prio := range p.prios {
 		g := p.groups[prio]
-		if g.dirty {
-			g.refreshLocked()
-		}
+		g.updateLocked()
 		elig += len(g.elig)
 		open += len(g.open)
 	}
@@ -941,18 +1080,29 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 	v.tiers = make([]tier[T], 0, len(p.prios))
 	for _, prio := range p.prios {
 		g := p.groups[prio]
+		ch := tierChange[T]{base: g.eligPrev, d: g.eligDelta, remake: g.reweigh}
 		ms := g.elig
 		if v.ignoreHealth {
-			ms = g.open
+			ms, ch = g.open, tierChange[T]{base: g.openPrev, d: g.openDelta, remake: g.reweigh}
 		}
+		g.reweigh = false
 		if len(ms) > 0 {
 			v.tiers = append(v.tiers, tier[T]{members: ms, priority: prio})
+			s.changes = append(s.changes, ch)
 		}
 		if p.cfg.fallback == FallbackAll && !v.ignoreHealth && len(g.open) > 0 {
 			v.fallback = append(v.fallback, tier[T]{members: g.open, priority: prio})
 		}
 	}
 	return s
+}
+
+// A tierChange is how a tier's members changed: base with d applied is
+// the tier's list. d is nil when the change is not known.
+type tierChange[T any] struct {
+	base   []*Backend[T]
+	d      *Delta
+	remake bool // weights changed: make the candidates again
 }
 
 // sameList reports whether a and b are the same list of a group, which is
@@ -964,11 +1114,14 @@ func sameList[T any](a, b []*Backend[T]) bool {
 // build makes the Pickers of the tiers of s.v, without mu. A tier whose
 // member list is the one the Picker built last for its priority by the
 // same Balancer was made from keeps that Picker, unless slow start is
-// ramping its weights; so does a tier whose candidates are equal to that
-// Picker's. Otherwise a Rebuilder rebuilds that Picker and other Balancers
-// build a new one. A tier rebuilt costs O(members), as Build takes all the
-// candidates; unchanged tiers cost nothing. The Pickers are kept only if
-// every tier builds.
+// ramping its weights. A tier whose list derives from that one by a known
+// Delta updates the candidates by copying, and an Updater updates its
+// Picker with the Delta, so a change costs time in proportion to what
+// changed, plus copying. Otherwise the candidates are made again; a tier
+// whose candidates are equal to the Picker's keeps it, an Updater updates
+// it without a Delta, and other Balancers build a new one. Under slow
+// start, changed tiers are made again. The Pickers are kept only if every
+// tier builds.
 func (p *Pool[T]) build(s snapshot[T]) {
 	v := s.v
 	if len(v.tiers) == 0 {
@@ -979,33 +1132,59 @@ func (p *Pool[T]) build(s snapshot[T]) {
 	if p.builtGen != s.gen {
 		prev = nil
 	}
-	built := make(map[int]builtTier[T], len(v.tiers))
+	upd, updater := s.balancer.(Updater)
+	built := make([]builtTier[T], len(v.tiers))
 	for i := range v.tiers {
 		t := &v.tiers[i]
-		old, ok := prev[t.priority]
-		if ok && !old.ramping && sameList(old.members, t.members) {
+		for len(prev) > 0 && prev[0].priority < t.priority {
+			prev = prev[1:]
+		}
+		ok := len(prev) > 0 && prev[0].priority == t.priority
+		var old builtTier[T]
+		if ok {
+			old = prev[0]
+		}
+		ch := s.changes[i]
+		if ok && !old.ramping && !ch.remake && sameList(old.members, t.members) {
 			t.picker = old.picker
-			built[t.priority] = old
+			built[i] = old
+			continue
+		}
+		if ok && s.slowStart <= 0 && !old.ramping && ch.d != nil && sameList(old.members, ch.base) {
+			cands := splice(old.cands, ch.d, func(k int) Candidate { return candidateOf(t.members[k]) })
+			if updater {
+				t.picker = upd.Update(old.picker, cands, ch.d)
+			} else {
+				t.picker = s.balancer.Build(cands)
+			}
+			built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority}
 			continue
 		}
 		cands := make([]Candidate, len(t.members))
 		for k, b := range t.members {
-			c := b.core
-			cands[k] = Candidate{InFlight: &c.inflight, Latency: &c.latency, Meta: b, ID: b.id, Weight: b.weight}
+			cands[k] = candidateOf(b)
 		}
 		ramping := s.slowStart > 0 && p.applySlowStart(t.members, cands, s.slowStart)
-		switch r, rebuilder := s.balancer.(Rebuilder); {
+		switch {
 		case ok && slices.Equal(old.cands, cands):
 			t.picker = old.picker
 			cands = old.cands
-		case ok && rebuilder:
-			t.picker = r.Rebuild(old.picker, cands)
+		case ok && updater:
+			t.picker = upd.Update(old.picker, cands, nil)
 		default:
 			t.picker = s.balancer.Build(cands)
 		}
-		built[t.priority] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, ramping: ramping}
+		built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority, ramping: ramping}
+	}
+	for i := range v.tiers {
+		v.tiers[i].ranker, _ = v.tiers[i].picker.(Ranker)
 	}
 	p.built, p.builtGen = built, s.gen
+}
+
+func candidateOf[T any](b *Backend[T]) Candidate {
+	c := b.core
+	return Candidate{InFlight: &c.inflight, Latency: &c.latency, Meta: b, ID: b.id, Weight: b.weight}
 }
 
 // applySlowStart lowers the candidate weights of backends that are ramping
@@ -1143,31 +1322,36 @@ func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 // member took the pick and one of them refused because it was full.
 func (t *tier[T]) pick(hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], refusal) {
 	n := len(t.members)
-	if rk, ok := t.picker.(Ranker); ok && n > 1 {
-		// One choice, then the whole ranking at once.
-		if l, ok := t.try(t.picker.Pick(hash, 0), tried, ignoreHealth); ok {
+	if l, ok := t.try(t.picker.Pick(hash, 0), tried, ignoreHealth); ok {
+		return l, admitted
+	}
+	if t.ranker != nil {
+		if l, ok := t.ranked(t.ranker, hash, tried, ignoreHealth); ok {
 			return l, admitted
 		}
-		buf, _ := indexPool.Get().(*[]int)
-		order := slices.Grow((*buf)[:0], n)[:n]
-		rk.Rank(hash, order)
-		for _, i := range order[1:] {
-			if l, ok := t.try(i, tried, ignoreHealth); ok {
-				*buf = order
-				indexPool.Put(buf)
-				return l, admitted
-			}
-		}
-		*buf = order
-		indexPool.Put(buf)
 	} else {
-		for attempt := range n {
+		for attempt := 1; attempt < n; attempt++ {
 			if l, ok := t.try(t.picker.Pick(hash, attempt), tried, ignoreHealth); ok {
 				return l, admitted
 			}
 		}
 	}
 	return scan(t.members, hash, tried, ignoreHealth)
+}
+
+// ranked tries the members of t past the first choice in the order of rk,
+// ranked once. The ranking stays on the stack for tiers of up to
+// rankStack members.
+func (t *tier[T]) ranked(rk Ranker, hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
+	var buf [rankStack]int
+	order := slices.Grow(buf[:0], len(t.members))[:len(t.members)]
+	rk.Rank(hash, order)
+	for _, i := range order[1:] {
+		if l, ok := t.try(i, tried, ignoreHealth); ok {
+			return l, true
+		}
+	}
+	return Lease[T]{}, false
 }
 
 // try leases member i of t unless tried has it or it refuses.
@@ -1179,11 +1363,6 @@ func (t *tier[T]) try(i int, tried *Request[T], ignoreHealth bool) (Lease[T], bo
 	tk, r := b.acquire(ignoreHealth)
 	return Lease[T]{b: b, t: tk}, r == admitted
 }
-
-// indexPool recycles the rankings of tier.pick.
-//
-//nolint:gochecknoglobals // a buffer pool shared by all Pickers, as sync.Pool is meant to be
-var indexPool = sync.Pool{New: func() any { return new([]int) }}
 
 // scan tries every backend of bs not in tried once, starting at a place
 // that hash chooses. It returns saturated if none took the pick and one of

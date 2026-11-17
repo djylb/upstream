@@ -1453,7 +1453,7 @@ func (b *rebuildCounter) Build(c []Candidate) Picker {
 	return RoundRobin().Build(c)
 }
 
-func (b *rebuildCounter) Rebuild(_ Picker, c []Candidate) Picker {
+func (b *rebuildCounter) Update(_ Picker, c []Candidate, _ *Delta) Picker {
 	b.rebuilds.Add(1)
 	return RoundRobin().Build(c)
 }
