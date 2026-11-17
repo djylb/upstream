@@ -87,8 +87,11 @@ func TestPoolRanksOnce(t *testing.T) {
 	}
 	picks, ranks = 0, 0
 	l, err := p.PickHash(1)
-	if err != nil || l.Value() != n-1 {
-		t.Fatalf("pick: %v, %v; want the last backend", l.Value(), err)
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+	if l.Value() != n-1 {
+		t.Fatalf("pick: %v, want the last backend", l.Value())
 	}
 	l.Release(Success)
 	if picks != 1 || ranks != 1 {
@@ -108,8 +111,11 @@ func TestAcquire(t *testing.T) {
 		t.Fatalf("unknown ID: %v", err)
 	}
 	l, err := p.Acquire("a")
-	if err != nil || l.Value() != "va" {
-		t.Fatalf("acquire a: %q, %v", l.Value(), err)
+	if err != nil {
+		t.Fatalf("acquire a: %v", err)
+	}
+	if l.Value() != "va" {
+		t.Fatalf("acquire a: %q", l.Value())
 	}
 	if _, err = p.Acquire("a"); !errors.Is(err, ErrSaturated) {
 		t.Fatalf("a at its cap: %v", err)
