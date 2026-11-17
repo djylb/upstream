@@ -20,7 +20,7 @@ import (
 // Checker when Remove is called or when its last owner lets go of it. Two
 // owners that give different Targets for one key share one target: the
 // latest Put, AddToGroup or SyncGroup wins. Removing a key cancels its check in
-// progress and discards that check's result, stops its timer, releases its
+// progress and discards that check's result, unschedules it, releases its
 // concurrency slot and forgets its state; adding the key again starts a
 // new generation.
 //
@@ -30,8 +30,11 @@ import (
 // been removed and added, keeping its owners; an empty network and "tcp"
 // are the same network.
 //
-// Every check runs in its own goroutine, which exists only while the check
-// runs, so a slow or hanging target never delays the others;
+// The pending checks wait in one queue ordered by time, behind a single
+// Clock timer for the earliest, so scheduling costs O(log n) and the
+// Checker holds one timer however many targets it has. Every check runs
+// in its own goroutine, which exists only while the check runs, so a slow
+// or hanging target never delays the others;
 // Config.Concurrency bounds how many run at once. Callbacks run on one
 // dispatching goroutine. The Checker owns all of these goroutines and its
 // timers: Close, or the end of the context passed to New, stops them, and
@@ -60,8 +63,17 @@ type Checker[K, G comparable] struct {
 	pending int                  // timers and goroutines about to start; guarded by mu
 	running int                  // goroutines running; guarded by mu
 	nextGen uint64               // guarded by mu
-	closed  bool                 // guarded by mu
-	ended   bool                 // done is closed; guarded by mu
+
+	// The schedule, guarded by mu: entries waiting for their check, in a
+	// min-heap by due time, and the one timer armed for the earliest.
+	sched   []*entry[K, G]
+	armAt   time.Time   // when the armed timer fires
+	armStop func() bool // stops the armed timer; nil while it is being made
+	armSeq  uint64      // identifies the armed timer
+	armed   bool        // a timer is armed or being made
+
+	closed bool // guarded by mu
+	ended  bool // done is closed; guarded by mu
 }
 
 // entry is the state of one generation of a key. All fields are guarded
@@ -72,13 +84,14 @@ type entry[K, G comparable] struct {
 	touched    time.Time // the latest Touch while the target was up
 	target     Target
 	lat        latencyWindow
-	stop       func() bool        // pending timer
+	due        time.Time          // when the scheduled check is due
 	cancel     context.CancelFunc // check in progress
 	groups     map[G]struct{}
 	queued     *delivery[K, G] // a queued report that changes nothing, which a newer one replaces
 	key        K
 	generation uint64
-	timer      uint64 // identifies the pending timer
+	timer      uint64 // identifies the scheduled check
+	slot       int    // 1 + index in the Checker's schedule; 0 if not scheduled
 	checks     uint64
 	failures   uint64
 	ok, fail   int
@@ -358,10 +371,7 @@ func (c *Checker[K, G]) dropLocked(e *entry[K, G], w *work[K, G], unlink bool) {
 		}
 		c.enqueueLocked(&delivery[K, G]{e: e, removed: true})
 	}
-	if e.stop != nil {
-		w.stops = append(w.stops, e.stop)
-		e.stop = nil
-	}
+	c.unscheduleLocked(e, w)
 	if e.cancel != nil {
 		w.cancels = append(w.cancels, e.cancel)
 		e.cancel = nil
@@ -741,13 +751,14 @@ func (c *Checker[K, G]) checkableLocked(e *entry[K, G]) bool {
 }
 
 // schedule arranges the next check of e, replacing any pending one, or,
-// if e is not to be checked, stops its timer and forgets its health. While
+// if e is not to be checked, unschedules it and forgets its health. While
 // a check of e runs, schedule only cancels it if e should no longer be
 // checked; the check schedules e again when it ends.
 //
-// pending counts a timer from here until either its check starts or a stop
-// cancels it. The clock is called without the lock; the timer number
-// catches a Remove, Close or newer schedule that runs in between.
+// pending counts the armed timer from when it is decided until either it
+// fires or a stop cancels it. The clock is called without the lock; the
+// timer number catches a Remove, Close or newer schedule that runs in
+// between.
 func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 	now := c.clock.Now()
 	c.mu.Lock()
@@ -762,10 +773,9 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 		}
 		return
 	}
-	old := e.stop
-	e.stop = nil
+	var w work[K, G]
+	c.unscheduleLocked(e, &w)
 	e.timer++
-	timer := e.timer
 	if !c.checkableLocked(e) {
 		if e.health != upstream.HealthUnknown {
 			prev := e.health
@@ -773,30 +783,154 @@ func (c *Checker[K, G]) schedule(e *entry[K, G]) {
 			c.reportLocked(e, Result{CheckResult: upstream.CheckResult{Time: now}, Health: upstream.HealthUnknown, Previous: prev})
 		}
 		c.mu.Unlock()
-		if old != nil && old() {
-			c.unannounce()
-		}
+		c.finish(&w)
 		return
 	}
-	d := c.delayLocked(e, now)
-	c.pending++
+	e.due = now.Add(c.delayLocked(e, now))
+	e.slot = len(c.sched) + 1
+	c.sched = append(c.sched, e)
+	c.up(e.slot - 1)
+	a := c.armLocked(now)
 	c.mu.Unlock()
-	if old != nil && old() {
+	c.finish(&w)
+	c.arm(a)
+}
+
+// unscheduleLocked takes e out of the schedule, and has w stop the timer
+// if nothing is left to wait for.
+func (c *Checker[K, G]) unscheduleLocked(e *entry[K, G], w *work[K, G]) {
+	if e.slot == 0 {
+		return
+	}
+	i := e.slot - 1
+	last := len(c.sched) - 1
+	c.swap(i, last)
+	c.sched[last] = nil
+	c.sched = c.sched[:last]
+	e.slot = 0
+	if i < last {
+		c.down(i)
+		c.up(i)
+	}
+	if len(c.sched) == 0 && c.armed {
+		if c.armStop != nil {
+			w.stops = append(w.stops, c.armStop)
+		}
+		c.armStop, c.armed = nil, false
+		c.armSeq++
+	}
+}
+
+func (c *Checker[K, G]) less(i, j int) bool { return c.sched[i].due.Before(c.sched[j].due) }
+
+func (c *Checker[K, G]) swap(i, j int) {
+	c.sched[i], c.sched[j] = c.sched[j], c.sched[i]
+	c.sched[i].slot, c.sched[j].slot = i+1, j+1
+}
+
+func (c *Checker[K, G]) up(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !c.less(i, parent) {
+			return
+		}
+		c.swap(i, parent)
+		i = parent
+	}
+}
+
+func (c *Checker[K, G]) down(i int) {
+	n := len(c.sched)
+	for {
+		l := 2*i + 1
+		if l >= n {
+			return
+		}
+		m := l
+		if r := l + 1; r < n && c.less(r, l) {
+			m = r
+		}
+		if !c.less(m, i) {
+			return
+		}
+		c.swap(i, m)
+		i = m
+	}
+}
+
+// An arming is a change to the schedule's timer, decided under the mutex
+// and made by arm without it.
+type arming struct {
+	stop  func() bool // the timer to stop, if any
+	d     time.Duration
+	seq   uint64
+	start bool // make a new timer for d
+}
+
+// armLocked decides whether the timer must move so that it fires by the
+// earliest due check. A timer that fires earlier stays: when it fires, it
+// starts what is due and arms again.
+func (c *Checker[K, G]) armLocked(now time.Time) arming {
+	if len(c.sched) == 0 || c.closed {
+		return arming{}
+	}
+	due := c.sched[0].due
+	if c.armed && !due.Before(c.armAt) {
+		return arming{}
+	}
+	a := arming{stop: c.armStop, d: max(due.Sub(now), 0), start: true}
+	c.armSeq++
+	a.seq = c.armSeq
+	c.armAt, c.armStop, c.armed = due, nil, true
+	c.pending++
+	return a
+}
+
+// arm carries out a.
+func (c *Checker[K, G]) arm(a arming) {
+	if a.stop != nil && a.stop() {
 		c.unannounce()
 	}
-
-	stop := c.clock.AfterFunc(d, func() { c.run(e, timer) })
-
+	if !a.start {
+		return
+	}
+	stop := c.clock.AfterFunc(a.d, func() { c.fire(a.seq) })
 	c.mu.Lock()
-	if c.closed || e.gone || e.timer != timer {
+	if c.closed || c.armSeq != a.seq {
 		c.mu.Unlock()
 		if stop() {
 			c.unannounce()
 		}
 		return
 	}
-	e.stop = stop
+	c.armStop = stop
 	c.mu.Unlock()
+}
+
+// fire starts the checks that are due and arms the timer for the next.
+func (c *Checker[K, G]) fire(seq uint64) {
+	c.enter()
+	defer c.leave()
+	now := c.clock.Now()
+	c.mu.Lock()
+	if c.armSeq == seq {
+		c.armStop, c.armed = nil, false
+	}
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	var w work[K, G]
+	for len(c.sched) > 0 && !c.sched[0].due.After(now) {
+		e := c.sched[0]
+		c.unscheduleLocked(e, &w)
+		c.pending++
+		go c.run(e, e.timer)
+	}
+	a := c.armLocked(now)
+	c.mu.Unlock()
+	c.finish(&w)
+	c.arm(a)
 }
 
 func (c *Checker[K, G]) delayLocked(e *entry[K, G], now time.Time) time.Duration {
@@ -838,7 +972,6 @@ func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 		c.mu.Unlock()
 		return
 	}
-	e.stop = nil
 	if c.touchedLocked(e, now) {
 		c.mu.Unlock()
 		c.schedule(e)
