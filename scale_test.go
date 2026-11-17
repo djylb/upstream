@@ -375,17 +375,3 @@ func TestLargeTierRankAllocsBounded(t *testing.T) {
 		t.Fatalf("%v allocations per pick on a full tier of %d", a, n)
 	}
 }
-
-// TestRankOrderTies checks that equal scores rank by ID, then by index,
-// as Pick breaks them.
-func TestRankOrderTies(t *testing.T) {
-	es := []rankEntry{{id: "b", score: 1, index: 0}, {id: "a", score: 1, index: 2}, {id: "a", score: 1, index: 1}, {id: "c", score: 2, index: 3}}
-	slices.SortFunc(es, rankOrder)
-	var got []int
-	for _, e := range es {
-		got = append(got, e.index)
-	}
-	if want := []int{3, 1, 2, 0}; !slices.Equal(got, want) {
-		t.Fatalf("order %v, want %v", got, want)
-	}
-}

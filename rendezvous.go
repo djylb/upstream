@@ -220,27 +220,8 @@ func (p *rendezvousPicker) Rank(key uint64, dst []int) {
 
 // rankEntry is a candidate's score for one key.
 type rankEntry struct {
-	id    string
 	score float64
 	index int
-}
-
-// rankOrder orders entries as beats does. It captures nothing, so sorting
-// does not allocate a closure.
-func rankOrder(a, b rankEntry) int {
-	switch {
-	case a.score != b.score:
-		if a.score > b.score {
-			return -1
-		}
-		return 1
-	case a.id != b.id:
-		if a.id < b.id {
-			return -1
-		}
-		return 1
-	}
-	return a.index - b.index
 }
 
 // rankStack is the number of candidates ranked in a buffer on the stack;
@@ -254,8 +235,16 @@ func (p *rendezvousPicker) ranked(key uint64, buf []rankEntry) []rankEntry {
 	r := slices.Grow(buf, len(p.members))[:len(p.members)]
 	for i := range p.members {
 		m := &p.members[i]
-		r[i] = rankEntry{id: m.id, score: p.score(p.hash(key, m), m.weight), index: i}
+		r[i] = rankEntry{score: p.score(p.hash(key, m), m.weight), index: i}
 	}
-	slices.SortFunc(r, rankOrder)
+	slices.SortFunc(r, func(a, b rankEntry) int {
+		switch {
+		case a.index == b.index:
+			return 0
+		case p.beats(a.score, a.index, b.score, b.index):
+			return -1
+		}
+		return 1
+	})
 	return r
 }
