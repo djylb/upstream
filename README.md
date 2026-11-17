@@ -94,6 +94,13 @@ with. An update that changes neither a member's weight nor its value
 and rebuilds nothing. An empty key carries no affinity: `PickKey("")` is
 `Pick`.
 
+`Acquire(id)` leases one backend by ID, bypassing the balancer, for requests
+that must reach that backend, such as the continuation of a session. It
+applies the same checks as a pick: it fails with `ErrUnavailable` when the
+backend is draining, offline, down, ejected or out of trial slots, with
+`ErrSaturated` at its `MaxInFlight`, and with `ErrUnknownBackend` when no
+member has the ID. Like `Pick`, it takes no lock and does not allocate.
+
 ### Retries
 
 ```go
@@ -214,7 +221,11 @@ per tier and calls `Build` for a tier only when its candidates change, never
 two at once, and coalesces changes that arrive during a build into one more. A balancer whose build is costly also
 implements `Rebuilder` to update the previous picker instead;
 `ConsistentHash` does, so a member that goes down or comes back on a large ring
-costs a linear merge, not a new sort.
+costs a linear merge, not a new sort. A picker that can order every candidate
+for a key at once also implements `Ranker`; when a pick must look past the
+first choice, because backends are full, down or already tried, the pool
+ranks once instead of calling `Pick` for every attempt. `Rendezvous` does,
+which keeps such a pick at O(n log n) on large tiers.
 
 ### Tiers
 
@@ -489,8 +500,14 @@ a member's value, weight, priority or cap really changed.
   that arrived during that build are still built, and otherwise the next
   change retries. Removals, drains and health verdicts take effect for picks
   at once regardless.
-- The checker owns its timers, one goroutine per running check and one
-  goroutine for callbacks. `Close` (or the end of its context) stops them and
+- A health or drain change rebuilds only the tier of the backend that changed:
+  other tiers keep their member lists and pickers. Rebuilding a tier costs
+  time linear in its size, as `Build` takes all its candidates; membership
+  changes (`Sync`, `Put`, `Remove`) cost time linear in the pool.
+- The checker keeps its pending checks in one queue ordered by time behind a
+  single timer, so it holds one timer however many targets it has. It owns
+  that timer, one goroutine per running check and one goroutine for
+  callbacks. `Close` (or the end of its context) stops them and
   returns at once; `Done` is closed, and `Wait` returns, once every one of them
   has ended. Waiting on `Done` from inside a probe or callback waits for
   itself.
@@ -509,8 +526,9 @@ a member's value, weight, priority or cap really changed.
 - Bounded-load consistent hashing reads every backend's in-flight count on
   each pick; retries (not first picks) on rings of more than 256 backends
   allocate.
-- A `Request` allocates from the fifth attempt of one request on; `Pool.Do`
-  does not allocate, `Request.Do` allocates once.
+- A `Request` allocates from the fifth attempt of one request on, and past 36
+  attempts keeps the backends it tried in a map; `Pool.Do` does not allocate,
+  `Request.Do` allocates once.
 - Slow start works through weights within a tier, so it has no effect with
   `RoundRobin`, on a backend alone in its tier, or between tiers: traffic
   moves back to a recovered tier at once.

@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -37,6 +36,10 @@ var (
 
 	// ErrClosed means the pool was closed.
 	ErrClosed = errors.New("upstream: pool closed")
+
+	// ErrUnknownBackend means Acquire was given an ID that is not a
+	// member.
+	ErrUnknownBackend = errors.New("upstream: unknown backend")
 
 	// ErrInvalidTarget means a Target has an empty or duplicate ID or a
 	// weight out of range.
@@ -206,6 +209,10 @@ const rampScale = 16
 // because a pick checks the backend's state itself; only new members and
 // changed weights wait for the view.
 //
+// A health, drain or offline change recomputes only the tier of the
+// backend that changed; the other tiers keep their member lists and
+// Pickers. Membership changes cost time linear in the pool.
+//
 // The pool starts no goroutines. It owns the passive health timers and the
 // slow-start timer, which Close stops. Pick never locks; Release locks only
 // when its outcome ejects or restores a backend, to rebuild the view.
@@ -224,20 +231,24 @@ type Pool[T any] struct {
 
 	mu       sync.Mutex
 	cfg      settings[T]
-	byID     map[string]*Backend[T]
+	byID     idIndex[T] // written under mu, read without
 	order    []*Backend[T]
-	subs     []*subscriber[T] // copy on write
-	dirty    bool             // the view is out of date
-	building bool             // a goroutine is building the view
+	subs     []*subscriber[T]  // copy on write
+	groups   map[int]*group[T] // members by priority
+	prios    []int             // the keys of groups, ascending
+	touched  []*Backend[T]     // members whose state may have changed since the last commit
+	dirty    bool              // the view is out of date
+	building bool              // a goroutine is building the view
 	closed   bool
+	all      bool // announce the state of every member: settings or membership changed
 
 	isClosed  atomic.Bool // Close has been called; read without mu
 	rampArmed atomic.Bool // a slow-start timer is pending
 	flushing  bool        // guarded by qmu
 
 	// Owned by the building goroutine.
-	built    map[int]builtTier // the latest Picker built for each priority
-	builtGen uint64            // settings.gen of built
+	built    map[int]builtTier[T] // the latest Picker built for each priority
+	builtGen uint64               // settings.gen of built
 
 	qmu   sync.Mutex
 	queue []delivery[T]
@@ -270,17 +281,46 @@ type tier[T any] struct {
 
 // builtTier is a Picker a build made, kept for the next build of its
 // priority to reuse or rebuild.
-type builtTier struct {
-	picker Picker
-	cands  []Candidate
+type builtTier[T any] struct {
+	picker  Picker
+	cands   []Candidate
+	members []*Backend[T] // the tier's members, which the next build compares by identity
+	ramping bool          // slow start lowered weights: rebuild at the next step
+}
+
+// A group is the members of one priority, with the lists a view takes
+// from them. The lists are recomputed, never modified, when the group is
+// dirty, so views share them; a group that did not change keeps its lists,
+// and a build keeps the Picker of a tier whose list it already built.
+type group[T any] struct {
+	members []*Backend[T] // in membership order
+	elig    []*Backend[T] // eligible members
+	open    []*Backend[T] // members that are not draining or offline
+	dirty   bool          // elig and open are out of date
+}
+
+// refreshLocked recomputes the lists of g.
+func (g *group[T]) refreshLocked() {
+	g.elig, g.open = nil, nil
+	for _, b := range g.members {
+		c := b.core
+		if c.flags.Load()&blockPick != 0 {
+			continue
+		}
+		g.open = append(g.open, b)
+		if c.eligible() {
+			g.elig = append(g.elig, b)
+		}
+	}
+	g.dirty = false
 }
 
 // New returns an empty pool.
 func New[T any](cfg Config) *Pool[T] {
 	p := &Pool[T]{
 		clock:    clockOrSystem(cfg.Clock),
-		byID:     make(map[string]*Backend[T]),
 		closedCh: make(chan struct{}),
+		groups:   make(map[int]*group[T]),
 	}
 	epoch := p.clock.Now()
 	p.cfg.outlier = newOutlierParams(cfg.Outlier, p.clock, epoch)
@@ -306,6 +346,10 @@ func (p *Pool[T]) setLocked(cfg Config) {
 	s.threshold = min(max(cfg.PanicThreshold, 0), 100)
 	s.fallback = cfg.Fallback
 	s.overflow = cfg.Overflow
+	for _, g := range p.groups {
+		g.dirty = true
+	}
+	p.all = true
 }
 
 // sameBalancer reports whether a and b are the same comparable Balancer,
@@ -379,7 +423,8 @@ func validate[T any](t Target[T]) error {
 func (p *Pool[T]) newBackendLocked(t Target[T], c *core) *Backend[T] {
 	if c == nil {
 		c = new(core)
-		c.det.init(p.cfg.outlier, p.refresh, &p.guard)
+		id := t.ID
+		c.det.init(p.cfg.outlier, func() { p.refreshID(id) }, &p.guard)
 		if p.cfg.slowStart > 0 {
 			c.rampStart.Store(-1)
 		}
@@ -425,6 +470,7 @@ func (p *Pool[T]) Sync(targets []Target[T]) error {
 		return nil
 	}
 	p.order = order
+	p.regroupLocked()
 	defer finishRemovals(removed)
 	p.unlockAndCommit()
 	return nil
@@ -443,7 +489,7 @@ func (p *Pool[T]) Put(t Target[T]) error {
 		p.mu.Unlock()
 		return ErrClosed
 	}
-	old := p.byID[t.ID]
+	old := p.byID.load(t.ID)
 	b := p.putLocked(t)
 	switch {
 	case b == old:
@@ -454,6 +500,7 @@ func (p *Pool[T]) Put(t Target[T]) error {
 	default:
 		p.order[slices.Index(p.order, old)] = b
 	}
+	p.regroupLocked()
 	p.unlockAndCommit()
 	return nil
 }
@@ -462,17 +509,17 @@ func (p *Pool[T]) Put(t Target[T]) error {
 // event, or returns the current backend if t changes nothing; the caller
 // places it in order.
 func (p *Pool[T]) putLocked(t Target[T]) *Backend[T] {
-	if old := p.byID[t.ID]; old != nil {
+	if old := p.byID.load(t.ID); old != nil {
 		if old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && p.cfg.equal(old.value, t.Value) {
 			return old
 		}
 		b := p.newBackendLocked(t, old.core)
-		p.byID[t.ID] = b
+		p.byID.store(b)
 		p.emitLocked(Event[T]{Kind: EventUpdated, Backend: b, From: old.core.reported, To: old.core.reported})
 		return b
 	}
 	b := p.newBackendLocked(t, nil)
-	p.byID[t.ID] = b
+	p.byID.store(b)
 	p.emitLocked(Event[T]{Kind: EventAdded, Backend: b, From: StateHealthy, To: StateHealthy})
 	return b
 }
@@ -496,7 +543,7 @@ func finishRemovals(rs []removal) {
 // removeLocked marks b removed and emits EventRemoved; the caller fixes
 // order and runs finishRemovals after unlocking.
 func (p *Pool[T]) removeLocked(b *Backend[T]) removal {
-	delete(p.byID, b.id)
+	p.byID.delete(b.id)
 	from := b.core.reported
 	d := b.core.drainLocked(flagRemoved | flagDraining)
 	b.core.reported = StateRemoved
@@ -510,13 +557,14 @@ func (p *Pool[T]) removeLocked(b *Backend[T]) removal {
 // there is no such member.
 func (p *Pool[T]) Remove(id string) (*Drain, bool) {
 	p.mu.Lock()
-	b := p.byID[id]
+	b := p.byID.load(id)
 	if b == nil {
 		p.mu.Unlock()
 		return nil, false
 	}
 	r := p.removeLocked(b)
 	p.order = slices.DeleteFunc(p.order, func(x *Backend[T]) bool { return x == b })
+	p.regroupLocked()
 	defer finishRemovals([]removal{r})
 	p.unlockAndCommit()
 	return r.d, true
@@ -529,13 +577,14 @@ func (p *Pool[T]) Remove(id string) (*Drain, bool) {
 // same Drain. Drain reports false if there is no such member.
 func (p *Pool[T]) Drain(id string) (*Drain, bool) {
 	p.mu.Lock()
-	b := p.byID[id]
+	b := p.byID.load(id)
 	if b == nil {
 		p.mu.Unlock()
 		return nil, false
 	}
 	d := b.core.drainLocked(flagDraining)
 	defer b.core.checkDrained(d)
+	p.touchLocked(b)
 	p.unlockAndCommit()
 	return d, true
 }
@@ -545,7 +594,7 @@ func (p *Pool[T]) Drain(id string) (*Drain, bool) {
 // member.
 func (p *Pool[T]) Resume(id string) bool {
 	p.mu.Lock()
-	b := p.byID[id]
+	b := p.byID.load(id)
 	if b == nil {
 		p.mu.Unlock()
 		return false
@@ -554,6 +603,7 @@ func (p *Pool[T]) Resume(id string) bool {
 	if d := b.core.drain.Swap(nil); d != nil {
 		defer d.finish(true)
 	}
+	p.touchLocked(b)
 	p.unlockAndCommit()
 	return true
 }
@@ -588,6 +638,7 @@ func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) bool {
 			break
 		}
 	}
+	p.touchLocked(b)
 	p.unlockAndCommit()
 	return true
 }
@@ -596,7 +647,7 @@ func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) bool {
 // member of the open pool, and reports whether it did.
 func (p *Pool[T]) lockMember(b *Backend[T]) bool {
 	p.mu.Lock()
-	if cur := p.byID[b.id]; p.closed || cur == nil || cur.core != b.core {
+	if cur := p.byID.load(b.id); p.closed || cur == nil || cur.core != b.core {
 		p.mu.Unlock()
 		return false
 	}
@@ -631,6 +682,7 @@ func (p *Pool[T]) MarkOffline(b *Backend[T], cause error) bool {
 		p.mu.Unlock()
 		return true
 	}
+	p.touchLocked(b)
 	p.unlockAndCommit()
 	return true
 }
@@ -649,6 +701,7 @@ func (p *Pool[T]) MarkOnline(b *Backend[T]) bool {
 		return true
 	}
 	c.offline.Store(nil)
+	p.touchLocked(b)
 	p.unlockAndCommit()
 	return true
 }
@@ -663,8 +716,59 @@ func (p *Pool[T]) ResetOutlier(id string) bool {
 	return ok
 }
 
-// refresh rebuilds the view after a passive health transition or a
-// slow-start step.
+// refreshID rebuilds the view after a passive health transition of the
+// member with the given ID.
+func (p *Pool[T]) refreshID(id string) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	if b := p.byID.load(id); b != nil {
+		p.touchLocked(b)
+	}
+	p.unlockAndCommit()
+}
+
+// touchLocked records that the state of b, or of the member with its ID,
+// may have changed: the next commit announces it and recomputes its tier.
+func (p *Pool[T]) touchLocked(b *Backend[T]) {
+	p.touched = append(p.touched, b)
+}
+
+// regroupLocked brings the groups in line with order after a membership
+// change, marking dirty the groups whose members changed. It costs O(n),
+// like the membership change itself.
+func (p *Pool[T]) regroupLocked() {
+	next := make(map[int][]*Backend[T], len(p.groups))
+	for _, b := range p.order {
+		next[b.priority] = append(next[b.priority], b)
+	}
+	for prio := range p.groups {
+		if _, ok := next[prio]; !ok {
+			delete(p.groups, prio)
+		}
+	}
+	for prio, ms := range next {
+		g := p.groups[prio]
+		if g == nil {
+			g = new(group[T])
+			p.groups[prio] = g
+		}
+		if !slices.Equal(g.members, ms) {
+			g.members = ms
+			g.dirty = true
+		}
+	}
+	p.prios = p.prios[:0]
+	for prio := range p.groups {
+		p.prios = append(p.prios, prio)
+	}
+	slices.Sort(p.prios)
+	p.all = true // states are announced for every member, in order
+}
+
+// refresh rebuilds the view after a slow-start step.
 func (p *Pool[T]) refresh() {
 	p.mu.Lock()
 	if p.closed {
@@ -679,16 +783,20 @@ func (p *Pool[T]) refresh() {
 // goroutine is building it, and delivers events.
 func (p *Pool[T]) unlockAndCommit() {
 	p.dirty = true
-	for _, b := range p.order {
-		c := b.core
-		if s := c.state(); s != c.reported {
-			if p.cfg.slowStart > 0 && s == StateHealthy {
-				c.rampStart.Store(-1)
+	if p.all {
+		for _, b := range p.order {
+			p.announceLocked(b)
+		}
+	} else {
+		for _, t := range p.touched {
+			if b := p.byID.load(t.id); b != nil {
+				p.groups[b.priority].dirty = true
+				p.announceLocked(b)
 			}
-			p.emitLocked(Event[T]{Kind: EventStateChanged, Backend: b, From: c.reported, To: s, Err: c.cause(s)})
-			c.reported = s
 		}
 	}
+	clear(p.touched)
+	p.touched, p.all = p.touched[:0], false
 	defer p.flush()
 	if p.building {
 		p.mu.Unlock()
@@ -696,6 +804,19 @@ func (p *Pool[T]) unlockAndCommit() {
 	}
 	p.building = true
 	p.buildLoop(commitBuilds)
+}
+
+// announceLocked emits EventStateChanged if the state of b differs from
+// the one last announced.
+func (p *Pool[T]) announceLocked(b *Backend[T]) {
+	c := b.core
+	if s := c.state(); s != c.reported {
+		if p.cfg.slowStart > 0 && s == StateHealthy {
+			c.rampStart.Store(-1)
+		}
+		p.emitLocked(Event[T]{Kind: EventStateChanged, Backend: b, From: c.reported, To: s, Err: c.cause(s)})
+		c.reported = s
+	}
 }
 
 // commitBuilds bounds the views a committer builds: its own and one more
@@ -707,11 +828,10 @@ const commitBuilds = 2
 
 // snapshot is what a build needs from the pool's state.
 type snapshot[T any] struct {
-	v         *view[T]
+	v         *view[T] // its tiers have members, and the Pickers to build
 	balancer  Balancer
 	gen       uint64
 	slowStart time.Duration
-	members   []*Backend[T] // what v.tiers are made of, in membership order
 }
 
 // buildLoop builds and publishes views while the view is out of date, at
@@ -794,7 +914,9 @@ func (p *Pool[T]) handOff() {
 	p.buildLoop(-1)
 }
 
-// snapshotLocked selects the members of the next view.
+// snapshotLocked selects the members of the next view. It recomputes the
+// lists of the dirty groups only; the tiers of the others are those of the
+// previous view.
 func (p *Pool[T]) snapshotLocked() snapshot[T] {
 	s := snapshot[T]{v: &view[T]{err: ErrUnavailable, overflow: p.cfg.overflow}, balancer: p.cfg.balancer, gen: p.cfg.gen, slowStart: p.cfg.slowStart}
 	v := s.v
@@ -802,57 +924,53 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 		v.err = ErrNoBackends
 	}
 	p.guard.members.Store(int32(min(len(p.order), math.MaxInt32)))
-	var open []*Backend[T] // not draining or offline
-	for _, b := range p.order {
-		c := b.core
-		if c.flags.Load()&blockPick != 0 {
-			continue
+	elig, open := 0, 0
+	for _, prio := range p.prios {
+		g := p.groups[prio]
+		if g.dirty {
+			g.refreshLocked()
 		}
-		open = append(open, b)
-		if c.eligible() {
-			s.members = append(s.members, b)
-		}
+		elig += len(g.elig)
+		open += len(g.open)
 	}
-	if p.cfg.fallback == FallbackAll && len(open) > 0 {
-		if len(s.members) == 0 || len(s.members)*100 < p.cfg.threshold*len(open) {
-			s.members = open
-			v.ignoreHealth = true
-		} else {
-			v.fallback = groupTiers(open)
+	v.eligible = elig
+	if p.cfg.fallback == FallbackAll && open > 0 && (elig == 0 || elig*100 < p.cfg.threshold*open) {
+		v.ignoreHealth = true
+		v.eligible = open
+	}
+	v.tiers = make([]tier[T], 0, len(p.prios))
+	for _, prio := range p.prios {
+		g := p.groups[prio]
+		ms := g.elig
+		if v.ignoreHealth {
+			ms = g.open
+		}
+		if len(ms) > 0 {
+			v.tiers = append(v.tiers, tier[T]{members: ms, priority: prio})
+		}
+		if p.cfg.fallback == FallbackAll && !v.ignoreHealth && len(g.open) > 0 {
+			v.fallback = append(v.fallback, tier[T]{members: g.open, priority: prio})
 		}
 	}
 	return s
 }
 
-// groupTiers returns bs grouped by ascending priority, keeping their
-// order within each priority.
-func groupTiers[T any](bs []*Backend[T]) []tier[T] {
-	if len(bs) == 0 {
-		return nil
-	}
-	bs = slices.Clone(bs)
-	slices.SortStableFunc(bs, func(a, b *Backend[T]) int { return cmp.Compare(a.priority, b.priority) })
-	var ts []tier[T]
-	for i := 0; i < len(bs); {
-		j := i + 1
-		for j < len(bs) && bs[j].priority == bs[i].priority {
-			j++
-		}
-		ts = append(ts, tier[T]{members: bs[i:j:j], priority: bs[i].priority})
-		i = j
-	}
-	return ts
+// sameList reports whether a and b are the same list of a group, which is
+// never modified once made.
+func sameList[T any](a, b []*Backend[T]) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
-// build makes the tiers of s.v and their Pickers, without mu. A tier whose
-// candidates are those of the Picker built last for its priority by the
-// same Balancer keeps that Picker; otherwise a Rebuilder rebuilds that
-// Picker and other Balancers build a new one. The Pickers are kept only if
+// build makes the Pickers of the tiers of s.v, without mu. A tier whose
+// member list is the one the Picker built last for its priority by the
+// same Balancer was made from keeps that Picker, unless slow start is
+// ramping its weights; so does a tier whose candidates are equal to that
+// Picker's. Otherwise a Rebuilder rebuilds that Picker and other Balancers
+// build a new one. A tier rebuilt costs O(members), as Build takes all the
+// candidates; unchanged tiers cost nothing. The Pickers are kept only if
 // every tier builds.
 func (p *Pool[T]) build(s snapshot[T]) {
 	v := s.v
-	v.tiers = groupTiers(s.members)
-	v.eligible = len(s.members)
 	if len(v.tiers) == 0 {
 		p.built = nil
 		return
@@ -861,18 +979,21 @@ func (p *Pool[T]) build(s snapshot[T]) {
 	if p.builtGen != s.gen {
 		prev = nil
 	}
-	built := make(map[int]builtTier, len(v.tiers))
+	built := make(map[int]builtTier[T], len(v.tiers))
 	for i := range v.tiers {
 		t := &v.tiers[i]
+		old, ok := prev[t.priority]
+		if ok && !old.ramping && sameList(old.members, t.members) {
+			t.picker = old.picker
+			built[t.priority] = old
+			continue
+		}
 		cands := make([]Candidate, len(t.members))
 		for k, b := range t.members {
 			c := b.core
 			cands[k] = Candidate{InFlight: &c.inflight, Latency: &c.latency, Meta: b, ID: b.id, Weight: b.weight}
 		}
-		if s.slowStart > 0 {
-			p.applySlowStart(t.members, cands, s.slowStart)
-		}
-		old, ok := prev[t.priority]
+		ramping := s.slowStart > 0 && p.applySlowStart(t.members, cands, s.slowStart)
 		switch r, rebuilder := s.balancer.(Rebuilder); {
 		case ok && slices.Equal(old.cands, cands):
 			t.picker = old.picker
@@ -882,14 +1003,14 @@ func (p *Pool[T]) build(s snapshot[T]) {
 		default:
 			t.picker = s.balancer.Build(cands)
 		}
-		built[t.priority] = builtTier{picker: t.picker, cands: cands}
+		built[t.priority] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, ramping: ramping}
 	}
 	p.built, p.builtGen = built, s.gen
 }
 
 // applySlowStart lowers the candidate weights of backends that are ramping
-// up and arms the timer for the next step.
-func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp time.Duration) {
+// up and arms the timer for the next step. It reports whether any is.
+func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp time.Duration) bool {
 	now := p.clock.Now().UnixNano()
 	ramping := false
 	maxWeight := 0
@@ -916,7 +1037,7 @@ func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp 
 		ramping = true
 	}
 	if !ramping {
-		return
+		return false
 	}
 	scale := 1
 	if maxWeight <= MaxWeight/rampScale {
@@ -926,6 +1047,7 @@ func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp 
 		cands[i].Weight = max(int(float64(cands[i].Weight*scale)*fraction[i]), 1)
 	}
 	p.armRamp(max(ramp/rampScale, time.Millisecond))
+	return true
 }
 
 // armRamp schedules one refresh after d unless one is already pending. The
@@ -1021,17 +1143,47 @@ func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 // member took the pick and one of them refused because it was full.
 func (t *tier[T]) pick(hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], refusal) {
 	n := len(t.members)
-	for attempt := range n {
-		b := t.members[t.picker.Pick(hash, attempt)]
-		if tried != nil && tried.has(b.core) {
-			continue
+	if rk, ok := t.picker.(Ranker); ok && n > 1 {
+		// One choice, then the whole ranking at once.
+		if l, ok := t.try(t.picker.Pick(hash, 0), tried, ignoreHealth); ok {
+			return l, admitted
 		}
-		if tk, r := b.acquire(ignoreHealth); r == admitted {
-			return Lease[T]{b: b, t: tk}, admitted
+		buf, _ := indexPool.Get().(*[]int)
+		order := slices.Grow((*buf)[:0], n)[:n]
+		rk.Rank(hash, order)
+		for _, i := range order[1:] {
+			if l, ok := t.try(i, tried, ignoreHealth); ok {
+				*buf = order
+				indexPool.Put(buf)
+				return l, admitted
+			}
+		}
+		*buf = order
+		indexPool.Put(buf)
+	} else {
+		for attempt := range n {
+			if l, ok := t.try(t.picker.Pick(hash, attempt), tried, ignoreHealth); ok {
+				return l, admitted
+			}
 		}
 	}
 	return scan(t.members, hash, tried, ignoreHealth)
 }
+
+// try leases member i of t unless tried has it or it refuses.
+func (t *tier[T]) try(i int, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
+	b := t.members[i]
+	if tried != nil && tried.has(b.core) {
+		return Lease[T]{}, false
+	}
+	tk, r := b.acquire(ignoreHealth)
+	return Lease[T]{b: b, t: tk}, r == admitted
+}
+
+// indexPool recycles the rankings of tier.pick.
+//
+//nolint:gochecknoglobals // a buffer pool shared by all Pickers, as sync.Pool is meant to be
+var indexPool = sync.Pool{New: func() any { return new([]int) }}
 
 // scan tries every backend of bs not in tried once, starting at a place
 // that hash chooses. It returns saturated if none took the pick and one of
@@ -1080,13 +1232,52 @@ func (p *Pool[T]) DoKey(ctx context.Context, key string, fn func(*Backend[T]) er
 	return r.loop(ctx, func(l Lease[T]) (bool, error) { return runBackend(l, fn) })
 }
 
-// Backend returns the member with the given ID.
+// Backend returns the member with the given ID. It does not lock.
 func (p *Pool[T]) Backend(id string) (*Backend[T], bool) {
-	p.mu.Lock()
-	b, ok := p.byID[id]
-	p.mu.Unlock()
-	return b, ok
+	b := p.byID.load(id)
+	return b, b != nil
 }
+
+// Acquire leases the member with the given ID, bypassing the balancer, for
+// requests that must reach one backend, such as the continuation of a
+// session. The member passes the checks of a pick: one that is draining,
+// offline, down, ejected or out of half-open trial slots refuses with
+// ErrUnavailable, and one at its Target.MaxInFlight with ErrSaturated. In
+// panic mode it ignores health as Pick does. Acquire returns
+// ErrUnknownBackend if there is no such member and ErrClosed once the pool
+// is closed. Like Pick, it does not lock or allocate.
+func (p *Pool[T]) Acquire(id string) (Lease[T], error) {
+	v := p.view.Load()
+	if errors.Is(v.err, ErrClosed) {
+		return Lease[T]{}, ErrClosed
+	}
+	b := p.byID.load(id)
+	if b == nil {
+		return Lease[T]{}, ErrUnknownBackend
+	}
+	switch t, r := b.acquire(v.ignoreHealth); r {
+	case admitted:
+		return Lease[T]{b: b, t: t}, nil
+	case saturated:
+		return Lease[T]{}, ErrSaturated
+	case refused:
+	}
+	return Lease[T]{}, ErrUnavailable
+}
+
+// index maps member IDs to backends. Writes happen under the pool's mutex;
+// reads, by Backend and Acquire, take no lock.
+type idIndex[T any] struct{ m sync.Map }
+
+func (x *idIndex[T]) load(id string) *Backend[T] {
+	b, _ := x.m.Load(id)
+	bk, _ := b.(*Backend[T])
+	return bk
+}
+
+func (x *idIndex[T]) store(b *Backend[T]) { x.m.Store(b.id, b) }
+
+func (x *idIndex[T]) delete(id string) { x.m.Delete(id) }
 
 // Backends returns the members in order.
 func (p *Pool[T]) Backends() []*Backend[T] {

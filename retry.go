@@ -84,11 +84,17 @@ func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
 // is for one goroutine. It does not allocate for up to four attempts.
 type Request[T any] struct {
 	p     *Pool[T]
-	more  []*core // tried after the first four
+	set   map[*core]struct{} // every tried backend, once more holds triedLinear
+	more  []*core            // tried after the first four, until set takes over
 	tried [4]*core
 	hash  uint64
 	n     int
 }
+
+// triedLinear is the number of backends past the first four that a
+// Request looks up by scanning; beyond it, a map keeps lookups constant
+// so that a request that retries through n backends costs O(n), not O(n²).
+const triedLinear = 32
 
 // Request returns the picker for one request routed by key; an empty key
 // carries no affinity, as with PickKey.
@@ -138,12 +144,7 @@ func (r *Request[T]) Next() (Lease[T], error) {
 	if r.n == 0 && rp.budget > 0 {
 		p.budget.add(now, rp.window, windowTotal)
 	}
-	if r.n < len(r.tried) {
-		r.tried[r.n] = l.b.core
-	} else {
-		r.more = append(r.more, l.b.core)
-	}
-	r.n++
+	r.add(l.b.core)
 	return l, nil
 }
 
@@ -209,7 +210,34 @@ func runBackend[T any](l Lease[T], fn func(*Backend[T]) error) (retry bool, err 
 	return o == Failure, err
 }
 
+// add records c as tried.
+func (r *Request[T]) add(c *core) {
+	switch {
+	case r.set != nil:
+		r.set[c] = struct{}{}
+	case r.n < len(r.tried):
+		r.tried[r.n] = c
+	case len(r.more) < triedLinear:
+		r.more = append(r.more, c)
+	default:
+		r.set = make(map[*core]struct{}, 2*r.n)
+		for _, x := range r.tried {
+			r.set[x] = struct{}{}
+		}
+		for _, x := range r.more {
+			r.set[x] = struct{}{}
+		}
+		r.set[c] = struct{}{}
+		r.more = nil
+	}
+	r.n++
+}
+
 func (r *Request[T]) has(c *core) bool {
+	if r.set != nil {
+		_, ok := r.set[c]
+		return ok
+	}
 	if slices.Contains(r.tried[:min(r.n, len(r.tried))], c) {
 		return true
 	}

@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"math"
 	"math/bits"
+	"slices"
+	"sync"
 )
 
 // RendezvousConfig configures Rendezvous.
@@ -28,13 +30,14 @@ type RendezvousConfig struct {
 // come from that candidate, and changing one weight moves keys only to or
 // from that candidate.
 //
-// Pick hashes the key it is given again, so any 64-bit key works. A pick
-// costs one hash per candidate and does not allocate. Retries (attempts
-// above 0) return the next best candidates in score order, the ones the key
+// Pick hashes the key it is given again, so any 64-bit key works. A first
+// pick costs one hash per candidate and does not allocate. Retries
+// (attempts above 0) rank all candidates, O(n log n), and return the next
+// best candidates in score order, the ones the key
 // would move to if the earlier ones left; attempts past the last candidate
 // start over. Unlike ConsistentHash, nothing is precomputed beyond the
-// IDs, so Build is cheap and the Balancer needs no Rebuilder; it suits tiers
-// of up to a few hundred candidates.
+// IDs, so Build is cheap and the Balancer needs no Rebuilder. Its Pickers
+// are Rankers, so a Pool that walks past the first choice ranks once.
 func Rendezvous(cfg RendezvousConfig) Balancer { return rendezvous{cfg: cfg} }
 
 type rendezvous struct{ cfg RendezvousConfig }
@@ -159,22 +162,64 @@ func (p *rendezvousPicker) Pick(key uint64, attempt int) int {
 		attempt = 0
 	}
 	attempt %= n
-	// Rank 0 is the best candidate; each further rank is the best of those
-	// ranked below the previous one.
-	best, bestScore := -1, 0.0
-	for range attempt + 1 {
-		prev, prevScore := best, bestScore
-		best = -1
+	if attempt == 0 {
+		best, bestScore := 0, 0.0
 		for i := range p.members {
 			m := &p.members[i]
 			s := p.score(p.hash(key, m), m.weight)
-			if prev >= 0 && !p.beats(prevScore, prev, s, i) {
-				continue // ranks above or equal to the previous one
-			}
-			if best < 0 || p.beats(s, i, bestScore, best) {
+			if i == 0 || p.beats(s, i, bestScore, best) {
 				best, bestScore = i, s
 			}
 		}
+		return best
 	}
-	return best
+	rs := p.ranked(key)
+	i := (*rs)[attempt].index
+	rankPool.Put(rs)
+	return i
+}
+
+// Rank writes the candidates in score order, as Pick returns them for
+// attempts 0 to n-1: one hash per candidate and a sort, O(n log n), where
+// calling Pick for every attempt would cost O(n²) hashes.
+func (p *rendezvousPicker) Rank(key uint64, dst []int) {
+	rs := p.ranked(key)
+	for i, r := range *rs {
+		dst[i] = r.index
+	}
+	rankPool.Put(rs)
+}
+
+// rankEntry is a candidate's score for one key.
+type rankEntry struct {
+	score float64
+	index int
+}
+
+// rankPool recycles the score buffers of Rank and Pick, so that ranking
+// does not allocate once the pool is warm.
+//
+//nolint:gochecknoglobals // a buffer pool shared by all Pickers, as sync.Pool is meant to be
+var rankPool = sync.Pool{New: func() any { return new([]rankEntry) }}
+
+// ranked returns the candidates sorted by rank for key, in a buffer of
+// rankPool that the caller puts back.
+func (p *rendezvousPicker) ranked(key uint64) *[]rankEntry {
+	rs, _ := rankPool.Get().(*[]rankEntry)
+	r := slices.Grow((*rs)[:0], len(p.members))[:len(p.members)]
+	for i := range p.members {
+		m := &p.members[i]
+		r[i] = rankEntry{score: p.score(p.hash(key, m), m.weight), index: i}
+	}
+	slices.SortFunc(r, func(a, b rankEntry) int {
+		switch {
+		case a.index == b.index:
+			return 0
+		case p.beats(a.score, a.index, b.score, b.index):
+			return -1
+		}
+		return 1
+	})
+	*rs = r
+	return rs
 }

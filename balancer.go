@@ -80,6 +80,20 @@ type Picker interface {
 	Pick(key uint64, attempt int) int
 }
 
+// A Ranker is a Picker that can order all its candidates for a key at
+// once, for Pickers whose Pick with a large attempt costs as much as
+// ranking, such as Rendezvous. A Pool that must look past the first choice
+// asks a Ranker for the whole order instead of calling Pick for every
+// attempt.
+type Ranker interface {
+	Picker
+
+	// Rank writes the index of every candidate to dst, which has one
+	// element per candidate, in the order that Pick returns them for key
+	// with attempts 0, 1, 2 and so on. It must not allocate.
+	Rank(key uint64, dst []int)
+}
+
 // RoundRobin returns a Balancer that cycles through the candidates in
 // order and ignores weights. Each Picker starts at a random position so
 // that many pools do not hit the same backend in step.
