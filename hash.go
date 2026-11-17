@@ -197,7 +197,7 @@ type ringPicker struct {
 	owners []int32
 	loadPicker
 	ids       []string // for Update
-	counts    []int32  // ring points per candidate, for Rebuild
+	counts    []int32  // ring points per candidate, for Update
 	factor    float64
 	weightSum float64
 	vnodes    int

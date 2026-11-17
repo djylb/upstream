@@ -333,3 +333,59 @@ func TestHealthyGroupSharesLists(t *testing.T) {
 	p.Remove("c") // the eligible list stays as it was; the open one shrinks to it
 	shared("after removing the only ineligible member")
 }
+
+// TestLargeTierRankAllocsBounded checks that ranking a tier past the
+// stack buffer allocates a fixed number of times per call: one scratch
+// buffer for the scores and, in a pool, one for the order.
+func TestLargeTierRankAllocsBounded(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds allocations")
+	}
+	const n = 300
+	c := make([]Candidate, n)
+	for i := range c {
+		c[i] = Candidate{ID: "backend-" + strconv.Itoa(i), Weight: 1}
+	}
+	rk := Rendezvous(RendezvousConfig{}).Build(c).(Ranker)
+	dst := make([]int, n)
+	key := uint64(0)
+	if a := testing.AllocsPerRun(50, func() { key++; rk.Rank(key, dst) }); a > 1 {
+		t.Fatalf("%v allocations per Rank of %d candidates", a, n)
+	}
+	p := New[int](Config{Balancer: Rendezvous(RendezvousConfig{})})
+	defer p.Close()
+	for i := range n {
+		if err := p.Put(Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range n - 1 {
+		if _, err := p.Acquire(strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a := testing.AllocsPerRun(50, func() {
+		key++
+		l, err := p.PickHash(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Release(Success)
+	}); a > 2 {
+		t.Fatalf("%v allocations per pick on a full tier of %d", a, n)
+	}
+}
+
+// TestRankOrderTies checks that equal scores rank by ID, then by index,
+// as Pick breaks them.
+func TestRankOrderTies(t *testing.T) {
+	es := []rankEntry{{id: "b", score: 1, index: 0}, {id: "a", score: 1, index: 2}, {id: "a", score: 1, index: 1}, {id: "c", score: 2, index: 3}}
+	slices.SortFunc(es, rankOrder)
+	var got []int
+	for _, e := range es {
+		got = append(got, e.index)
+	}
+	if want := []int{3, 1, 2, 0}; !slices.Equal(got, want) {
+		t.Fatalf("order %v, want %v", got, want)
+	}
+}

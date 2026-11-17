@@ -160,7 +160,11 @@ type Ranker interface {
 
 	// Rank writes the index of every candidate to dst, which has one
 	// element per candidate, in the order that Pick returns them for key
-	// with attempts 0, 1, 2 and so on. It must not allocate.
+	// with attempts 0, 1, 2 and so on. It should need no memory beyond
+	// dst for small candidate sets and a fixed number of allocations, not
+	// growing with the calls, for large ones: the built-in Rendezvous
+	// allocates nothing up to 64 candidates and one scratch buffer per
+	// call beyond.
 	Rank(key uint64, dst []int)
 }
 
