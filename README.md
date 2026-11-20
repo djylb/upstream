@@ -76,7 +76,9 @@ defer conn.Close()
 `upnet.Dialer` does all of this, with retries.
 
 A `Lease` holds one in-flight slot of its backend until it is released, with
-`Success`, `Failure` or `Neutral` (for example when the client went away).
+`Success`, `Failure`, `Neutral` (for example when the client went away) or
+`Degraded` (the backend answered badly, such as with a 5xx status: counted by
+the failure-rate rule only).
 Release every lease exactly once. Releasing the same lease variable twice is a
 no-op. When the outcome is known long before the lease ends, as for a
 connection that stays open, `Report` records it at once and `Release` later
@@ -306,7 +308,10 @@ An empty pool returns `ErrNoBackends`; a closed one `ErrClosed`.
 
 `OutlierConfig` ejects a backend after `ConsecutiveFailures` failures in a row,
 or when `FailurePercent` of the requests in a sliding `Window` failed (once
-`MinRequests` were seen). The ejection lasts `BaseEjection`, doubling with each
+`MinRequests` were seen). A `Degraded` outcome counts as failed for the rate
+only: it neither extends nor resets the consecutive run, so it never ejects a
+backend before `MinRequests` requests, and it is not retried; a half-open
+trial answered with it fails. The ejection lasts `BaseEjection`, doubling with each
 ejection that is not followed by a recovery, up to `MaxEjection`. Then the
 backend is half-open: `HalfOpenSuccesses` successful trials restore it and
 reset the backoff; a failed trial ejects it again. Each ejection is one event,

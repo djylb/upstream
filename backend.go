@@ -154,13 +154,14 @@ type Status struct {
 	// Lease.Observe, or zero before the first one.
 	Latency time.Duration
 
-	// Successes, Failures and Neutrals count the outcomes of leases, as
-	// reported by Lease.Report or Lease.Release. Together with InFlight
-	// they count every pick: each lease is in flight until released and
-	// has one outcome.
+	// Successes, Failures, Neutrals and Degraded count the outcomes of
+	// leases, as reported by Lease.Report or Lease.Release. Together with
+	// InFlight they count every pick: each lease is in flight until
+	// released and has one outcome.
 	Successes uint64
 	Failures  uint64
 	Neutrals  uint64
+	Degraded  uint64
 
 	// State is the routing state.
 	State State
@@ -260,6 +261,7 @@ func (b *Backend[T]) Status() Status {
 		Successes:   c.successes.Load(),
 		Failures:    c.failures.Load(),
 		Neutrals:    c.neutrals.Load(),
+		Degraded:    c.degraded.Load(),
 		State:       stateOf(f, c.det.State()),
 		Health:      healthOf(f),
 		Draining:    f&(flagDraining|flagRemoved) != 0,
@@ -288,6 +290,7 @@ type core struct {
 	check     atomic.Pointer[CheckResult]
 	rampStart atomic.Int64 // slow start: 0 none, -1 pending, else unix nanoseconds
 	neutrals  atomic.Uint64
+	degraded  atomic.Uint64
 	offline   atomic.Pointer[error] // the cause given to MarkOffline; set before flagOffline
 }
 
@@ -445,6 +448,8 @@ func (c *core) count(o Outcome) {
 		c.failures.Add(1)
 	case Neutral:
 		c.neutrals.Add(1)
+	case Degraded:
+		c.degraded.Add(1)
 	}
 }
 

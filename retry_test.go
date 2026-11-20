@@ -369,7 +369,7 @@ func TestNamesRoundTrip(t *testing.T) {
 
 func TestWithOutcome(t *testing.T) {
 	base := errors.New("x")
-	for _, o := range []Outcome{Success, Failure, Neutral} {
+	for _, o := range []Outcome{Success, Failure, Neutral, Degraded} {
 		err := WithOutcome(fmt.Errorf("wrapped: %w", base), o)
 		if OutcomeOf(fmt.Errorf("again: %w", err)) != o || !errors.Is(err, base) || err.Error() != "wrapped: x" {
 			t.Errorf("WithOutcome(%v) = %v", o, err)

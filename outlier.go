@@ -48,12 +48,13 @@ type OutlierConfig struct {
 	MaxEjection time.Duration
 
 	// ConsecutiveFailures ejects the backend after this many failures in a
-	// row. Zero disables the rule.
+	// row. Degraded outcomes neither count towards the run nor end it.
+	// Zero disables the rule.
 	ConsecutiveFailures int
 
 	// FailurePercent ejects the backend when at least this percentage of
-	// the requests in Window failed, once MinRequests requests have been
-	// seen. Zero disables the rule; values above 100 mean 100.
+	// the requests in Window failed or were Degraded, once MinRequests
+	// requests have been seen. Zero disables the rule; values above 100 mean 100.
 	FailurePercent int
 
 	// MinRequests is the request volume the failure-rate rule needs before
@@ -412,13 +413,13 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 		if p.percent > 0 {
 			d.win.add(p.clock.Now().Sub(p.epoch), p.window, windowTotal)
 		}
-	case Failure:
+	case Failure, Degraded:
 		if OutlierState(d.state.Load()) != OutlierOK {
 			return // judged by trials, not by requests admitted earlier
 		}
 		// At or beyond the threshold, as a refused ejection leaves the
 		// run going.
-		if p.consec > 0 && d.consec.Add(1) >= p.consec {
+		if o == Failure && p.consec > 0 && d.consec.Add(1) >= p.consec {
 			d.eject(OutlierOK, 0, ErrConsecutiveFailures)
 			return
 		}
@@ -448,7 +449,7 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 				return
 			}
 		}
-	case Failure:
+	case Failure, Degraded:
 		d.eject(OutlierHalfOpen, gen, ErrTrialFailed)
 	case Neutral:
 	}

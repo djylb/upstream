@@ -24,6 +24,15 @@ const (
 	// because the client went away. It counts towards neither successes nor
 	// failures.
 	Neutral
+
+	// Degraded means the backend answered, but badly: for example an HTTP
+	// status the caller counts against it. It is a failure for the
+	// failure-rate rule only, so it ejects a backend only once
+	// OutlierConfig.MinRequests requests have been seen, and it neither
+	// extends nor resets the run of consecutive failures. A half-open
+	// backend that answers a trial with it is ejected again. It is not
+	// retried.
+	Degraded
 )
 
 // OutcomeOf maps an error to an Outcome: nil is Success, an error from
@@ -78,6 +87,8 @@ func (o Outcome) String() string {
 		return "failure"
 	case Neutral:
 		return "neutral"
+	case Degraded:
+		return "degraded"
 	}
 	return "Outcome(" + strconv.Itoa(int(o)) + ")"
 }

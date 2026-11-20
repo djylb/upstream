@@ -47,7 +47,7 @@ func (s *OutlierState) UnmarshalText(b []byte) (err error) {
 //
 //goland:noinspection GoMixedReceiverTypes
 func (o *Outcome) UnmarshalText(b []byte) (err error) {
-	*o, err = parseName(string(b), Neutral+1, "outcome")
+	*o, err = parseName(string(b), Degraded+1, "outcome")
 	return err
 }
 
