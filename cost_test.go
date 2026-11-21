@@ -322,7 +322,7 @@ func TestCostOracle(t *testing.T) {
 		n := 1 + rng.IntN(12)
 		ts := make([]Target[string], n)
 		for i := range ts {
-			ts[i] = Target[string]{ID: "m" + strconv.Itoa(i), Value: "v", Priority: rng.IntN(2), Cost: uint64(rng.IntN(5) * 50)}
+			ts[i] = Target[string]{ID: "m" + strconv.Itoa(i), Value: "v", Priority: rng.IntN(2), Cost: rng.Uint64N(5) * 50}
 		}
 		if err := p.Sync(ts); err != nil {
 			t.Fatal(err)
@@ -348,7 +348,7 @@ func TestCostOracle(t *testing.T) {
 				continue
 			}
 			for _, x := range ts {
-				if x.Priority == prio && !down[x.ID] && x.Cost <= bandLimit(cheapest, uint64(tol)) {
+				if x.Priority == prio && !down[x.ID] && x.Cost <= bandLimit(cheapest, uint64(max(tol, 0))) {
 					want[x.ID] = true
 				}
 			}
