@@ -46,6 +46,9 @@
 // tier with a member that can take them, balanced within it, which makes
 // active-backup pools. Target.MaxInFlight caps a member's leases, and
 // Config.Overflow lets picks go on to the next tier when a tier is full.
+// Target.Cost splits a tier into cost bands: picks prefer the members
+// whose cost is within Config.CostTolerance of the cheapest one that can
+// take them.
 //
 // # Health
 //

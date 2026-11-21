@@ -147,6 +147,10 @@ type Status struct {
 	// none.
 	MaxInFlight int
 
+	// Cost is the backend's cost (Target.Cost): lower is preferred within
+	// its tier.
+	Cost uint64
+
 	// InFlight is the number of leases not yet released.
 	InFlight int64
 
@@ -218,6 +222,7 @@ type Backend[T any] struct {
 	priority int
 	slot     int   // index among the members of its priority, -1 until placed; guarded by the pool's mutex
 	limit    int64 // MaxInFlight; 0 means none
+	cost     uint64
 	value    T
 }
 
@@ -232,6 +237,10 @@ func (b *Backend[T]) Weight() int { return b.weight }
 
 // Priority returns the backend's tier: lower values are preferred.
 func (b *Backend[T]) Priority() int { return b.priority }
+
+// Cost returns the backend's cost (Target.Cost): lower is preferred
+// within its tier.
+func (b *Backend[T]) Cost() uint64 { return b.cost }
 
 // MaxInFlight returns the backend's cap on leases in flight, or zero if it
 // has none.
@@ -256,6 +265,7 @@ func (b *Backend[T]) Status() Status {
 		Weight:      b.weight,
 		Priority:    b.priority,
 		MaxInFlight: int(b.limit),
+		Cost:        b.cost,
 		InFlight:    c.inflight.Load(),
 		Latency:     time.Duration(c.latency.Load()),
 		Successes:   c.successes.Load(),

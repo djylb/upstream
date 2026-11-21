@@ -14,6 +14,8 @@ the state of every backend.
   optional bounded loads, rendezvous hashing, or your own.
 - Priority tiers for active-backup setups, with per-backend caps on requests
   in flight and optional overflow to the next tier.
+- Cost bands within a tier: picks prefer the members that are cheapest to
+  reach, by a cost the caller supplies, such as a path latency.
 - Passive health: ejection on consecutive failures or a failure rate, with
   exponential, capped backoff and half-open trials.
 - Active health: TCP connect checks by default, HTTP checks or any function on
@@ -261,6 +263,33 @@ err := pool.Sync([]upstream.Target[string]{
 	{ID: "a", Value: "10.0.0.1:8080", MaxInFlight: 100},
 	{ID: "b", Value: "10.0.0.2:8080", MaxInFlight: 100},
 	{ID: "backup", Value: "10.0.0.9:8080", Priority: 1},
+})
+```
+
+### Cost bands
+
+`Target.Cost` says what reaching a backend costs the caller, in its own units,
+such as the latency of the path to it; lower is preferred. Within a tier the
+pool splits the eligible members into bands: a band starts at the cheapest
+member not yet placed and takes every member whose cost is at most
+`Config.CostTolerance` percent above it. A pick goes to the cheapest band that
+has a member that can take it, balanced within that band, so a key-affine
+balancer keeps its keys while costs move within the band. Bands are a
+preference inside one tier, not tiers of their own: a band whose members are
+full always passes the pick on to the dearer bands of the tier, while
+`Config.Overflow` still decides whether it goes on to the next tier. Retries
+and panic mode go through the bands in the same order.
+
+The default cost, 0 for every member, leaves each tier one band. A cost is
+part of the target: `Put` or `Sync` the new cost when it changes; an update
+that changes nothing does nothing, so resyncing unchanged costs is cheap.
+
+```go
+pool := upstream.New[string](upstream.Config{CostTolerance: 20})
+err := pool.Sync([]upstream.Target[string]{
+	{ID: "near-a", Value: "10.0.0.1:8080", Cost: 1000},
+	{ID: "near-b", Value: "10.0.0.2:8080", Cost: 1150},
+	{ID: "far", Value: "10.0.1.1:8080", Cost: 9000},
 })
 ```
 
@@ -513,7 +542,9 @@ a member's value, weight, priority or cap really changed.
   plus copying the tier's arrays; an `Updater` then updates its picker by the
   same `Delta`, and other balancers build. Membership changes (`Sync`, `Put`,
   `Remove`) compare the whole pool once and pass a `Delta` too, unless `Sync`
-  reorders members. Under slow start a changed tier is built anew.
+  reorders members. Under slow start a changed tier is built anew. In a
+  tier split into cost bands, the bands whose members did not change keep
+  their pickers, and a changed band is made again without a `Delta`.
 - The checker keeps its pending checks in one queue ordered by time behind a
   single timer, so it holds one timer however many targets it has. It owns
   that timer, one goroutine per running check and one goroutine for

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"reflect"
 	"runtime/debug"
@@ -76,6 +77,17 @@ type Target[T any] struct {
 	// the cap for a moment while a pick that lost a race for the last slot
 	// backs out; the leases never exceed it.
 	MaxInFlight int
+
+	// Cost is what reaching the backend costs the caller, in the caller's
+	// units, such as a path latency in microseconds; lower is preferred.
+	// Within a tier, picks go to the members whose cost is close to the
+	// lowest cost of the members that can take them, by
+	// Config.CostTolerance, and are balanced among those; the dearer
+	// members take picks only when none of the cheaper ones can, as with
+	// tiers, except that a full cost band always passes the pick on. The
+	// default, 0 for every member, leaves the tier one band. A cost is
+	// part of the target: Put or Sync a new one when it changes.
+	Cost uint64
 
 	// Value is what callers connect to, such as an address.
 	Value T
@@ -173,6 +185,14 @@ type Config struct {
 	// when it is busy. Members that are down, ejected, out of half-open
 	// trial slots or already tried by the request always pass the pick on.
 	Overflow bool
+
+	// CostTolerance, in percent, is how much dearer than the cheapest
+	// member of a band a member of the same tier may be and still share
+	// its band (Target.Cost): a band takes the cheapest remaining member
+	// and every member whose cost is at most CostTolerance percent above
+	// it, and the members left form the next bands the same way. Zero
+	// puts only equal costs in one band; negative values mean zero.
+	CostTolerance int
 }
 
 // settings are the parts of a Config that the pool reads under its mutex.
@@ -184,6 +204,7 @@ type settings[T any] struct {
 	threshold int // panic threshold in percent
 	fallback  Fallback
 	overflow  bool
+	costTol   uint64 // CostTolerance
 	gen       uint64 // changes with the balancer
 }
 
@@ -271,14 +292,17 @@ type view[T any] struct {
 	eligible     int  // members of tiers, for Available
 	ignoreHealth bool // panic mode: tiers hold all that are not draining or offline
 	overflow     bool // Config.Overflow
+	banded       bool // a priority has more than one cost band
 }
 
-// A tier is the members of one priority and their Picker.
+// A tier is the members of one cost band of one priority and their
+// Picker.
 type tier[T any] struct {
 	picker   Picker
 	ranker   Ranker        // picker, if it is a Ranker
 	members  []*Backend[T] // the candidates of picker
 	priority int
+	band     int // the cost band within the priority, from 0
 }
 
 // builtTier is a Picker a build made, kept for the next build of its
@@ -287,6 +311,7 @@ type builtTier[T any] struct {
 	picker   Picker
 	cands    []Candidate
 	priority int
+	band     int
 	members  []*Backend[T] // the tier's members, which the next build compares by identity
 	ramping  bool          // slow start lowered weights: rebuild at the next step
 }
@@ -309,6 +334,89 @@ type group[T any] struct {
 	pend      []*Backend[T] // members whose state may have changed
 	rediff    bool          // members changed: compare every member
 	reweigh   bool          // a member starts a slow start: make the tier again
+	eligBands bandCache[T]  // elig split by cost
+	openBands bandCache[T]  // open split by cost
+}
+
+// A bandCache holds the cost bands of a group list, kept while the list
+// and the tolerance stay the same, so that the bands, like the list, are
+// the same slices from one view to the next and their Pickers are kept.
+type bandCache[T any] struct {
+	src   []*Backend[T]
+	tol   uint64
+	bands [][]*Backend[T]
+	one   [1][]*Backend[T] // bands of a list of one cost, without allocating
+}
+
+// get returns the cost bands of list under tolerance tol.
+func (c *bandCache[T]) get(list []*Backend[T], tol uint64) [][]*Backend[T] {
+	if c.bands != nil && c.tol == tol && sameList(c.src, list) {
+		return c.bands
+	}
+	c.src, c.tol = list, tol
+	if uniformCost(list) {
+		c.one[0] = list
+		c.bands = c.one[:min(len(list), 1)]
+		return c.bands
+	}
+	c.bands = costBands(list, tol)
+	return c.bands
+}
+
+// uniformCost reports whether the members of list have one cost.
+func uniformCost[T any](list []*Backend[T]) bool {
+	return len(list) == 0 || !slices.ContainsFunc(list[1:], func(b *Backend[T]) bool { return b.cost != list[0].cost })
+}
+
+// costBands splits list into cost bands, cheapest first, each in the
+// order of list: a band starts at the cheapest member not yet placed and
+// takes the members whose cost is at most tol percent above it. A list
+// of one cost is one band, list itself; an empty list has none.
+func costBands[T any](list []*Backend[T], tol uint64) [][]*Backend[T] {
+	if len(list) == 0 {
+		return nil
+	}
+	if uniformCost(list) {
+		return [][]*Backend[T]{list}
+	}
+	costs := make([]uint64, len(list))
+	for i, b := range list {
+		costs[i] = b.cost
+	}
+	slices.Sort(costs)
+	// starts holds the lowest cost of every band.
+	starts := costs[:1]
+	limit := bandLimit(costs[0], tol)
+	for _, c := range costs[1:] {
+		if c > limit {
+			starts = append(starts, c)
+			limit = bandLimit(c, tol)
+		}
+	}
+	bands := make([][]*Backend[T], len(starts))
+	for _, b := range list {
+		k, found := slices.BinarySearch(starts, b.cost)
+		if !found {
+			k--
+		}
+		bands[k] = append(bands[k], b)
+	}
+	return bands
+}
+
+// bandLimit is the highest cost of the band that starts at c: c plus tol
+// percent of it, saturating.
+func bandLimit(c, tol uint64) uint64 {
+	hi, lo := bits.Mul64(c, tol)
+	if hi >= 100 {
+		return math.MaxUint64
+	}
+	extra, _ := bits.Div64(hi, lo, 100)
+	sum, carry := bits.Add64(c, extra, 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return sum
 }
 
 func isOpen[T any](b *Backend[T]) bool { return b.core.flags.Load()&blockPick == 0 }
@@ -473,6 +581,7 @@ func (p *Pool[T]) setLocked(cfg Config) {
 	s.threshold = min(max(cfg.PanicThreshold, 0), 100)
 	s.fallback = cfg.Fallback
 	s.overflow = cfg.Overflow
+	s.costTol = uint64(max(cfg.CostTolerance, 0))
 	for _, g := range p.groups {
 		g.rediff = true
 	}
@@ -556,7 +665,7 @@ func (p *Pool[T]) newBackendLocked(t Target[T], c *core) *Backend[T] {
 			c.rampStart.Store(-1)
 		}
 	}
-	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, slot: -1, limit: int64(t.MaxInFlight), value: t.Value}
+	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, slot: -1, limit: int64(t.MaxInFlight), cost: t.Cost, value: t.Value}
 }
 
 // Sync replaces the pool's membership with targets, in order. Members
@@ -605,8 +714,8 @@ func (p *Pool[T]) Sync(targets []Target[T]) error {
 
 // Put adds a target, or replaces the member with the same ID, keeping its
 // position, health state and counters. It emits EventAdded or
-// EventUpdated; a Put that changes none of the weight, priority, cap and
-// value of a member does nothing.
+// EventUpdated; a Put that changes none of the weight, priority, cap,
+// cost and value of a member does nothing.
 func (p *Pool[T]) Put(t Target[T]) error {
 	if err := validate(t); err != nil {
 		return err
@@ -637,7 +746,7 @@ func (p *Pool[T]) Put(t Target[T]) error {
 // places it in order.
 func (p *Pool[T]) putLocked(t Target[T]) *Backend[T] {
 	if old := p.byID.load(t.ID); old != nil {
-		if old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && p.cfg.equal(old.value, t.Value) {
+		if old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && old.cost == t.Cost && p.cfg.equal(old.value, t.Value) {
 			return old
 		}
 		b := p.newBackendLocked(t, old.core)
@@ -1078,20 +1187,31 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 		v.eligible = open
 	}
 	v.tiers = make([]tier[T], 0, len(p.prios))
+	tol := p.cfg.costTol
 	for _, prio := range p.prios {
 		g := p.groups[prio]
 		ch := tierChange[T]{base: g.eligPrev, d: g.eligDelta, remake: g.reweigh}
-		ms := g.elig
+		ms, bands := g.elig, &g.eligBands
 		if v.ignoreHealth {
-			ms, ch = g.open, tierChange[T]{base: g.openPrev, d: g.openDelta, remake: g.reweigh}
+			ms, bands, ch = g.open, &g.openBands, tierChange[T]{base: g.openPrev, d: g.openDelta, remake: g.reweigh}
 		}
 		g.reweigh = false
-		if len(ms) > 0 {
-			v.tiers = append(v.tiers, tier[T]{members: ms, priority: prio})
+		bs := bands.get(ms, tol)
+		if len(bs) > 1 {
+			// The group's delta is from its whole list, not a band's.
+			ch.base, ch.d = nil, nil
+		}
+		for k, b := range bs {
+			v.tiers = append(v.tiers, tier[T]{members: b, priority: prio, band: k})
 			s.changes = append(s.changes, ch)
 		}
-		if p.cfg.fallback == FallbackAll && !v.ignoreHealth && len(g.open) > 0 {
-			v.fallback = append(v.fallback, tier[T]{members: g.open, priority: prio})
+		v.banded = v.banded || len(bs) > 1
+		if p.cfg.fallback == FallbackAll && !v.ignoreHealth {
+			fb := g.openBands.get(g.open, tol)
+			for k, b := range fb {
+				v.fallback = append(v.fallback, tier[T]{members: b, priority: prio, band: k})
+			}
+			v.banded = v.banded || len(fb) > 1
 		}
 	}
 	return s
@@ -1136,10 +1256,10 @@ func (p *Pool[T]) build(s snapshot[T]) {
 	built := make([]builtTier[T], len(v.tiers))
 	for i := range v.tiers {
 		t := &v.tiers[i]
-		for len(prev) > 0 && prev[0].priority < t.priority {
+		for len(prev) > 0 && (prev[0].priority < t.priority || prev[0].priority == t.priority && prev[0].band < t.band) {
 			prev = prev[1:]
 		}
-		ok := len(prev) > 0 && prev[0].priority == t.priority
+		ok := len(prev) > 0 && prev[0].priority == t.priority && prev[0].band == t.band
 		var old builtTier[T]
 		if ok {
 			old = prev[0]
@@ -1157,7 +1277,7 @@ func (p *Pool[T]) build(s snapshot[T]) {
 			} else {
 				t.picker = s.balancer.Build(cands)
 			}
-			built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority}
+			built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority, band: t.band}
 			continue
 		}
 		cands := make([]Candidate, len(t.members))
@@ -1174,7 +1294,7 @@ func (p *Pool[T]) build(s snapshot[T]) {
 		default:
 			t.picker = s.balancer.Build(cands)
 		}
-		built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority, ramping: ramping}
+		built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority, band: t.band, ramping: ramping}
 	}
 	for i := range v.tiers {
 		v.tiers[i].ranker, _ = v.tiers[i].picker.(Ranker)
@@ -1276,17 +1396,45 @@ func keyHash(key string) uint64 {
 // pick leases a member of v that is not in tried, which may be nil, from
 // the first tier that has one that can take the request, and last, under
 // FallbackAll, any member that is not draining or offline, again tier by
-// tier. Within a tier it takes the balancer's choices first, then every
-// member in turn, for when the balancer kept choosing backends that could
-// not take the request, such as half-open ones out of trial slots, full
-// ones or ones already tried. A tier that refuses because members are full
-// ends the pick with ErrSaturated unless v.overflow lets it go on to the
-// next tier; the pick also fails with ErrSaturated if it found members
-// full on its way, and with ErrUnavailable otherwise.
+// tier. Within a tier it takes the cost bands in order and, within a
+// band, the balancer's choices first, then every member in turn, for when
+// the balancer kept choosing backends that could not take the request,
+// such as half-open ones out of trial slots, full ones or ones already
+// tried. A tier that refuses because members are full ends the pick with
+// ErrSaturated unless v.overflow lets it go on to the next tier; the pick
+// also fails with ErrSaturated if it found members full on its way, and
+// with ErrUnavailable otherwise.
 func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 	if len(v.tiers) == 0 {
 		return Lease[T]{}, v.err
 	}
+	if !v.banded {
+		return v.pickFlat(hash, tried)
+	}
+	full := false
+	l, r := pickTiers(v.tiers, hash, tried, v.ignoreHealth, v.overflow, false)
+	switch r {
+	case admitted:
+		return l, nil
+	case saturated:
+		if !v.overflow {
+			return Lease[T]{}, ErrSaturated
+		}
+		full = true
+	case refused:
+	}
+	if l, r = pickTiers(v.fallback, hash, tried, true, v.overflow, true); r == admitted {
+		return l, nil
+	}
+	if full || r == saturated {
+		return Lease[T]{}, ErrSaturated
+	}
+	return Lease[T]{}, ErrUnavailable
+}
+
+// pickFlat is pick for a view whose tiers are one band each: every tier
+// boundary is a priority's.
+func (v *view[T]) pickFlat(hash uint64, tried *Request[T]) (Lease[T], error) {
 	full := false
 	for i := range v.tiers {
 		l, r := v.tiers[i].pick(hash, tried, v.ignoreHealth)
@@ -1316,6 +1464,35 @@ func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 		return Lease[T]{}, ErrSaturated
 	}
 	return Lease[T]{}, ErrUnavailable
+}
+
+// pickTiers leases a member of the first of ts that has one that can
+// take the pick, with scan for tiers without a Picker. Without overflow,
+// it stops at the end of a priority in which a band was full and returns
+// saturated; the bands of one priority always pass a pick on.
+func pickTiers[T any](ts []tier[T], hash uint64, tried *Request[T], ignoreHealth, overflow, scanOnly bool) (Lease[T], refusal) {
+	res := refused
+	for i := range ts {
+		t := &ts[i]
+		if res == saturated && !overflow && t.priority != ts[i-1].priority {
+			return Lease[T]{}, saturated
+		}
+		var l Lease[T]
+		var r refusal
+		if scanOnly {
+			l, r = scan(t.members, hash, tried, ignoreHealth)
+		} else {
+			l, r = t.pick(hash, tried, ignoreHealth)
+		}
+		switch r {
+		case admitted:
+			return l, admitted
+		case saturated:
+			res = saturated
+		case refused:
+		}
+	}
+	return Lease[T]{}, res
 }
 
 // pick leases a member of t not in tried. It returns saturated if no
