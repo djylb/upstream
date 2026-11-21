@@ -398,6 +398,12 @@ once. Closing a pool, or calling the function `Attach` returns, ends its group.
 the context's error once it is done. An empty network and `tcp` are the same
 network, so pools that spell it differently share one check.
 
+A `Damper` limits how often changes are reported onward, for consumers that
+report a target's health to somewhere else: after more than `Flips` changes
+of a key within `Window`, reports for it are held back for `Base`, doubling
+up to `Max`, and the latest value is passed when the hold ends. Use it as the
+`OnChange` hook; it does not change any decision of the checker.
+
 ### Draining
 
 `Drain(id)` stops new picks while the backend stays a member; `Remove(id)`
