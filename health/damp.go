@@ -87,6 +87,7 @@ type dampKey[K comparable, V any] struct {
 	val      V
 	has      bool // a value has been passed: reported is valid
 	reported upstream.Health
+	round    uint64
 	timer    func() bool
 }
 
@@ -153,7 +154,9 @@ func (d *Damper[K, V]) decide(key K, k *dampKey[K, V], h upstream.Health, v V) b
 			if k.timer != nil {
 				k.timer()
 			}
-			k.timer = d.clock.AfterFunc(k.hold, func() { d.release(key, k) })
+			k.round++
+			round := k.round
+			k.timer = d.clock.AfterFunc(k.hold, func() { d.release(key, k, round) })
 			return false
 		}
 	}
@@ -167,10 +170,10 @@ func (d *Damper[K, V]) decide(key K, k *dampKey[K, V], h upstream.Health, v V) b
 	return true
 }
 
-// release ends a suppression: the latest value is passed.
-func (d *Damper[K, V]) release(key K, k *dampKey[K, V]) {
+// release passes the latest value if the timer still owns the suppression.
+func (d *Damper[K, V]) release(key K, k *dampKey[K, V], round uint64) {
 	d.mu.Lock()
-	if d.closed || d.keys[key] != k || !k.pending {
+	if d.closed || d.keys[key] != k || k.round != round || !k.pending {
 		d.mu.Unlock()
 		return
 	}

@@ -61,26 +61,32 @@ func (c *stepClock) WithTimeout(ctx context.Context, d time.Duration) (context.C
 // own time.
 func (c *stepClock) Advance(d time.Duration) {
 	end := c.Now().Add(d)
-	for {
-		c.mu.Lock()
-		var next *stepTimer
-		for _, t := range c.timers {
-			if !t.at.After(end) && (next == nil || t.at.Before(next.at) || t.at.Equal(next.at) && t.seq < next.seq) {
-				next = t
-			}
-		}
-		if next == nil {
-			c.now = end
-			c.mu.Unlock()
-			return
-		}
-		c.timers = slices.DeleteFunc(c.timers, func(t *stepTimer) bool { return t == next })
-		if next.at.After(c.now) {
-			c.now = next.at
-		}
-		c.mu.Unlock()
-		next.f()
+	for f := c.takeDue(end); f != nil; f = c.takeDue(end) {
+		f()
 	}
+}
+
+// takeDue dequeues the next timer due by end and returns its callback
+// without running it. The clock moves to the timer's time, or to end if
+// no timer is due.
+func (c *stepClock) takeDue(end time.Time) func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var next *stepTimer
+	for _, t := range c.timers {
+		if !t.at.After(end) && (next == nil || t.at.Before(next.at) || t.at.Equal(next.at) && t.seq < next.seq) {
+			next = t
+		}
+	}
+	if next == nil {
+		c.now = end
+		return nil
+	}
+	c.timers = slices.DeleteFunc(c.timers, func(t *stepTimer) bool { return t == next })
+	if next.at.After(c.now) {
+		c.now = next.at
+	}
+	return next.f
 }
 
 type damped struct {
@@ -139,6 +145,43 @@ func TestDamperReleaseRepeatsReported(t *testing.T) {
 	clk.Advance(30 * time.Second)
 	if len(got) != 3 || got[2].h != up {
 		t.Fatalf("release: %v", got)
+	}
+}
+
+func TestDamperDelayedRelease(t *testing.T) {
+	const base = 10 * time.Second
+	clk := newStepClock()
+	var got []damped
+	d := newTestDamper(clk, DampConfig{Flips: 1, Base: base}, &got)
+	defer d.Close()
+
+	d.Offer("a", up, up)
+	d.Offer("a", down, down)
+	d.Offer("a", up, up) // starts the first suppression
+	release := clk.takeDue(clk.Now().Add(base))
+	if release == nil {
+		t.Fatal("first suppression did not schedule a release")
+	}
+
+	d.Offer("a", up, up)     // passes after the first suppression expires
+	d.Offer("a", down, down) // starts the second suppression
+	want := []damped{{"a", up}, {"a", down}, {"a", up}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("before delayed release: got %v, want %v", got, want)
+	}
+	release()
+	if !slices.Equal(got, want) {
+		t.Fatalf("old timer released the second suppression: got %v, want %v", got, want)
+	}
+
+	clk.Advance(2*base - time.Second)
+	if !slices.Equal(got, want) {
+		t.Fatalf("before second deadline: got %v, want %v", got, want)
+	}
+	clk.Advance(time.Second)
+	want = append(want, damped{"a", down})
+	if !slices.Equal(got, want) {
+		t.Fatalf("at second deadline: got %v, want %v", got, want)
 	}
 }
 
@@ -211,6 +254,41 @@ func TestDamperForgetAndClose(t *testing.T) {
 	}
 	if len(clk.timers) != 0 {
 		t.Fatalf("%d timers left", len(clk.timers))
+	}
+}
+
+func TestDamperDelayedReleaseAfterForgetAndClose(t *testing.T) {
+	const base = 10 * time.Second
+	clk := newStepClock()
+	var got []damped
+	d := newTestDamper(clk, DampConfig{Flips: 1, Base: base}, &got)
+	defer d.Close()
+
+	takeRelease := func() func() {
+		t.Helper()
+		d.Offer("a", up, up)
+		d.Offer("a", down, down)
+		d.Offer("a", up, up)
+		release := clk.takeDue(clk.Now().Add(base))
+		if release == nil {
+			t.Fatal("suppression did not schedule a release")
+		}
+		return release
+	}
+
+	forgotten := takeRelease()
+	d.Forget("a")
+	current := takeRelease()
+	want := []damped{{"a", up}, {"a", down}, {"a", up}, {"a", down}}
+	forgotten()
+	if !slices.Equal(got, want) {
+		t.Fatalf("delayed release after Forget: got %v, want %v", got, want)
+	}
+
+	d.Close()
+	current()
+	if !slices.Equal(got, want) {
+		t.Fatalf("delayed release after Close: got %v, want %v", got, want)
 	}
 }
 
