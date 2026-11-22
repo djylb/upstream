@@ -34,6 +34,8 @@ var ErrHeaderTimeout = fmt.Errorf("uphttp: timed out waiting for response header
 // (GET, HEAD, OPTIONS, TRACE, or any method with an Idempotency-Key
 // header) or the connection to the failed backend was never established.
 // When no retry is allowed, the last response or error is returned.
+// Once another backend is picked for a retry, the previous response body
+// is closed without draining it.
 //
 // The lease on the backend lasts until the response body is read to the
 // end or closed, or, for an upgraded connection (status 101), until it is
@@ -163,13 +165,13 @@ type attempt[T any] struct {
 
 // discard drops the response of an attempt that is retried.
 func (a *attempt[T]) discard() {
-	if a.resp != nil && a.resp.Body != nil {
-		discard(a.resp.Body)
-	}
-	a.lease.Release(a.o)
 	if a.cancel != nil {
 		a.cancel()
 	}
+	if a.resp != nil && a.resp.Body != nil {
+		_ = a.resp.Body.Close()
+	}
+	a.lease.Release(a.o)
 	*a = attempt[T]{}
 }
 
@@ -396,13 +398,6 @@ func closeBody(req *http.Request) {
 	if req.Body != nil {
 		_ = req.Body.Close()
 	}
-}
-
-// discard reads a little of a response that is not used, so that its
-// connection can be reused, and closes it.
-func discard(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4<<10))
-	_ = body.Close()
 }
 
 // finish hands the response of the last attempt to the caller: it

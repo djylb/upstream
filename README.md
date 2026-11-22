@@ -162,8 +162,9 @@ conn, err := dialer.DialKey(ctx, clientIP)
 it points each request at a picked backend, takes an affinity key from the
 request, judges responses (5xx is a failure by default) and retries on another
 backend when the request can be sent again: its body can be replayed and its
-method is idempotent, or the connection was never established. The lease lasts
-until the response body is read to the end or closed; for an upgraded
+method is idempotent, or the connection was never established. Once a retry
+can start, the previous response body is closed without draining it. The lease
+lasts until the response body is read to the end or closed; for an upgraded
 connection (101), until it is closed, since the client may still be writing.
 The outgoing request keeps the incoming `Host`; with `https`, the TLS server
 name and certificate check use the backend's address unless the transport's

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/upstream"
@@ -525,6 +526,63 @@ func TestRoundTripperHeaderTimeout(t *testing.T) {
 	if _, err := (&http.Client{Transport: rt}).Get("http://service/"); !errors.Is(err, ErrHeaderTimeout) || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAttemptTimeout) {
 		t.Fatalf("error %v", err)
 	}
+}
+
+func TestRoundTripperRetryClosesStalledBody(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		p := newOrderedRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}}, "stalled", "ok")
+		reader, writer := io.Pipe() // The first backend sends no body bytes or EOF.
+		closes := 0
+		tr := rtFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Host == "stalled" {
+				body := struct {
+					io.Reader
+					io.Closer
+				}{reader, closeFunc(func() {
+					closes++
+					if err := r.Context().Err(); !errors.Is(err, context.Canceled) {
+						t.Errorf("discarded attempt context at Close: %v", err)
+					}
+					_ = reader.Close()
+				})}
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: body, Request: r}, nil
+			}
+			if s := p.Status()[0]; closes != 1 || s.InFlight != 0 || s.Failures != 1 {
+				t.Errorf("before retry: %d body closes, first backend status %+v", closes, s)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
+		})
+		client := &http.Client{Transport: &RoundTripper[string]{
+			Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper { return tr }, HeaderTimeout: time.Second,
+		}}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			resp, err := client.Get("http://service/")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status %d", resp.StatusCode)
+			}
+		}()
+		defer func() {
+			_ = writer.Close() // Unblock an erroneous body read before joining the request.
+			<-done
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("retry blocked while the first response body was stalled")
+		}
+		if n := clk.Pending(); n != 0 {
+			t.Errorf("%d timers pending", n)
+		}
+	})
 }
 
 // TestRoundTripperHeaderTimeoutLoses checks the race: a response that the
