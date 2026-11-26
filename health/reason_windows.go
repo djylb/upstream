@@ -35,7 +35,7 @@ func errnoReason(err error) (Reason, bool) {
 	case wsaEHOSTUNREACH, wsaENETUNREACH, wsaEHOSTDOWN, wsaENETDOWN, wsaEADDRNOTAVAIL,
 		uintptr(syscall.EHOSTUNREACH), uintptr(syscall.ENETUNREACH), uintptr(syscall.EHOSTDOWN), uintptr(syscall.ENETDOWN), uintptr(syscall.EADDRNOTAVAIL):
 		return ReasonUnreachable, true
-	case wsaECONNRESET, wsaECONNABORTED, uintptr(syscall.ECONNRESET), uintptr(syscall.ECONNABORTED):
+	case uintptr(syscall.ERROR_NETNAME_DELETED), wsaECONNRESET, wsaECONNABORTED, uintptr(syscall.ECONNRESET), uintptr(syscall.ECONNABORTED):
 		return ReasonReset, true
 	}
 	return ReasonNone, false

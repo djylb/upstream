@@ -28,8 +28,13 @@ func AddressOf[T any](v T) (addr string, ok bool) {
 	case string:
 		return x, true
 	case Addresser:
-		if rv := reflect.ValueOf(x); rv.Kind() == reflect.Pointer && rv.IsNil() {
-			return "", false
+		rv := reflect.ValueOf(x)
+		switch rv.Kind() {
+		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+			if rv.IsNil() {
+				return "", false
+			}
+		default:
 		}
 		return x.Address(), true
 	}

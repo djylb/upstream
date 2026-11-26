@@ -141,6 +141,11 @@ func serverName(c Check) string {
 	if h, _, err := net.SplitHostPort(c.Host); err == nil {
 		return h
 	}
+	if len(c.Host) > 2 && c.Host[0] == '[' && c.Host[len(c.Host)-1] == ']' {
+		if ip := net.ParseIP(c.Host[1 : len(c.Host)-1]); ip != nil {
+			return c.Host[1 : len(c.Host)-1]
+		}
+	}
 	return c.Host
 }
 

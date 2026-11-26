@@ -3,6 +3,7 @@ package uphttp
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -302,6 +303,7 @@ func TestCheckServerName(t *testing.T) {
 		want string
 	}{
 		{Check{}, ""},
+		{Check{Host: "[" + net.IPv6loopback.String() + "]"}, net.IPv6loopback.String()},
 		{Check{Host: "svc.example"}, "svc.example"},
 		{Check{Host: "svc.example:8443"}, "svc.example"},
 		{Check{Host: "svc.example", ServerName: "tls.example"}, "tls.example"},
@@ -314,5 +316,38 @@ func TestCheckServerName(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%+v: server name %q, want %q", tc.c, got, tc.want)
 		}
+	}
+}
+
+func TestConcurrentFactoryPanic(t *testing.T) {
+	entered, finish := make(chan struct{}), make(chan struct{})
+	calls := 0
+	c := NewTransportCache(func(string) *http.Transport {
+		calls++
+		switch calls {
+		case 1:
+			close(entered)
+			<-finish
+		case 2:
+			panic("factory")
+		}
+		return new(http.Transport)
+	}, TransportCacheConfig{})
+	defer c.CloseIdleConnections()
+	result := make(chan *http.Transport, 1)
+	go func() { result <- c.Get("a") }()
+	<-entered
+	func() {
+		defer func() {
+			if recover() != "factory" {
+				t.Error("missing panic")
+			}
+		}()
+		c.Get("a")
+	}()
+	close(finish)
+	built := <-result
+	if c.Get("a") != built || calls != 2 {
+		t.Fatal("successful build was lost")
 	}
 }

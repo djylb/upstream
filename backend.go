@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/upstream/internal/latency"
 )
 
 // State is the routing state of a backend, combining its membership, the
@@ -159,9 +161,9 @@ type Status struct {
 	Latency time.Duration
 
 	// Successes, Failures, Neutrals and Degraded count the outcomes of
-	// leases, as reported by Lease.Report or Lease.Release. Together with
-	// InFlight they count every pick: each lease is in flight until
-	// released and has one outcome.
+	// leases, as reported by Lease.Report or Lease.Release. A reported lease
+	// can still be in flight. Concurrent reads of these counters need not
+	// describe one instant.
 	Successes uint64
 	Failures  uint64
 	Neutrals  uint64
@@ -289,19 +291,21 @@ func (b *Backend[T]) Status() Status {
 // core is the state shared by every version of a backend. Hot fields come
 // first; flags change only under the pool's mutex but are read without it.
 type core struct {
-	inflight  atomic.Int64
-	latency   atomic.Int64 // moving average in nanoseconds; 0 before the first sample
-	successes atomic.Uint64
-	failures  atomic.Uint64
-	flags     atomic.Uint32
-	reported  State // last state announced in an event; guarded by the pool's mutex
-	det       OutlierDetector
-	drain     atomic.Pointer[Drain]
-	check     atomic.Pointer[CheckResult]
-	rampStart atomic.Int64 // slow start: 0 none, -1 pending, else unix nanoseconds
-	neutrals  atomic.Uint64
-	degraded  atomic.Uint64
-	offline   atomic.Pointer[error] // the cause given to MarkOffline; set before flagOffline
+	inflight     atomic.Int64
+	latency      atomic.Int64 // moving average in nanoseconds; 0 before the first sample
+	successes    atomic.Uint64
+	failures     atomic.Uint64
+	flags        atomic.Uint32
+	reported     State // last state announced in an event; guarded by the pool's mutex
+	det          OutlierDetector
+	drain        atomic.Pointer[Drain]
+	directHealth Health
+	checkSources map[*CheckSource]Health
+	check        atomic.Pointer[CheckResult]
+	rampStart    atomic.Pointer[time.Time] // nil, pendingRamp, or start instant
+	neutrals     atomic.Uint64
+	degraded     atomic.Uint64
+	offline      atomic.Pointer[error] // the cause given to MarkOffline; set before flagOffline
 }
 
 func stateOf(f uint32, o OutlierState) State {
@@ -352,6 +356,14 @@ func (c *core) eligible() bool {
 	return c.flags.Load()&^flagUp == 0 && c.det.State() != OutlierEjected
 }
 
+// canRoute checks the live routing state without consuming a half-open ticket.
+func (c *core) canRoute(ignoreHealth bool) bool {
+	if ignoreHealth {
+		return c.flags.Load()&blockPick == 0
+	}
+	return c.eligible() && !c.det.trialsFull()
+}
+
 const blockAlways = flagDraining | flagRemoved
 
 // blockPick are the flags that keep a backend from every pick, panic mode
@@ -366,6 +378,8 @@ const (
 	refused           // draining, offline, unhealthy, ejected or out of trial slots
 	saturated         // at its MaxInFlight
 )
+
+func (b *Backend[T]) full() bool { return b.limit > 0 && b.core.inflight.Load() >= b.limit }
 
 // acquire takes an in-flight slot of b. With ignoreHealth it admits any
 // backend that is neither draining, removed nor offline; its outcome still
@@ -387,15 +401,13 @@ func (b *Backend[T]) acquire(ignoreHealth bool) (Ticket, refusal) {
 	if !ignoreHealth && f&flagUnhealthy != 0 {
 		return Ticket{}, refused
 	}
-	if b.limit > 0 && c.inflight.Load() >= b.limit {
+	if b.full() {
 		return Ticket{}, saturated
 	}
 	if c.det.enabled.Load() {
-		if !ignoreHealth {
-			var ok bool
-			if t, ok = c.det.Admit(); !ok {
-				return Ticket{}, refused
-			}
+		var ok bool
+		if t, ok = c.det.Admit(); !ok && !ignoreHealth {
+			return Ticket{}, refused
 		}
 		t.admitted = true
 	}
@@ -440,10 +452,7 @@ func (c *core) observe(d time.Duration) {
 	d = max(d, 1)
 	for {
 		old := c.latency.Load()
-		avg := int64(d)
-		if old != 0 {
-			avg = old + (int64(d)-old)/8
-		}
+		avg := int64(latency.Update(time.Duration(old), d, 8, old == 0))
 		if c.latency.CompareAndSwap(old, avg) {
 			return
 		}

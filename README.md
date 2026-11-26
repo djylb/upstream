@@ -228,11 +228,12 @@ candidate also implements `Updater`: the pool then hands it the previous picker
 and a `Delta`, the positions of the candidates that left and joined, so that
 it redoes only the work for those. `Rendezvous` prepares only the new
 candidates; `ConsistentHash` keeps the ring points of the others and merges,
-in linear time without a new sort. A picker that can order every candidate
-for a key at once also implements `Ranker`; when a pick must look past the
-first choice, because backends are full, down or already tried, the pool
-ranks once instead of calling `Pick` for every attempt. `Rendezvous` does,
-which keeps such a pick at O(n log n) on large tiers.
+in linear time without a new sort. Custom pickers can implement `Ranker` to
+provide an ordered list of alternatives. The built-in hash pickers handle a
+full or already tried first choice without allocating a ranking buffer.
+Consistent hashing walks distinct ring owners. Rendezvous finds the highest
+scoring remaining candidate eligible for a trial. If admission changes during
+the pick, a final scan tries each remaining member.
 
 ### Tiers
 
@@ -379,15 +380,19 @@ defer watcher.Close()
 ```
 
 `Watch` follows the pool's membership and reports each result with
-`Pool.ReportCheck`, matching reports to members by generation so that a
-re-added member never takes an old verdict. Give a target function to choose
+its own `Pool.ReportCheckFrom` source, matching reports to members by
+generation so that a re-added member never takes an old verdict. Give a target function to choose
 the address, a `Probe` (such as `uphttp.Probe`) or per-member options.
 Thresholds apply in the checker: before its first check a target is
 `HealthUnknown`; the first check decides at once; after that `Rise`
 consecutive passes bring it up and `Fall` consecutive failures take it down.
-Transitions are reported once each. Closing the watcher before the pool sets
-the members' health back to `HealthUnknown`, so no member stays out of
-rotation on a verdict nothing will revise.
+Transitions are reported once each. Each watcher or attachment owns its verdict.
+Closing it withdraws that verdict. Any remaining Down verdict keeps the member
+down. Otherwise an Up verdict keeps it up, and a member with no verdict is
+unknown. For example, if a watcher and a direct check both report Down,
+`pool.ClearCheckFrom(nil, backend)` withdraws the direct verdict. The watcher
+keeps the member down until it recovers or the watcher closes. Clearing a
+source preserves the most recent observation in `LastCheck`.
 
 `Attach` connects a pool to one group of a shared checker instead, for
 example one pool per tunnel. The checker then holds targets by address
@@ -429,9 +434,11 @@ not crash the program or reach the caller that changed the pool: the pool keeps
 routing with its last view, reports a `*BalancerPanicError` with the panic value
 and stack in an `EventBalancerPanic`, and builds again on its next change. Callbacks run
 without any lock held and may call the pool. `Status` and `Backend.Status`
-return in-flight counts, outcome counters (successes, failures and neutral
-outcomes, which with the in-flight count make up every pick), the latest check
-result, the outlier state and the routing state of every backend.
+return the current number of held leases, counts of reported outcomes
+(success, failure, degraded and neutral), the latest check result, the outlier
+state and the routing state. A lease reported before release contributes to
+both the in-flight count and its outcome count. Concurrent reads of several
+counters can observe different instants.
 `Available` counts the members that are eligible for traffic, for readiness
 checks; it is zero in panic mode, when `FallbackAll` still lets picks through.
 
@@ -497,10 +504,13 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
   are probed. A target whose checks stop goes
   back to `HealthUnknown`.
 - **Removal** cancels the target's check in progress through its context,
-  discards the result, stops its timer and frees its slot. Once `Remove`,
-  `RemoveFromGroup`, `RemoveGroup` or `SyncGroup` returns, no callback for the
-  removed target starts (one already running may finish, as with
-  `time.Timer.Stop`); `OnRemove` reports its key and generation last.
+  discards the result and removes its schedule. The probe holds its concurrency
+  slot until it returns. Once `Remove`, `RemoveFromGroup`, `RemoveGroup`
+  or `SyncGroup` returns, the checker admits
+  no further probe or result callback for that generation. A call starts at
+  its final generation check under the checker lock. An admitted call may
+  enter user code or finish after removal returns. `OnRemove` reports the
+  removal itself, with the key and generation.
   Adding the key again, or changing its network or address, starts a new
   generation; `OnRemove` reports the end of the old one too, and every report
   carries the generation so that buffered reports of an old target can be
@@ -511,7 +521,7 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
   nothing are coalesced per target meanwhile.
 
 `Config.Concurrency` bounds how many checks run at once; a hanging target holds
-one slot and never delays the others.
+one slot. Other checks wait if all slots are occupied.
 
 ## HTTP transports
 
@@ -525,7 +535,7 @@ a member's value, weight, priority or cap really changed.
 
 ## Concurrency and lifetimes
 
-- All types are safe for concurrent use.
+- Create pools, checkers, dampers, detectors and transport caches with their constructors. A request and each lease have one owner. Use `Lease.Take` to hand a lease to another owner. Pool and checker methods support concurrent calls.
 - No lock is held while calling a balancer, a clock, a probe or a callback, so
   callbacks may call back into the pool or the checker.
 - No method waits for a probe or a callback, so none deadlocks when called
@@ -572,16 +582,13 @@ a member's value, weight, priority or cap really changed.
   ratios, it picks at random by weight, lock-free, so proportions hold on
   average.
 - Bounded-load consistent hashing reads every backend's in-flight count on
-  each pick; retries (not first picks) on rings of more than 256 backends
-  allocate.
+  each pick. Ring retries visit distinct owners without allocating.
 - A `Request` allocates from the fifth attempt of one request on, and past 36
   attempts keeps the backends it tried in a map; `Pool.Do` does not allocate,
   `Request.Do` allocates once.
 - Slow start works through weights within a tier, so it has no effect with
   `RoundRobin`, on a backend alone in its tier, or between tiers: traffic
   moves back to a recovered tier at once.
-- The failure-rate window counts up to 2³²−1 requests per window and backend;
-  the retry budget, up to 2³²−1 requests per window and pool.
 - The checker compares targets by key; two groups that give different
   targets for one key share the latest one.
 

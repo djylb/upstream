@@ -681,3 +681,226 @@ func TestRoundTripperGetBodyErrorStopsTimer(t *testing.T) {
 		t.Fatalf("leaked %d timers", clk.Pending())
 	}
 }
+
+func TestRewriteFailureClosesBody(t *testing.T) {
+	p := upstream.New[*url.URL](upstream.Config{})
+	defer p.Close()
+	if err := p.Put(upstream.Target[*url.URL]{ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	body := &rwBody{Reader: strings.NewReader("")}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, "/", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&RoundTripper[*url.URL]{Pool: p}).RoundTrip(req)
+	if !errors.Is(err, upstream.ErrNoAddress) || !body.closed || p.Status()[0].InFlight != 0 {
+		t.Fatalf("rewrite failure %v, closed %v", err, body.closed)
+	}
+}
+
+func TestRetryPanicDiscardsResponse(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	body := &rwBody{Reader: strings.NewReader("")}
+	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Hour, Retry: func(*http.Response, error) bool { panic("retry") },
+		Transport: func(*upstream.Backend[string]) http.RoundTripper {
+			return rtFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			})
+		}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recover() != "retry" {
+				t.Fatal("missing panic")
+			}
+		}()
+		_, _ = rt.RoundTrip(req)
+	}()
+	if !body.closed || clk.Pending() != 0 || p.Status()[0].InFlight != 0 {
+		t.Fatal("resources survived Retry panic")
+	}
+}
+
+func TestInvalidationDuringTransportFactory(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	c := NewTransportCache(func(string) *http.Transport { close(started); <-release; return &http.Transport{} }, TransportCacheConfig{})
+	done := make(chan struct{})
+	go func() { defer close(done); c.Get("a") }()
+	<-started
+	c.Remove("a")
+	close(release)
+	<-done
+	if c.Len() != 0 {
+		t.Fatal("invalidated factory populated cache")
+	}
+}
+
+func TestAttemptTimeoutDiscardsLateSuccess(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	body := &rwBody{Reader: strings.NewReader("")}
+	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Second, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(req *http.Request) (*http.Response, error) {
+			clk.Advance(time.Second)
+			<-req.Context().Done()
+			return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+		})
+	}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.RoundTrip(req)
+	if !errors.Is(err, ErrAttemptTimeout) || !body.closed || p.Status()[0].InFlight != 0 {
+		t.Fatalf("late response: %v", err)
+	}
+}
+
+func TestFinishPanicOwnsResponse(t *testing.T) {
+	clk := fakeclock.New()
+	cfg := upstream.Config{Clock: clk, Outlier: upstream.OutlierConfig{ConsecutiveFailures: 1}}
+	p := newRTPool(t, cfg, "a")
+	defer p.Subscribe(func(e upstream.Event[string]) {
+		if e.To == upstream.StateEjected {
+			panic("subscriber")
+		}
+	})()
+	body := &rwBody{Reader: strings.NewReader("")}
+	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Minute, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusBadGateway, Body: body}, nil
+		})
+	}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recover() != "subscriber" {
+				t.Fatal("missing subscriber panic")
+			}
+		}()
+		_, _ = rt.RoundTrip(req)
+	}()
+	if !body.closed || p.Status()[0].InFlight != 0 || clk.Pending() != 1 {
+		t.Fatal("handoff leaked response, attempt timer or lease")
+	}
+}
+
+func TestRewriteBodyOwnership(t *testing.T) {
+	for _, mode := range []string{"replace", "wrap", "panic"} {
+		t.Run(mode, func(t *testing.T) {
+			p := newRTPool(t, upstream.Config{}, "a")
+			original, replacement := 0, 0
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/", closeFunc(func() { original++ }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rt := RoundTripper[string]{Pool: p, Rewrite: func(r *http.Request, _ *upstream.Backend[string]) {
+				inner := r.Body
+				r.Body = closeFunc(func() {
+					replacement++
+					if mode == "wrap" {
+						_ = inner.Close()
+					}
+				})
+				if mode == "panic" {
+					panic("rewrite")
+				}
+			}, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+				return rtFunc(func(r *http.Request) (*http.Response, error) {
+					_ = r.Body.Close()
+					return &http.Response{Body: http.NoBody, StatusCode: http.StatusOK}, nil
+				})
+			}}
+			func() {
+				defer func() {
+					if v := recover(); (mode == "panic" && v != "rewrite") || (mode != "panic" && v != nil) {
+						t.Errorf("unexpected panic result: %v", v)
+					}
+				}()
+				resp, err := rt.RoundTrip(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+			}()
+			if original != 1 || replacement != 1 {
+				t.Fatalf("closed original %d replacement %d", original, replacement)
+			}
+		})
+	}
+}
+
+func TestErrorResponseClosePanic(t *testing.T) {
+	p := newRTPool(t, upstream.Config{}, "a")
+	closes := 0
+	rt := RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{Body: closeFunc(func() { closes++; panic("close") })}, errors.New("failed")
+		})
+	}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if recover() != "close" || closes != 1 || p.Status()[0].InFlight != 0 {
+			t.Errorf("close panic: %d closes", closes)
+		}
+	}()
+	_, _ = rt.RoundTrip(req)
+}
+
+func TestTransportMissingResponse(t *testing.T) {
+	clk := fakeclock.New()
+	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
+	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Minute, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(*http.Request) (*http.Response, error) { return nil, nil })
+	}}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.RoundTrip(req)
+	if !errors.Is(err, errNoResponse) || p.Status()[0].InFlight != 0 || clk.Pending() != 0 {
+		t.Fatalf("invalid transport result: %v", err)
+	}
+}
+
+func TestRewrittenRetryBodies(t *testing.T) {
+	p := newOrderedRTPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}}, "a", "b")
+	var original, replay, replaced, attempts int
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/", closeFunc(func() { original++ }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return closeFunc(func() { replay++ }), nil }
+	rt := RoundTripper[string]{Pool: p, Rewrite: func(r *http.Request, _ *upstream.Backend[string]) {
+		r.Body = closeFunc(func() { replaced++ })
+	}, Transport: func(*upstream.Backend[string]) http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			_ = r.Body.Close()
+			code := http.StatusOK
+			if attempts == 1 {
+				code = http.StatusBadGateway
+			}
+			return &http.Response{StatusCode: code, Body: http.NoBody}, nil
+		})
+	}}
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if original != 1 || replay != 1 || replaced != 2 || attempts != 2 {
+		t.Fatalf("closed original %d replay %d rewritten %d on %d attempts", original, replay, replaced, attempts)
+	}
+}

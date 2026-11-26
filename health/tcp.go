@@ -2,7 +2,6 @@ package health
 
 import (
 	"context"
-	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/dialresult"
 )
 
 // TCPOptions configure the TCP check.
@@ -39,6 +39,7 @@ type TCPOptions struct {
 // reading anything. The check passes if the connection is established; it
 // fails with upstream.ErrNoAddress for a target without an address, such
 // as a backend whose value is a nil Addresser.
+// A non-TCP network fails with net.UnknownNetworkError before dialing.
 // Host names are resolved by each check; when a name has several
 // addresses, they are tried as net.Dialer does, and the Observation names
 // the one that answered.
@@ -52,22 +53,24 @@ func TCP(o TCPOptions) Probe {
 			return Observation{}, upstream.ErrNoAddress
 		}
 		network := normNetwork(t.Network)
+		if !isTCP(network) {
+			return Observation{}, net.UnknownNetworkError(network)
+		}
 		var (
 			conn net.Conn
 			err  error
 			obs  Observation
 		)
+		defer func() {
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}()
 		begin := clock.Now()
 		switch {
 		case o.Dial != nil:
-			conn, err = o.Dial(ctx, network, t.Address)
+			conn, err = dialresult.Check(o.Dial(ctx, network, t.Address))
 			obs.Latency = clock.Now().Sub(begin)
-			switch {
-			case err != nil && conn != nil:
-				_ = conn.Close()
-			case err == nil && conn == nil:
-				err = errNoConn
-			}
 		case !controlHooks:
 			conn, err = new(net.Dialer).DialContext(ctx, network, t.Address)
 			obs.Latency = clock.Now().Sub(begin)
@@ -77,8 +80,9 @@ func TCP(o TCPOptions) Probe {
 			var mu sync.Mutex
 			starts := make(map[string]time.Time, 2)
 			d := net.Dialer{ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
+				now := clock.Now()
 				mu.Lock()
-				starts[address] = clock.Now()
+				starts[address] = now
 				mu.Unlock()
 				return nil
 			}}
@@ -101,14 +105,9 @@ func TCP(o TCPOptions) Probe {
 		if tc, ok := conn.(*net.TCPConn); ok && o.Reset {
 			_ = tc.SetLinger(0)
 		}
-		_ = conn.Close() // the target was reachable; a close error changes nothing
 		return obs, nil
 	}
 }
-
-// errNoConn is the error of a TCP check whose Dial returned neither a
-// connection nor an error.
-var errNoConn = errors.New("health: dial returned no connection")
 
 // addrString formats a, which may be nil for a connection of a custom Dial.
 func addrString(a net.Addr) string {

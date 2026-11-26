@@ -47,8 +47,7 @@ var (
 	ErrInvalidTarget = errors.New("upstream: invalid target")
 )
 
-// MaxWeight is the largest Target weight. It keeps the products of loads
-// and weights that balancers compare far from overflowing.
+// MaxWeight bounds a Target or Candidate weight.
 const MaxWeight = math.MaxInt32
 
 // A Target describes a backend to a Pool.
@@ -147,7 +146,9 @@ type Config struct {
 	// that Sync and Put keep a member whose weight and value did not
 	// change: same Backend, no EventUpdated, no rebuild. Nil compares
 	// values with ==, through reflection, when they are comparable, and
-	// treats other values, such as slices, as always changed.
+	// treats other values, such as slices, as always changed. Equal runs
+	// outside the pool lock. Replacing the compared backend or installing
+	// a comparator with SetConfig can repeat that comparison.
 	Equal func(a, b any) bool
 
 	// Outlier configures passive health checking, which is disabled by
@@ -245,11 +246,12 @@ const rampScale = 16
 // its status; neither calls out while held. rampMu (the slow-start timer)
 // is taken alone.
 type Pool[T any] struct {
-	view   atomic.Pointer[view[T]]
-	retry  atomic.Pointer[retryParams]
-	budget window // retry budget: first attempts and retries
-	guard  ejectionGuard
-	clock  Clock
+	pendingRamp  time.Time // address marks a pending slow start
+	view         atomic.Pointer[view[T]]
+	retry        atomic.Pointer[retryParams]
+	equalVersion uint64 // changes when SetConfig installs a comparator
+	guard        ejectionGuard
+	clock        Clock
 
 	mu       sync.Mutex
 	cfg      settings[T]
@@ -292,23 +294,31 @@ type view[T any] struct {
 	eligible     int  // members of tiers, for Available
 	ignoreHealth bool // panic mode: tiers hold all that are not draining or offline
 	overflow     bool // Config.Overflow
-	banded       bool // a priority has more than one cost band
 }
 
 // A tier is the members of one cost band of one priority and their
 // Picker.
 type tier[T any] struct {
 	picker   Picker
-	ranker   Ranker        // picker, if it is a Ranker
+	ranking  *tierRanking
 	members  []*Backend[T] // the candidates of picker
 	priority int
 	band     int // the cost band within the priority, from 0
+}
+
+// A custom Ranker may use the tier's workspace for one call. Overlapping
+// calls follow the same order through Picker.Pick.
+type tierRanking struct {
+	ranker Ranker
+	order  []int
+	busy   atomic.Bool
 }
 
 // builtTier is a Picker a build made, kept for the next build of its
 // priority to reuse or rebuild.
 type builtTier[T any] struct {
 	picker   Picker
+	ranking  *tierRanking
 	cands    []Candidate
 	priority int
 	band     int
@@ -359,6 +369,7 @@ func (c *bandCache[T]) get(list []*Backend[T], tol uint64) [][]*Backend[T] {
 		c.bands = c.one[:min(len(list), 1)]
 		return c.bands
 	}
+	c.one[0] = nil
 	c.bands = costBands(list, tol)
 	return c.bands
 }
@@ -611,14 +622,16 @@ func (p *Pool[T]) SetConfig(cfg Config) error {
 		return ErrClosed
 	}
 	p.setLocked(cfg)
+	p.equalVersion++
 	old := p.cfg.outlier
 	op := newOutlierParams(cfg.Outlier, p.clock, old.epoch)
 	op.seq = old.seq + 1
 	p.cfg.outlier = op
 	rp := newRetryParams(cfg.Retry, p.clock, p.retry.Load().epoch)
-	if p.retry.Swap(rp).window != rp.window {
-		p.budget.restart(p.clock.Now().Sub(rp.epoch), rp.window)
+	if oldRetry := p.retry.Load(); oldRetry.window == rp.window {
+		rp.counts = oldRetry.counts
 	}
+	p.retry.Store(rp)
 	members := slices.Clone(p.order)
 	p.unlockAndCommit()
 
@@ -662,7 +675,7 @@ func (p *Pool[T]) newBackendLocked(t Target[T], c *core) *Backend[T] {
 		id := t.ID
 		c.det.init(p.cfg.outlier, func() { p.refreshID(id) }, &p.guard)
 		if p.cfg.slowStart > 0 {
-			c.rampStart.Store(-1)
+			c.rampStart.Store(&p.pendingRamp)
 		}
 	}
 	return &Backend[T]{core: c, id: t.ID, weight: max(t.Weight, 1), priority: t.Priority, slot: -1, limit: int64(t.MaxInFlight), cost: t.Cost, value: t.Value}
@@ -686,10 +699,9 @@ func (p *Pool[T]) Sync(targets []Target[T]) error {
 		}
 		seen[t.ID] = struct{}{}
 	}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return ErrClosed
+	same, err := p.compareAndLock(targets)
+	if err != nil {
+		return err
 	}
 	var removed []removal
 	for _, b := range p.order {
@@ -698,8 +710,8 @@ func (p *Pool[T]) Sync(targets []Target[T]) error {
 		}
 	}
 	order := make([]*Backend[T], 0, len(targets))
-	for _, t := range targets {
-		order = append(order, p.putLocked(t))
+	for i, t := range targets {
+		order = append(order, p.putLocked(t, same[i]))
 	}
 	if len(removed) == 0 && slices.Equal(order, p.order) {
 		p.mu.Unlock()
@@ -720,13 +732,12 @@ func (p *Pool[T]) Put(t Target[T]) error {
 	if err := validate(t); err != nil {
 		return err
 	}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return ErrClosed
+	same, err := p.compareAndLock([]Target[T]{t})
+	if err != nil {
+		return err
 	}
 	old := p.byID.load(t.ID)
-	b := p.putLocked(t)
+	b := p.putLocked(t, same[0])
 	switch {
 	case b == old:
 		p.mu.Unlock()
@@ -741,12 +752,47 @@ func (p *Pool[T]) Put(t Target[T]) error {
 	return nil
 }
 
+// compareAndLock compares immutable versions outside mu, then keeps mu
+// locked only if the inputs to the comparison are still current.
+func (p *Pool[T]) compareAndLock(ts []Target[T]) ([]bool, error) {
+	olds := make([]*Backend[T], len(ts))
+	same := make([]bool, len(ts))
+	var pending []int
+	p.mu.Lock()
+	version := p.equalVersion
+	for !p.closed {
+		pending = pending[:0]
+		for i, t := range ts {
+			old := p.byID.load(t.ID)
+			if version == p.equalVersion && old == olds[i] {
+				continue
+			}
+			olds[i], same[i] = old, false
+			if old != nil && old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && old.cost == t.Cost {
+				pending = append(pending, i)
+			}
+		}
+		if len(pending) == 0 {
+			return same, nil
+		}
+		version = p.equalVersion
+		equal := p.cfg.equal
+		p.mu.Unlock()
+		for _, i := range pending {
+			same[i] = equal(olds[i].value, ts[i].Value)
+		}
+		p.mu.Lock()
+	}
+	p.mu.Unlock()
+	return nil, ErrClosed
+}
+
 // putLocked creates or replaces the backend for t in byID and emits the
 // event, or returns the current backend if t changes nothing; the caller
 // places it in order.
-func (p *Pool[T]) putLocked(t Target[T]) *Backend[T] {
+func (p *Pool[T]) putLocked(t Target[T], same bool) *Backend[T] {
 	if old := p.byID.load(t.ID); old != nil {
-		if old.weight == max(t.Weight, 1) && old.priority == t.Priority && old.limit == int64(t.MaxInFlight) && old.cost == t.Cost && p.cfg.equal(old.value, t.Value) {
+		if same {
 			return old
 		}
 		b := p.newBackendLocked(t, old.core)
@@ -790,11 +836,11 @@ func (p *Pool[T]) removeLocked(b *Backend[T]) removal {
 // Remove removes the backend with the given ID gracefully: new picks avoid
 // it at once, and leases already issued finish normally. The returned
 // Drain is done when the last of them is released. Remove reports false if
-// there is no such member.
+// the pool is closed or there is no such member.
 func (p *Pool[T]) Remove(id string) (*Drain, bool) {
 	p.mu.Lock()
 	b := p.byID.load(id)
-	if b == nil {
+	if p.closed || b == nil {
 		p.mu.Unlock()
 		return nil, false
 	}
@@ -810,28 +856,27 @@ func (p *Pool[T]) Remove(id string) (*Drain, bool) {
 // member, for maintenance or before removal. The returned Drain is done
 // when the backend has no leases in flight, or canceled when Resume ends
 // the drain first. Draining a backend that is already draining returns the
-// same Drain. Drain reports false if there is no such member.
+// same Drain. Drain reports false for a closed pool or an unknown ID.
 func (p *Pool[T]) Drain(id string) (*Drain, bool) {
 	p.mu.Lock()
 	b := p.byID.load(id)
-	if b == nil {
+	if p.closed || b == nil {
 		p.mu.Unlock()
 		return nil, false
 	}
 	d := b.core.drainLocked(flagDraining)
-	defer b.core.checkDrained(d)
+	b.core.checkDrained(d)
 	p.touchLocked(b)
 	p.unlockAndCommit()
 	return d, true
 }
 
 // Resume ends a drain started by Drain; the Drain reports Canceled unless
-// it had already completed. Resume reports false if there is no such
-// member.
+// it had already completed. Resume reports false for a closed pool or an unknown ID.
 func (p *Pool[T]) Resume(id string) bool {
 	p.mu.Lock()
 	b := p.byID.load(id)
-	if b == nil {
+	if p.closed || b == nil {
 		p.mu.Unlock()
 		return false
 	}
@@ -845,20 +890,67 @@ func (p *Pool[T]) Resume(id string) bool {
 }
 
 // ReportCheck records the result of an active health check of b and sets
-// its health. A health checker calls it after every check; the checker,
-// not the pool, applies rise and fall thresholds. HealthDown takes the
-// backend out of rotation; HealthUp and HealthUnknown keep it in, so a
-// change between them only updates the health and rebuilds nothing.
+// the default source's verdict. The checker applies its rise and fall
+// thresholds before reporting. A Down verdict excludes b from normal
+// rotation. FallbackAll may bypass health. Other sources retain their verdicts.
 // Reports for a backend that has been removed, or replaced by a new
 // member with the same ID, are ignored; ReportCheck reports whether b was
 // a current member of an open pool.
 func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) bool {
-	c := b.core
-	want := healthFlags(h)
+	return p.reportFrom(nil, b, h, &r)
+}
+
+// CheckSource identifies one independent active health writer. Its zero
+// value is ready to use. Use the same pointer for the writer's lifetime.
+type CheckSource struct{ _ byte }
+
+// ReportCheckFrom records source's verdict and the latest observation.
+// Any Down excludes b from normal rotation. FallbackAll may bypass health.
+// Otherwise any Up takes precedence over Unknown.
+// An unrecognized health value withdraws the source verdict.
+// A nil source identifies the writer used by ReportCheck.
+func (p *Pool[T]) ReportCheckFrom(source *CheckSource, b *Backend[T], h Health, r CheckResult) bool {
+	return p.reportFrom(source, b, h, &r)
+}
+
+// ClearCheckFrom withdraws only source's verdict, keeping the last observation.
+func (p *Pool[T]) ClearCheckFrom(source *CheckSource, b *Backend[T]) bool {
+	return p.reportFrom(source, b, HealthUnknown, nil)
+}
+
+func (p *Pool[T]) reportFrom(source *CheckSource, b *Backend[T], h Health, r *CheckResult) bool {
 	if !p.lockMember(b) {
 		return false
 	}
-	c.check.Store(&r)
+	c := b.core
+	if h != HealthUp && h != HealthDown {
+		h = HealthUnknown
+	}
+	switch {
+	case source == nil:
+		c.directHealth = h
+	case h == HealthUnknown:
+		delete(c.checkSources, source)
+	default:
+		if c.checkSources == nil {
+			c.checkSources = make(map[*CheckSource]Health)
+		}
+		c.checkSources[source] = h
+	}
+	h = c.directHealth
+	for _, v := range c.checkSources {
+		if v == HealthDown {
+			h = HealthDown
+			break
+		}
+		if h == HealthUnknown {
+			h = v
+		}
+	}
+	want := healthFlags(h)
+	if r != nil {
+		c.check.Store(r)
+	}
 	for {
 		old := c.flags.Load()
 		f := old&^(flagUp|flagUnhealthy) | want
@@ -882,6 +974,9 @@ func (p *Pool[T]) ReportCheck(b *Backend[T], h Health, r CheckResult) bool {
 // lockMember locks mu if b is the current version, or an earlier one, of a
 // member of the open pool, and reports whether it did.
 func (p *Pool[T]) lockMember(b *Backend[T]) bool {
+	if b == nil {
+		return false
+	}
 	p.mu.Lock()
 	if cur := p.byID.load(b.id); p.closed || cur == nil || cur.core != b.core {
 		p.mu.Unlock()
@@ -1058,7 +1153,7 @@ func (p *Pool[T]) announceLocked(b *Backend[T]) {
 	c := b.core
 	if s := c.state(); s != c.reported {
 		if p.cfg.slowStart > 0 && s == StateHealthy {
-			c.rampStart.Store(-1)
+			c.rampStart.Store(&p.pendingRamp)
 			// The member's weight changes while its list may not: make
 			// the tier again.
 			p.groups[b.priority].reweigh = true
@@ -1182,7 +1277,7 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 		open += len(g.open)
 	}
 	v.eligible = elig
-	if p.cfg.fallback == FallbackAll && open > 0 && (elig == 0 || elig*100 < p.cfg.threshold*open) {
+	if p.cfg.fallback == FallbackAll && open > 0 && (elig == 0 || int64(elig)*100 < int64(p.cfg.threshold)*int64(open)) {
 		v.ignoreHealth = true
 		v.eligible = open
 	}
@@ -1195,6 +1290,13 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 		if v.ignoreHealth {
 			ms, bands, ch = g.open, &g.openBands, tierChange[T]{base: g.openPrev, d: g.openDelta, remake: g.reweigh}
 		}
+		g.eligPrev, g.openPrev = nil, nil
+		g.eligDelta, g.openDelta = nil, nil
+		if v.ignoreHealth {
+			g.eligBands = bandCache[T]{}
+		} else if p.cfg.fallback != FallbackAll {
+			g.openBands = bandCache[T]{}
+		}
 		g.reweigh = false
 		bs := bands.get(ms, tol)
 		if len(bs) > 1 {
@@ -1205,13 +1307,11 @@ func (p *Pool[T]) snapshotLocked() snapshot[T] {
 			v.tiers = append(v.tiers, tier[T]{members: b, priority: prio, band: k})
 			s.changes = append(s.changes, ch)
 		}
-		v.banded = v.banded || len(bs) > 1
 		if p.cfg.fallback == FallbackAll && !v.ignoreHealth {
 			fb := g.openBands.get(g.open, tol)
 			for k, b := range fb {
 				v.fallback = append(v.fallback, tier[T]{members: b, priority: prio, band: k})
 			}
-			v.banded = v.banded || len(fb) > 1
 		}
 	}
 	return s
@@ -1288,16 +1388,27 @@ func (p *Pool[T]) build(s snapshot[T]) {
 		switch {
 		case ok && slices.Equal(old.cands, cands):
 			t.picker = old.picker
+			t.ranking = old.ranking
 			cands = old.cands
 		case ok && updater:
 			t.picker = upd.Update(old.picker, cands, nil)
 		default:
 			t.picker = s.balancer.Build(cands)
 		}
-		built[i] = builtTier[T]{picker: t.picker, cands: cands, members: t.members, priority: t.priority, band: t.band, ramping: ramping}
+		built[i] = builtTier[T]{picker: t.picker, ranking: t.ranking, cands: cands, members: t.members, priority: t.priority, band: t.band, ramping: ramping}
 	}
 	for i := range v.tiers {
-		v.tiers[i].ranker, _ = v.tiers[i].picker.(Ranker)
+		t := &v.tiers[i]
+		if r := built[i].ranking; r != nil {
+			t.ranking = r
+			continue
+		}
+		switch rk := t.picker.(type) {
+		case *rendezvousPicker, *ringPicker:
+		case Ranker:
+			t.ranking = &tierRanking{ranker: rk, order: make([]int, len(t.members))}
+			built[i].ranking = t.ranking
+		}
 	}
 	p.built, p.builtGen = built, s.gen
 }
@@ -1310,7 +1421,7 @@ func candidateOf[T any](b *Backend[T]) Candidate {
 // applySlowStart lowers the candidate weights of backends that are ramping
 // up and arms the timer for the next step. It reports whether any is.
 func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp time.Duration) bool {
-	now := p.clock.Now().UnixNano()
+	now := p.clock.Now()
 	ramping := false
 	maxWeight := 0
 	fraction := make([]float64, len(members))
@@ -1319,17 +1430,17 @@ func (p *Pool[T]) applySlowStart(members []*Backend[T], cands []Candidate, ramp 
 		maxWeight = max(maxWeight, b.weight)
 		fraction[i] = 1
 		rs := c.rampStart.Load()
-		if rs == -1 && c.rampStart.CompareAndSwap(-1, now) {
-			rs = now
+		if rs == &p.pendingRamp && c.rampStart.CompareAndSwap(rs, &now) {
+			rs = &now
 		}
-		if rs <= 0 {
+		if rs == nil || rs == &p.pendingRamp {
 			continue
 		}
 		// A rebuild may have started the ramp with a later reading of the
 		// clock than ours: count that as the start.
-		elapsed := max(now-rs, 0)
-		if elapsed >= int64(ramp) {
-			c.rampStart.CompareAndSwap(rs, 0)
+		elapsed := max(now.Sub(*rs), 0)
+		if elapsed >= ramp {
+			c.rampStart.CompareAndSwap(rs, nil)
 			continue
 		}
 		fraction[i] = float64(elapsed) / float64(ramp)
@@ -1408,9 +1519,6 @@ func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 	if len(v.tiers) == 0 {
 		return Lease[T]{}, v.err
 	}
-	if !v.banded {
-		return v.pickFlat(hash, tried)
-	}
 	full := false
 	l, r := pickTiers(v.tiers, hash, tried, v.ignoreHealth, v.overflow, false)
 	switch r {
@@ -1427,40 +1535,6 @@ func (v *view[T]) pick(hash uint64, tried *Request[T]) (Lease[T], error) {
 		return l, nil
 	}
 	if full || r == saturated {
-		return Lease[T]{}, ErrSaturated
-	}
-	return Lease[T]{}, ErrUnavailable
-}
-
-// pickFlat is pick for a view whose tiers are one band each: every tier
-// boundary is a priority's.
-func (v *view[T]) pickFlat(hash uint64, tried *Request[T]) (Lease[T], error) {
-	full := false
-	for i := range v.tiers {
-		l, r := v.tiers[i].pick(hash, tried, v.ignoreHealth)
-		if r == admitted {
-			return l, nil
-		}
-		if r == saturated {
-			if !v.overflow {
-				return Lease[T]{}, ErrSaturated
-			}
-			full = true
-		}
-	}
-	for i := range v.fallback {
-		l, r := scan(v.fallback[i].members, hash, tried, true)
-		if r == admitted {
-			return l, nil
-		}
-		if r == saturated {
-			if !v.overflow {
-				return Lease[T]{}, ErrSaturated
-			}
-			full = true
-		}
-	}
-	if full {
 		return Lease[T]{}, ErrSaturated
 	}
 	return Lease[T]{}, ErrUnavailable
@@ -1502,28 +1576,50 @@ func (t *tier[T]) pick(hash uint64, tried *Request[T], ignoreHealth bool) (Lease
 	if l, ok := t.try(t.picker.Pick(hash, 0), tried, ignoreHealth); ok {
 		return l, admitted
 	}
-	if t.ranker != nil {
-		if l, ok := t.ranked(t.ranker, hash, tried, ignoreHealth); ok {
-			return l, admitted
+	switch p := t.picker.(type) {
+	case *ringPicker:
+		var lease Lease[T]
+		p.visit(p.position(hash), func(i int) bool {
+			var ok bool
+			lease, ok = t.try(i, tried, ignoreHealth)
+			return ok
+		})
+		if lease.b != nil {
+			return lease, admitted
 		}
-	} else {
-		for attempt := 1; attempt < n; attempt++ {
-			if l, ok := t.try(t.picker.Pick(hash, attempt), tried, ignoreHealth); ok {
+	case *rendezvousPicker:
+		// Rank the remaining candidates once. If the winner's admission
+		// changes during scoring, the final scan still makes progress.
+		best := p.best(hash, func(i int) bool {
+			b := t.members[i]
+			return (tried == nil || !tried.has(b.id)) && !b.full() && b.core.canRoute(ignoreHealth)
+		})
+		if best >= 0 {
+			if l, ok := t.try(best, tried, ignoreHealth); ok {
 				return l, admitted
+			}
+		}
+	default:
+		if rk := t.ranking; rk != nil && rk.busy.CompareAndSwap(false, true) {
+			if l, ok := t.ranked(rk, hash, tried, ignoreHealth); ok {
+				return l, admitted
+			}
+		} else {
+			for attempt := 1; attempt < n; attempt++ {
+				if l, ok := t.try(t.picker.Pick(hash, attempt), tried, ignoreHealth); ok {
+					return l, admitted
+				}
 			}
 		}
 	}
 	return scan(t.members, hash, tried, ignoreHealth)
 }
 
-// ranked tries the members of t past the first choice in the order of rk,
-// ranked once. The ranking stays on the stack for tiers of up to
-// rankStack members.
-func (t *tier[T]) ranked(rk Ranker, hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
-	var buf [rankStack]int
-	order := slices.Grow(buf[:0], len(t.members))[:len(t.members)]
-	rk.Rank(hash, order)
-	for _, i := range order[1:] {
+// ranked holds the tier's scratch space until all indices have been consumed.
+func (t *tier[T]) ranked(rk *tierRanking, hash uint64, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
+	defer rk.busy.Store(false)
+	rk.ranker.Rank(hash, rk.order)
+	for _, i := range rk.order[1:] {
 		if l, ok := t.try(i, tried, ignoreHealth); ok {
 			return l, true
 		}
@@ -1534,11 +1630,14 @@ func (t *tier[T]) ranked(rk Ranker, hash uint64, tried *Request[T], ignoreHealth
 // try leases member i of t unless tried has it or it refuses.
 func (t *tier[T]) try(i int, tried *Request[T], ignoreHealth bool) (Lease[T], bool) {
 	b := t.members[i]
-	if tried != nil && tried.has(b.core) {
+	if tried != nil && tried.has(b.id) {
 		return Lease[T]{}, false
 	}
 	tk, r := b.acquire(ignoreHealth)
-	return Lease[T]{b: b, t: tk}, r == admitted
+	if r != admitted {
+		return Lease[T]{}, false
+	}
+	return Lease[T]{b: b, t: tk}, true
 }
 
 // scan tries every backend of bs not in tried once, starting at a place
@@ -1557,7 +1656,7 @@ func scan[T any](bs []*Backend[T], hash uint64, tried *Request[T], ignoreHealth 
 			i -= n
 		}
 		b := bs[i]
-		if tried != nil && tried.has(b.core) {
+		if tried != nil && tried.has(b.id) {
 			continue
 		}
 		t, r := b.acquire(ignoreHealth)
@@ -1709,7 +1808,7 @@ func (p *Pool[T]) Close() {
 		s.off.Store(true) // no event starts after Close, even one already queued
 	}
 	p.subs = nil
-	members := p.order
+	members := slices.Clone(p.order)
 	p.mu.Unlock()
 	for _, b := range members {
 		b.core.det.Close()

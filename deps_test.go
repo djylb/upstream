@@ -54,7 +54,7 @@ func TestDependencies(t *testing.T) {
 		switch path := strings.TrimSpace(line); {
 		case path == "net/http" || strings.HasPrefix(path, "net/http/"):
 			t.Errorf("upnet depends on %s", path)
-		case strings.HasPrefix(path, module+"/") && path != module+"/upnet":
+		case strings.HasPrefix(path, module+"/") && path != module+"/upnet" && path != module+"/internal/dialresult" && path != module+"/internal/latency":
 			t.Errorf("upnet depends on %s", path)
 		}
 	}
@@ -67,7 +67,7 @@ func TestDependencies(t *testing.T) {
 		switch path := strings.TrimSpace(line); {
 		case path == "net" || strings.HasPrefix(path, "net/"):
 			t.Errorf("the root package depends on %s", path)
-		case strings.HasPrefix(path, module+"/"):
+		case strings.HasPrefix(path, module+"/") && path != module+"/internal/latency":
 			t.Errorf("the root package depends on %s", path)
 		}
 	}

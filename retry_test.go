@@ -501,3 +501,77 @@ func TestDoNeverReturnsNilOnFailure(t *testing.T) {
 		t.Fatalf("Do after Next with a done ctx = %v", err)
 	}
 }
+
+type retryPanicPicker struct{ fail bool }
+
+func (p *retryPanicPicker) Pick(_ uint64, attempt int) int {
+	if p.fail {
+		panic("pick")
+	}
+	return attempt
+}
+func TestPanicRefundsRetry(t *testing.T) {
+	picker := &retryPanicPicker{}
+	p := newTestPool(t, Config{Balancer: balancerFunc(func([]Candidate) Picker { return picker }), Retry: RetryConfig{Attempts: 2, MinRetries: 1, Budget: .01}}, "a", "b")
+	r := p.Request("")
+	next := func() {
+		l, err := r.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Release(Neutral)
+	}
+	next()
+	picker.fail = true
+	func() {
+		defer func() {
+			if recover() != "pick" {
+				t.Fatal("missing panic")
+			}
+		}()
+		next()
+	}()
+	picker.fail = false
+	next()
+}
+func TestRetryWindowAllocations(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds allocations")
+	}
+	clk := fakeclock.New()
+	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Window: time.Second, Budget: 1, Attempts: 2}}, "a", "b")
+	if allocs := testing.AllocsPerRun(30, func() {
+		clk.Advance(time.Second)
+		r := p.Request("key")
+		for range 2 {
+			l, err := r.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			l.Release(Neutral)
+		}
+	}); allocs != 0 {
+		t.Fatalf("%v allocations per window", allocs)
+	}
+}
+
+func TestBudgetAcrossLargeClockSteps(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds allocations")
+	}
+	clk := fakeclock.New()
+	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Window: 1, Budget: 1, Attempts: 2}}, "a", "b")
+	if n := testing.AllocsPerRun(10, func() {
+		clk.Advance(1 << 32)
+		r := p.Request("key")
+		for range 2 {
+			l, err := r.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			l.Release(Neutral)
+		}
+	}); n != 0 {
+		t.Fatalf("%v allocations after a large clock step", n)
+	}
+}

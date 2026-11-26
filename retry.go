@@ -48,6 +48,7 @@ type RetryConfig struct {
 // retryParams is a normalized RetryConfig. It is immutable once
 // published; a change publishes a new one.
 type retryParams struct {
+	counts   *window
 	epoch    time.Time
 	clock    Clock
 	window   time.Duration
@@ -57,7 +58,7 @@ type retryParams struct {
 }
 
 func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
-	p := &retryParams{clock: clock, window: c.Window, attempts: max(c.Attempts, 1), epoch: epoch}
+	p := &retryParams{counts: new(window), clock: clock, window: c.Window, attempts: max(c.Attempts, 1), epoch: epoch}
 	if c.Budget > 0 && !math.IsInf(c.Budget, 1) {
 		p.budget = c.Budget
 	}
@@ -74,7 +75,7 @@ func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
 }
 
 // A Request picks distinct backends for one request: the first Next is a
-// pick like PickKey, and every later Next is a retry that leases a backend
+// pick like PickKey, and every later Next is a retry that leases a backend ID
 // this Request has not returned before, as the pool's RetryConfig allows.
 // It reads the pool's current routing view and retry settings on every
 // call, so a retry avoids backends that went down meanwhile.
@@ -84,9 +85,9 @@ func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
 // is for one goroutine. It does not allocate for up to four attempts.
 type Request[T any] struct {
 	p     *Pool[T]
-	set   map[*core]struct{} // every tried backend, once more holds triedLinear
-	more  []*core            // tried after the first four, until set takes over
-	tried [4]*core
+	set   map[string]struct{} // every tried backend, once more holds triedLinear
+	more  []string            // tried after the first four, until set takes over
+	tried [4]string
 	hash  uint64
 	n     int
 }
@@ -114,6 +115,7 @@ func (r *Request[T]) Tried() int { return r.n }
 func (r *Request[T]) Next() (Lease[T], error) {
 	p := r.p
 	rp := p.retry.Load()
+	var reserved reservation
 	var now time.Duration
 	if rp.budget > 0 {
 		now = rp.clock.Now().Sub(rp.epoch)
@@ -125,9 +127,19 @@ func (r *Request[T]) Next() (Lease[T], error) {
 		// The retry is counted before the pick, atomically with the
 		// check, so concurrent retries cannot overrun the budget; it is
 		// given back if no backend is left.
-		if rp.budget > 0 && !p.budget.addPartWithin(now, rp.window, rp.min, rp.budget) {
+		if rp.budget > 0 {
+			reserved = rp.counts.reserve(now, rp.window, rp.min, rp.budget)
+		}
+		if rp.budget > 0 && reserved.credits == nil {
 			return Lease[T]{}, ErrRetryBudget
 		}
+	}
+	if reserved.credits != nil {
+		defer func() {
+			if reserved.credits != nil {
+				reserved.refund()
+			}
+		}()
 	}
 	v := p.view.Load()
 	tried := r
@@ -136,15 +148,13 @@ func (r *Request[T]) Next() (Lease[T], error) {
 	}
 	l, err := v.pick(r.hash, tried)
 	if err != nil {
-		if r.n > 0 && rp.budget > 0 {
-			p.budget.removePart()
-		}
 		return Lease[T]{}, err
 	}
 	if r.n == 0 && rp.budget > 0 {
-		p.budget.add(now, rp.window, windowTotal)
+		rp.counts.add(now, rp.window, 0)
 	}
-	r.add(l.b.core)
+	reserved = reservation{}
+	r.add(l.b.id)
 	return l, nil
 }
 
@@ -193,25 +203,27 @@ func (r *Request[T]) loop(ctx context.Context, attempt func(Lease[T]) (bool, err
 // runLease calls fn and releases the lease if fn left it, with OutcomeOf
 // of fn's error, or with Failure if fn panics.
 func runLease[T any](l *Lease[T], fn func(*Lease[T]) (bool, error)) (retry bool, err error) {
-	o := Failure
-	defer func() { l.Release(o) }()
-	retry, err = fn(l)
-	o = OutcomeOf(err)
+	retry, _, err = runAttempt(l, l, fn)
 	return retry, err
 }
 
-// runBackend calls fn with the backend of l and releases l with OutcomeOf
-// of fn's error, or with Failure if fn panics.
-func runBackend[T any](l Lease[T], fn func(*Backend[T]) error) (retry bool, err error) {
-	o := Failure
-	defer func() { l.Release(o) }()
-	err = fn(l.b)
-	o = OutcomeOf(err)
+func runBackend[T any](l Lease[T], fn func(*Backend[T]) error) (bool, error) {
+	_, o, err := runAttempt(&l, l.b, func(b *Backend[T]) (bool, error) { return false, fn(b) })
 	return o == Failure, err
 }
 
+// The callback argument is independent of l so a backend-only call keeps
+// its single-owner lease on the stack.
+func runAttempt[T, A any](l *Lease[T], arg A, fn func(A) (bool, error)) (bool, Outcome, error) {
+	o := Failure
+	defer func() { l.Release(o) }()
+	retry, err := fn(arg)
+	o = OutcomeOf(err)
+	return retry, o, err
+}
+
 // add records c as tried.
-func (r *Request[T]) add(c *core) {
+func (r *Request[T]) add(c string) {
 	switch {
 	case r.set != nil:
 		r.set[c] = struct{}{}
@@ -220,7 +232,7 @@ func (r *Request[T]) add(c *core) {
 	case len(r.more) < triedLinear:
 		r.more = append(r.more, c)
 	default:
-		r.set = make(map[*core]struct{}, 2*r.n)
+		r.set = make(map[string]struct{}, 2*r.n)
 		for _, x := range r.tried {
 			r.set[x] = struct{}{}
 		}
@@ -233,7 +245,7 @@ func (r *Request[T]) add(c *core) {
 	r.n++
 }
 
-func (r *Request[T]) has(c *core) bool {
+func (r *Request[T]) has(c string) bool {
 	if r.set != nil {
 		_, ok := r.set[c]
 		return ok

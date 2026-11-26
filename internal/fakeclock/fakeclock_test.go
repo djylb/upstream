@@ -53,3 +53,23 @@ func TestWithTimeoutCancel(t *testing.T) {
 		t.Fatalf("%d timers pending, want the parent's only", c.Pending())
 	}
 }
+
+func TestImmediateAndParentTimeoutCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := New()
+		ctx, stop := clk.WithTimeout(t.Context(), 0)
+		defer stop()
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), ctx.Err()) {
+			t.Fatal("zero timeout not expired")
+		}
+		parent, cancel := context.WithCancel(t.Context())
+		child, stopChild := clk.WithTimeout(parent, time.Hour)
+		defer stopChild()
+		cancel()
+		<-child.Done()
+		synctest.Wait()
+		if !errors.Is(child.Err(), context.Canceled) || clk.Pending() != 0 {
+			t.Fatal("parent cancellation left timer")
+		}
+	})
+}

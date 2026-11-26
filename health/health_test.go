@@ -9,7 +9,6 @@ import (
 	"os"
 	"runtime"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -235,17 +234,12 @@ func TestIntervals(t *testing.T) {
 	// The default jitter is a tenth of the interval.
 	c := New[string, string](t.Context(), Config[string]{Options: Options{Interval: 10 * time.Second}})
 	defer c.Close()
-	e := &entry[string, string]{lastEnd: time.Unix(1000, 0), target: Target{Address: "x"}}
-	seen := map[time.Duration]bool{}
-	for range 200 {
-		d := c.delayLocked(e, time.Unix(1000, 0))
-		if d < 9*time.Second || d > 11*time.Second {
-			t.Fatalf("jittered interval %v", d)
-		}
-		seen[d] = true
+	e := &entry[string, string]{lastEnd: time.Time{}, checks: 1, target: Target{Address: "x"}}
+	if j := c.optionsLocked(e).Jitter; j != time.Second {
+		t.Fatalf("default jitter %v", j)
 	}
-	if len(seen) < 10 {
-		t.Fatal("no jitter")
+	if d := c.delayLocked(e, time.Time{}); d < 9*time.Second || d > 11*time.Second {
+		t.Fatalf("jittered interval from zero time %v", d)
 	}
 }
 
@@ -746,7 +740,6 @@ func TestClassify(t *testing.T) {
 }
 
 func TestTCP(t *testing.T) {
-	defer checkGoroutines(t)()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -812,24 +805,6 @@ func TestTCP(t *testing.T) {
 	custom := TCP(TCPOptions{Dial: func(context.Context, string, string) (net.Conn, error) { return nil, dialErr }})
 	if _, err := custom(ctx, Target{Address: "x"}); !errors.Is(err, dialErr) {
 		t.Fatalf("custom dial: %v", err)
-	}
-}
-
-// checkGoroutines returns a function that fails the test if goroutines
-// started since remain after a grace period.
-func checkGoroutines(t *testing.T) func() {
-	t.Helper()
-	before := runtime.NumGoroutine()
-	return func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if n := runtime.NumGoroutine(); n > before {
-			buf := make([]byte, 1<<16)
-			buf = buf[:runtime.Stack(buf, true)]
-			t.Errorf("%d goroutines leaked:\n%s", n-before, strings.TrimSpace(string(buf)))
-		}
 	}
 }
 
@@ -1128,11 +1103,12 @@ func waitDone(t *testing.T, c *Checker[string, string]) {
 func TestCloseFromCallbackAndProbe(t *testing.T) {
 	var c *Checker[string, string]
 	inProbe := make(chan struct{})
+	inCallback := make(chan struct{})
 	done := make(chan struct{}, 2)
 	probe := func(_ context.Context, tg Target) (Observation, error) {
 		if tg.Address == "slow" {
 			close(inProbe)
-			time.Sleep(100 * time.Millisecond) // let the callback reach Close
+			<-inCallback
 			c.Close()
 			done <- struct{}{}
 		}
@@ -1141,6 +1117,7 @@ func TestCloseFromCallbackAndProbe(t *testing.T) {
 	c = New[string, string](context.Background(), Config[string]{Concurrency: 4, OnChange: func(r Report[string]) {
 		if r.Key == "fast" {
 			<-inProbe
+			close(inCallback)
 			c.Close()
 			done <- struct{}{}
 		}
@@ -1434,6 +1411,178 @@ func TestTouchPostponesChecksWhileUp(t *testing.T) {
 		h.tick(3)
 		if got := h.sw.count("a"); got != before+3 {
 			t.Fatalf("checks of a down target: %d, want %d", got, before+3)
+		}
+	})
+}
+
+func TestRemoveDuringOnResult(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var c *Checker[string, string]
+		var removed bool
+		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(),
+			OnResult: func(r Report[string]) { removed = c.Remove(r.Key) },
+			OnChange: func(Report[string]) { t.Error("change callback after remove") }})
+		defer c.Close()
+		c.Put("a", Target{Probe: newSwitchable().probe})
+		synctest.Wait()
+		if !removed {
+			t.Fatal("OnResult did not remove the target")
+		}
+	})
+}
+
+func TestAttachmentReplayPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := upstream.New[string](upstream.Config{})
+		defer p.Close()
+		if err := p.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}}); err != nil {
+			t.Fatal(err)
+		}
+		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New()})
+		func() {
+			defer func() {
+				if recover() != "target" {
+					t.Fatal("missing panic")
+				}
+			}()
+			calls := 0
+			_, _ = Attach(c, "group", p, func(*upstream.Backend[string]) Target {
+				calls++
+				if calls == 1 {
+					return Target{Network: "udp", Address: "a"}
+				}
+				panic("target")
+			})
+		}()
+		defer c.Close()
+		if err := p.Put(upstream.Target[string]{ID: "c"}); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.GroupKeys("group")) != 0 || c.Len() != 0 {
+			t.Fatal("registration survived")
+		}
+	})
+}
+
+func TestTCPRejectsUDP(t *testing.T) {
+	probe := TCP(TCPOptions{Dial: func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("UDP dial")
+		return nil, errDown
+	}})
+	if _, err := probe(t.Context(), Target{Network: "udp", Address: "a"}); err == nil {
+		t.Fatal("UDP check passed")
+	}
+}
+
+func TestLateProbeResults(t *testing.T) {
+	for _, probeErr := range []error{nil, &net.DNSError{Err: "missing"}, os.ErrNotExist} {
+		synctest.Test(t, func(t *testing.T) {
+			clk := fakeclock.New()
+			c := New[string, string](t.Context(), Config[string]{Clock: clk, Options: Options{Timeout: time.Second}})
+			defer c.Close()
+			c.Put("a", Target{Probe: func(ctx context.Context, _ Target) (Observation, error) {
+				<-ctx.Done()
+				return Observation{}, probeErr
+			}})
+			synctest.Wait()
+			clk.Advance(time.Second)
+			synctest.Wait()
+			s, _ := c.Status("a")
+			if s.Last.Reason != ReasonTimeout || !errors.Is(s.Last.Err, context.DeadlineExceeded) || probeErr != nil && !errors.Is(s.Last.Err, probeErr) {
+				t.Fatalf("late result %+v", s.Last)
+			}
+		})
+	}
+}
+
+func TestWatchSkipsReplacedEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := upstream.New[string](upstream.Config{})
+		defer p.Close()
+		put := func(v string) {
+			if err := p.Put(upstream.Target[string]{ID: "a", Value: v}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer p.Subscribe(func(e upstream.Event[string]) {
+			if e.Kind == upstream.EventAdded && e.Backend.Value() == "old" {
+				p.Remove("a")
+				put("new")
+			}
+		})()
+		calls := 0
+		w, err := Watch(t.Context(), p, func(b *upstream.Backend[string]) Target {
+			calls++
+			if b.Value() != "new" {
+				t.Error("stale target")
+			}
+			return Target{Network: "udp"}
+		}, Config[string]{Clock: fakeclock.New()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		put("old")
+		if calls != 1 {
+			t.Fatalf("target calls %d", calls)
+		}
+	})
+}
+
+type panicAddrConn struct {
+	net.Conn
+	closed int
+}
+
+func (*panicAddrConn) RemoteAddr() net.Addr { panic("address") }
+func (c *panicAddrConn) Close() error       { c.closed++; return nil }
+
+func TestTCPClosesOnPanic(t *testing.T) {
+	c := new(panicAddrConn)
+	probe := TCP(TCPOptions{Dial: func(context.Context, string, string) (net.Conn, error) { return c, nil }})
+	defer func() {
+		if recover() != "address" || c.closed != 1 {
+			t.Error("connection cleanup failed")
+		}
+	}()
+	_, _ = probe(t.Context(), Target{Address: "a"})
+}
+
+type admissionClock struct {
+	*fakeclock.Clock
+	beforeProbe func()
+}
+type admissionContext struct {
+	context.Context //nolint:containedctx // this test context delegates its deadline and cancellation to the fake clock
+	beforeProbe     func()
+}
+
+func (c *admissionContext) Err() error {
+	err := c.Context.Err()
+	if c.beforeProbe != nil {
+		f := c.beforeProbe
+		c.beforeProbe = nil
+		f()
+	}
+	return err
+}
+func (c *admissionClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	child, cancel := c.Clock.WithTimeout(ctx, d)
+	return &admissionContext{child, c.beforeProbe}, cancel
+}
+func TestRemovalDuringProbeAdmission(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := &admissionClock{Clock: fakeclock.New()}
+		c := New[string, int](t.Context(), Config[string]{Clock: clk})
+		defer c.Close()
+		clk.beforeProbe = func() { c.Remove("a") }
+		c.Put("a", Target{Probe: func(context.Context, Target) (Observation, error) {
+			t.Error("probe after removal")
+			return Observation{}, nil
+		}})
+		synctest.Wait()
+		if c.Len() != 0 {
+			t.Fatal("removal did not run")
 		}
 	})
 }

@@ -1,7 +1,6 @@
 package health
 
 import (
-	"context"
 	"math/rand"
 	"slices"
 	"sync"
@@ -9,84 +8,23 @@ import (
 	"time"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 // stepClock is a Clock whose timers run synchronously, in time order, from
 // Advance, so that decisions that depend on the order of timers and calls
 // can be compared exactly.
-type stepClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*stepTimer
-	seq    int
-}
+type stepClock struct{ *fakeclock.Clock }
 
-type stepTimer struct {
-	at  time.Time
-	seq int
-	f   func()
-}
-
-func newStepClock() *stepClock { return &stepClock{now: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)} }
-
-func (c *stepClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *stepClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.seq++
-	t := &stepTimer{c.now.Add(d), c.seq, f}
-	c.timers = append(c.timers, t)
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		i := slices.Index(c.timers, t)
-		if i < 0 {
-			return false
-		}
-		c.timers = slices.Delete(c.timers, i, i+1)
-		return true
-	}
-}
-
-func (c *stepClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, d)
-}
+func newStepClock() *stepClock { return &stepClock{fakeclock.New()} }
 
 // Advance moves the clock by d, running each timer due on the way at its
 // own time.
 func (c *stepClock) Advance(d time.Duration) {
 	end := c.Now().Add(d)
-	for f := c.takeDue(end); f != nil; f = c.takeDue(end) {
+	for f := c.TakeDue(end); f != nil; f = c.TakeDue(end) {
 		f()
 	}
-}
-
-// takeDue dequeues the next timer due by end and returns its callback
-// without running it. The clock moves to the timer's time, or to end if
-// no timer is due.
-func (c *stepClock) takeDue(end time.Time) func() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var next *stepTimer
-	for _, t := range c.timers {
-		if !t.at.After(end) && (next == nil || t.at.Before(next.at) || t.at.Equal(next.at) && t.seq < next.seq) {
-			next = t
-		}
-	}
-	if next == nil {
-		c.now = end
-		return nil
-	}
-	c.timers = slices.DeleteFunc(c.timers, func(t *stepTimer) bool { return t == next })
-	if next.at.After(c.now) {
-		c.now = next.at
-	}
-	return next.f
 }
 
 type damped struct {
@@ -158,7 +96,7 @@ func TestDamperDelayedRelease(t *testing.T) {
 	d.Offer("a", up, up)
 	d.Offer("a", down, down)
 	d.Offer("a", up, up) // starts the first suppression
-	release := clk.takeDue(clk.Now().Add(base))
+	release := clk.TakeDue(clk.Now().Add(base))
 	if release == nil {
 		t.Fatal("first suppression did not schedule a release")
 	}
@@ -252,8 +190,8 @@ func TestDamperForgetAndClose(t *testing.T) {
 	if len(got) != n+2 || d.Len() != 0 {
 		t.Fatalf("after Close: %v", got[n:])
 	}
-	if len(clk.timers) != 0 {
-		t.Fatalf("%d timers left", len(clk.timers))
+	if clk.Pending() != 0 {
+		t.Fatalf("%d timers left", clk.Pending())
 	}
 }
 
@@ -269,7 +207,7 @@ func TestDamperDelayedReleaseAfterForgetAndClose(t *testing.T) {
 		d.Offer("a", up, up)
 		d.Offer("a", down, down)
 		d.Offer("a", up, up)
-		release := clk.takeDue(clk.Now().Add(base))
+		release := clk.TakeDue(clk.Now().Add(base))
 		if release == nil {
 			t.Fatal("suppression did not schedule a release")
 		}
@@ -320,18 +258,8 @@ func TestDamperEmitSerialAndReentrant(t *testing.T) {
 	}
 	started.Wait()
 	// Every goroutine's value is passed, once all deliveries have drained.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		mu.Lock()
-		n := len(perKey)
-		mu.Unlock()
-		if n == 16 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("keys %d", n)
-		}
-		time.Sleep(time.Millisecond)
+	if len(perKey) != 16 {
+		t.Fatalf("keys %d", len(perKey))
 	}
 	if maxIn != 1 {
 		t.Fatalf("%d emits at once", maxIn)
@@ -454,5 +382,80 @@ func TestDamperMatchesReference(t *testing.T) {
 			}
 		}
 		d.Close()
+	}
+}
+
+func TestDamperRecoversDispatch(t *testing.T) {
+	delivered := 0
+	d := NewDamper(newStepClock(), DampConfig{}, func(_ string, _ int) {
+		delivered++
+		if delivered == 1 {
+			panic("emit")
+		}
+	})
+	defer d.Close()
+	func() {
+		defer func() {
+			if recover() != "emit" {
+				t.Fatal("missing panic")
+			}
+		}()
+		d.Offer("a", up, 1)
+	}()
+	d.Offer("a", down, 2)
+	if delivered != 2 {
+		t.Fatal("dispatch stopped")
+	}
+}
+
+type reentrantDampClock struct {
+	*stepClock
+	inspect func()
+}
+
+func (c reentrantDampClock) Now() time.Time { c.inspect(); return c.stepClock.Now() }
+func (c reentrantDampClock) AfterFunc(d time.Duration, f func()) func() bool {
+	c.inspect()
+	stop := c.stepClock.AfterFunc(d, f)
+	return func() bool { c.inspect(); return stop() }
+}
+func TestReentrantDampClock(t *testing.T) {
+	var d *Damper[string, int]
+	clk := reentrantDampClock{newStepClock(), func() { d.Len() }}
+	d = NewDamper(clk, DampConfig{Flips: 1}, func(string, int) {})
+	d.Offer("a", up, 1)
+	d.Offer("a", down, 2)
+	d.Offer("a", up, 3)
+	d.Forget("a")
+	d.Close()
+	if clk.Pending() != 0 {
+		t.Fatal("timer left after Forget")
+	}
+}
+
+type offerClock struct {
+	*stepClock
+	afterRead func()
+}
+
+func (c *offerClock) Now() time.Time {
+	now := c.stepClock.Now()
+	if c.afterRead != nil {
+		c.afterRead()
+	}
+	return now
+}
+func TestDamperReleaseDuringOffer(t *testing.T) {
+	clk := &offerClock{stepClock: newStepClock()}
+	var got []damped
+	d := newTestDamper(clk, DampConfig{Flips: 1, Base: time.Second}, &got)
+	defer d.Close()
+	d.Offer("a", up, up)
+	d.Offer("a", down, down)
+	d.Offer("a", up, up)
+	clk.afterRead = func() { clk.Advance(time.Second) }
+	d.Offer("a", down, down)
+	if len(got) != 4 || got[3].h != down {
+		t.Fatalf("deliveries %v", got)
 	}
 }

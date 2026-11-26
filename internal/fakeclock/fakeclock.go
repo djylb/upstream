@@ -47,8 +47,12 @@ func (c *Clock) AfterFunc(d time.Duration, f func()) func() bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.addLocked(c.now.Add(d), f)
+}
+
+func (c *Clock) addLocked(at time.Time, f func()) func() bool {
 	c.seq++
-	t := &timer{at: c.now.Add(d), f: f, seq: c.seq}
+	t := &timer{at: at, f: f, seq: c.seq}
 	c.timers = append(c.timers, t)
 	return func() bool {
 		c.mu.Lock()
@@ -67,21 +71,23 @@ func (c *Clock) AfterFunc(d time.Duration, f func()) func() bool {
 // with context.DeadlineExceeded once Advance reaches it.
 func (c *Clock) WithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	inner, cancel := context.WithCancelCause(parent)
-	t := &timeoutCtx{Context: inner, deadline: c.Now().Add(d), done: make(chan struct{})}
-	if pd, ok := parent.Deadline(); ok && pd.Before(t.deadline) {
+	pd, hasParent := parent.Deadline()
+	c.mu.Lock()
+	t := &timeoutCtx{Context: inner, deadline: c.now.Add(d), done: make(chan struct{})}
+	if hasParent && pd.Before(t.deadline) {
 		t.deadline = pd
 	}
-	stopWatch := context.AfterFunc(inner, t.finish)
-	stopTimer := c.AfterFunc(d, func() {
-		cancel(context.DeadlineExceeded)
-		t.finish()
-	})
-	return t, func() {
-		stopTimer()
-		cancel(context.Canceled)
-		stopWatch()
-		t.finish()
+	expire := func() { cancel(context.DeadlineExceeded); t.finish() }
+	if t.deadline.After(c.now) && inner.Err() == nil {
+		t.stop = c.addLocked(t.deadline, expire)
 	}
+	c.mu.Unlock()
+	if t.stop == nil {
+		expire()
+		return t, func() {}
+	}
+	stopWatch := context.AfterFunc(inner, t.finish)
+	return t, func() { cancel(context.Canceled); stopWatch(); t.finish() }
 }
 
 // timeoutCtx is the context of Clock.WithTimeout. It has its own Done
@@ -90,6 +96,7 @@ func (c *Clock) WithTimeout(parent context.Context, d time.Duration) (context.Co
 // the fake deadline passed. Cause comes from the inner context.
 type timeoutCtx struct {
 	context.Context //nolint:containedctx // the inner context, canceled with the cause; timeoutCtx is a context itself
+	stop            func() bool
 	deadline        time.Time
 	once            sync.Once
 	done            chan struct{}
@@ -98,6 +105,9 @@ type timeoutCtx struct {
 
 func (t *timeoutCtx) finish() {
 	t.once.Do(func() {
+		if t.stop != nil {
+			t.stop()
+		}
 		t.err = t.Context.Err()
 		if errors.Is(context.Cause(t.Context), context.DeadlineExceeded) {
 			t.err = context.DeadlineExceeded
@@ -145,6 +155,29 @@ func (c *Clock) Advance(d time.Duration) {
 	for _, t := range due {
 		go t.f()
 	}
+}
+
+// TakeDue advances to the earliest pending timer through end, or to end
+// if none is due. A synchronous test driver owns the returned callback.
+func (c *Clock) TakeDue(end time.Time) func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := -1
+	for i, t := range c.timers {
+		if !t.at.After(end) && (next < 0 || t.at.Before(c.timers[next].at)) {
+			next = i
+		}
+	}
+	if next < 0 {
+		c.now = end
+		return nil
+	}
+	t := c.timers[next]
+	c.timers = slices.Delete(c.timers, next, next+1)
+	if t.at.After(c.now) {
+		c.now = t.at
+	}
+	return t.f
 }
 
 // Pending returns the number of scheduled timers.

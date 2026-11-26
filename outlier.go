@@ -89,6 +89,8 @@ func (c OutlierConfig) Enabled() bool {
 // outlierParams is a normalized OutlierConfig. It is immutable once
 // published; a change publishes a new one.
 type outlierParams struct {
+	counts     *window        // private to one detector once installed
+	streak     *atomic.Uint32 // consecutive failures in this reset generation
 	clock      Clock
 	epoch      time.Time
 	window     time.Duration
@@ -104,7 +106,7 @@ type outlierParams struct {
 }
 
 // newOutlierParams normalizes c. epoch is the origin of the failure-rate
-// window, or zero for now. The caller sets seq.
+// window. The caller sets seq.
 func newOutlierParams(c OutlierConfig, clock Clock, epoch time.Time) *outlierParams {
 	p := &outlierParams{
 		clock:    clockOrSystem(clock),
@@ -121,9 +123,7 @@ func newOutlierParams(c OutlierConfig, clock Clock, epoch time.Time) *outlierPar
 	if c.MaxEjectionPercent > 0 && c.MaxEjectionPercent < 100 {
 		p.maxEjected = int32(c.MaxEjectionPercent)
 	}
-	if p.epoch.IsZero() {
-		p.epoch = p.clock.Now()
-	}
+
 	if p.window <= 0 {
 		p.window = 10 * time.Second
 	}
@@ -231,11 +231,8 @@ type Ticket struct {
 //
 // The detector owns one timer, which ends an ejection. Close stops it.
 type OutlierDetector struct {
-	win       window
-	until     atomic.Int64 // unix nanoseconds; 0 unless ejected
 	ejections atomic.Uint64
 	state     atomic.Uint32 // OutlierState
-	consec    atomic.Uint32
 	gen       atomic.Uint32 // changes on every transition
 	trials    atomic.Uint64 // half-open period<<32 | trial requests in flight
 	trialsOK  atomic.Uint64 // half-open period<<32 | successful trials
@@ -245,6 +242,7 @@ type OutlierDetector struct {
 	guard     *ejectionGuard // the pool's cap on ejections, or nil
 
 	mu     sync.Mutex
+	until  time.Time   // guarded by mu
 	stop   func() bool // ends the pending reopen timer; guarded by mu
 	cause  error       // guarded by mu
 	level  uint        // ejections without recovery; guarded by mu
@@ -288,11 +286,18 @@ func (g *ejectionGuard) release() { g.held.Add(-1) }
 // ejects.
 func NewOutlierDetector(cfg OutlierConfig, clock Clock, onChange func()) *OutlierDetector {
 	d := new(OutlierDetector)
-	d.init(newOutlierParams(cfg, clock, time.Time{}), onChange, nil)
+	clock = clockOrSystem(clock)
+	d.init(newOutlierParams(cfg, clock, clock.Now()), onChange, nil)
 	return d
 }
 
 func (d *OutlierDetector) init(p *outlierParams, onChange func(), g *ejectionGuard) {
+	params := *p
+	params.streak = new(atomic.Uint32)
+	if params.percent > 0 {
+		params.counts = new(window)
+	}
+	p = &params
 	d.params.Store(p)
 	d.enabled.Store(p.enabled())
 	d.onChange = onChange
@@ -304,32 +309,44 @@ func (d *OutlierDetector) init(p *outlierParams, onChange func(), g *ejectionGua
 // the next request and the next ejection. A configuration that is not
 // Enabled also clears any ejection, as Reset does.
 func (d *OutlierDetector) SetConfig(cfg OutlierConfig) {
-	d.mu.Lock()
 	old := d.params.Load()
-	p := newOutlierParams(cfg, old.clock, old.epoch)
-	p.seq = old.seq + 1
-	d.mu.Unlock()
-	d.setParams(p)
+	d.setParams(newOutlierParams(cfg, old.clock, old.epoch))
 }
 
-// setParams publishes p, which has the epoch and clock of the current
-// parameters, unless parameters with a later seq are published already,
-// so that concurrent updates end with the latest.
+// setParams also clears a disabled detector in the same critical section.
 func (d *OutlierDetector) setParams(p *outlierParams) {
 	d.mu.Lock()
 	old := d.params.Load()
-	if old.seq >= p.seq {
+	if p.seq != 0 && old.seq >= p.seq {
 		d.mu.Unlock()
 		return
 	}
+	params := *p
+	params.streak = old.streak
+	params.counts = old.counts
+	switch {
+	case p.percent == 0:
+		params.counts = nil
+	case old.counts == nil || old.window != p.window:
+		params.counts = new(window)
+	}
+	p = &params
 	d.params.Store(p)
 	d.enabled.Store(p.enabled())
-	if old.window != p.window {
-		d.win.restart(p.clock.Now().Sub(p.epoch), p.window)
+	var stop func() bool
+	changed := false
+	if !p.enabled() && !d.closed {
+		changed = d.State() != OutlierOK
+		d.gen.Add(1)
+		d.resetLocked()
+		stop, d.stop = d.stop, nil
 	}
 	d.mu.Unlock()
-	if !p.enabled() {
-		d.Reset()
+	if stop != nil {
+		stop()
+	}
+	if changed {
+		d.notify()
 	}
 }
 
@@ -349,6 +366,10 @@ func (d *OutlierDetector) Admit() (Ticket, bool) {
 	return Ticket{}, false
 }
 
+func (d *OutlierDetector) trialsFull() bool {
+	return d.State() == OutlierHalfOpen && periodCount(d.trials.Load(), d.gen.Load()) >= u32(d.params.Load().trials)
+}
+
 // admitTrial takes a trial slot of the current half-open period. Every
 // transition changes gen, so a period that ends while the slot is taken is
 // detected by reading gen again, and the slot is given back.
@@ -359,6 +380,9 @@ func (d *OutlierDetector) admitTrial() (Ticket, bool) {
 	}
 	for {
 		v := d.trials.Load()
+		if d.gen.Load() != gen {
+			return Ticket{}, false
+		}
 		n := periodCount(v, gen)
 		if n >= u32(d.params.Load().trials) {
 			return Ticket{}, false
@@ -407,11 +431,11 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 	p := d.params.Load()
 	switch o {
 	case Success:
-		if d.consec.Load() != 0 {
-			d.consec.Store(0)
+		if p.streak.Load() != 0 {
+			p.streak.Store(0)
 		}
 		if p.percent > 0 {
-			d.win.add(p.clock.Now().Sub(p.epoch), p.window, windowTotal)
+			p.counts.add(p.clock.Now().Sub(p.epoch), p.window, 0)
 		}
 	case Failure, Degraded:
 		if OutlierState(d.state.Load()) != OutlierOK {
@@ -419,14 +443,21 @@ func (d *OutlierDetector) Record(t Ticket, o Outcome) {
 		}
 		// At or beyond the threshold, as a refused ejection leaves the
 		// run going.
-		if o == Failure && p.consec > 0 && d.consec.Add(1) >= p.consec {
-			d.eject(OutlierOK, 0, ErrConsecutiveFailures)
-			return
+		if o == Failure && p.consec > 0 {
+			if n := p.streak.Add(1); n >= p.consec {
+				d.eject(p, 0, ErrConsecutiveFailures, func(current *outlierParams) bool {
+					return current.consec > 0 && n >= current.consec
+				})
+				return
+			}
 		}
 		if p.percent > 0 {
-			total, failed := d.win.add(p.clock.Now().Sub(p.epoch), p.window, windowTotal|windowPart)
+			passed, failed := p.counts.add(p.clock.Now().Sub(p.epoch), p.window, 1)
+			total := passed + failed
 			if total >= p.minReq && failed*100 >= p.percent*total {
-				d.eject(OutlierOK, 0, ErrFailureRate)
+				d.eject(p, 0, ErrFailureRate, func(current *outlierParams) bool {
+					return current.counts == p.counts && total >= current.minReq && failed*100 >= current.percent*total
+				})
 			}
 		}
 	case Neutral:
@@ -441,6 +472,9 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 		}
 		for {
 			v := d.trialsOK.Load()
+			if d.gen.Load() != gen {
+				return
+			}
 			n := periodCount(v, gen) + 1
 			if d.trialsOK.CompareAndSwap(v, uint64(gen)<<32|uint64(n)) {
 				if n >= u32(d.params.Load().trialsOK) {
@@ -450,24 +484,29 @@ func (d *OutlierDetector) recordTrial(gen uint32, o Outcome) {
 			}
 		}
 	case Failure, Degraded:
-		d.eject(OutlierHalfOpen, gen, ErrTrialFailed)
+		d.eject(d.params.Load(), gen, ErrTrialFailed, nil)
 	case Neutral:
 	}
 }
 
-// eject moves the detector from state from (and, for half-open, period
-// gen) to ejected. It does nothing if the detector moved on meanwhile.
-func (d *OutlierDetector) eject(from OutlierState, gen uint32, cause error) {
-	p := d.params.Load()
+// eject revalidates the observation against the live rule before committing.
+// A nil rule identifies a failed trial from the given half-open period.
+func (d *OutlierDetector) eject(p *outlierParams, gen uint32, cause error, rule func(*outlierParams) bool) {
 	if !p.enabled() {
 		return
 	}
 	now := p.clock.Now()
 	d.mu.Lock()
-	if d.closed || OutlierState(d.state.Load()) != from || (from == OutlierHalfOpen && d.gen.Load() != gen) {
+	current := d.params.Load()
+	valid := d.State() == OutlierHalfOpen && d.gen.Load() == gen
+	if rule != nil {
+		valid = d.State() == OutlierOK && p.streak == current.streak && rule(current)
+	}
+	if d.closed || !current.enabled() || !valid {
 		d.mu.Unlock()
 		return
 	}
+	p = current
 	if !d.held && d.guard != nil {
 		if !d.guard.acquire(p.maxEjected) {
 			d.mu.Unlock()
@@ -480,9 +519,8 @@ func (d *OutlierDetector) eject(from OutlierState, gen uint32, cause error) {
 	d.level++
 	ejectGen := d.gen.Add(1)
 	d.cause = cause
-	d.consec.Store(0)
-	d.win.reset()
-	d.until.Store(now.Add(wait).UnixNano())
+	d.resetCountsLocked()
+	d.until = now.Add(wait)
 	d.ejections.Add(1)
 	d.state.Store(uint32(OutlierEjected))
 	old := d.stop
@@ -514,7 +552,7 @@ func (d *OutlierDetector) reopen(gen uint32) {
 	}
 	d.gen.Add(1)
 	d.stop = nil
-	d.until.Store(0)
+	d.until = time.Time{}
 	d.state.Store(uint32(OutlierHalfOpen))
 	d.mu.Unlock()
 	d.notify()
@@ -532,13 +570,25 @@ func (d *OutlierDetector) recover(gen uint32) {
 	d.notify()
 }
 
+func (d *OutlierDetector) resetCountsLocked() {
+	old := d.params.Load()
+	if old == nil {
+		return
+	}
+	p := *old
+	p.streak = new(atomic.Uint32)
+	if old.counts != nil {
+		p.counts = new(window)
+	}
+	d.params.Store(&p)
+}
+
 func (d *OutlierDetector) resetLocked() {
 	d.releaseGuardLocked()
 	d.level = 0
 	d.cause = nil
-	d.consec.Store(0)
-	d.win.reset()
-	d.until.Store(0)
+	d.resetCountsLocked()
+	d.until = time.Time{}
 	d.state.Store(uint32(OutlierOK))
 }
 
@@ -594,19 +644,19 @@ func (d *OutlierDetector) State() OutlierState {
 // Status returns a snapshot of the detector.
 func (d *OutlierDetector) Status() OutlierStatus {
 	d.mu.Lock()
-	cause := d.cause
-	d.mu.Unlock()
-	s := OutlierStatus{
-		Cause:               cause,
+	defer d.mu.Unlock()
+	var failures uint32
+	if p := d.params.Load(); p != nil {
+		failures = p.streak.Load()
+	}
+	return OutlierStatus{
+		Cause:               d.cause,
+		EjectedUntil:        d.until,
 		Ejections:           d.ejections.Load(),
 		Refused:             d.refused.Load(),
-		ConsecutiveFailures: d.consec.Load(),
+		ConsecutiveFailures: failures,
 		State:               OutlierState(d.state.Load()),
 	}
-	if u := d.until.Load(); u != 0 {
-		s.EjectedUntil = time.Unix(0, u)
-	}
-	return s
 }
 
 func (d *OutlierDetector) notify() {
@@ -617,88 +667,162 @@ func (d *OutlierDetector) notify() {
 
 func (p *outlierParams) enabled() bool { return p.consec > 0 || p.percent > 0 }
 
-// window estimates two counts over a sliding window, a total (such as
-// requests) and a part of it or a second count (such as failures or
-// retries), from two fixed buckets: the current one, and the previous one
-// weighted by how much of it still overlaps the sliding window. Each bucket
-// packs the total in the high 32 bits and the part in the low 32 bits so
-// one atomic add updates both.
+// Two alternating buckets count two event streams. Retry reservations have a
+// third, independent stream for refunds, which belong to the original bucket.
 type window struct {
-	idx  atomic.Int64
-	cur  atomic.Uint64
-	prev atomic.Uint64
+	latest  atomic.Uint64
+	buckets [2]windowBucket
 }
 
-// Deltas for window.add.
-const (
-	windowTotal uint64 = 1 << 32
-	windowPart  uint64 = 1
-)
-
-// add adds delta, a sum of windowTotal and windowPart, to the bucket of
-// now and returns the estimates after it.
-func (w *window) add(now, size time.Duration, delta uint64) (total, part float64) {
-	w.rotate(now, size)
-	c := w.cur.Add(delta)
-	prev := w.prev.Load()
-	weight := 1 - float64(now%size)/float64(size)
-	total = float64(c>>32) + float64(prev>>32)*weight
-	part = float64(low32(c)) + float64(low32(prev))*weight
-	return total, part
+type windowBucket struct {
+	counts  [2]windowCounter
+	refunds windowCounter
 }
 
-// rotate moves the buckets on to the one of now.
-func (w *window) rotate(now, size time.Duration) {
-	i := int64(now / size)
-	if old := w.idx.Load(); i > old && w.idx.CompareAndSwap(old, i) {
-		c := w.cur.Swap(0)
-		if i == old+1 {
-			w.prev.Store(c)
-		} else {
-			w.prev.Store(0)
-		}
+// A counter's serial increases on every event and every rotation. The count
+// is the distance from the serial at the start of its window. Even serials
+// accept increments; an odd serial freezes the old count during rotation.
+// The low bit of generation marks a rotation in progress. Any caller can
+// finish it, even if the caller that started it is suspended.
+type windowCounter struct {
+	generation atomic.Uint64
+	serial     atomic.Uint64
+	base       atomic.Uint64
+}
+
+// advance publishes the new origin before opening the new generation.
+// Every helper of this rotation sees the same frozen serial. A delayed
+// helper can never move the origin back or thaw a later generation.
+func (c *windowCounter) advance(generation, serial uint64) {
+	if generation != c.generation.Load() {
+		return
 	}
+	if generation&1 == 0 {
+		// The generation is open but its first increment still needs to thaw it.
+		c.serial.CompareAndSwap(serial, serial+1)
+		return
+	}
+	if serial&1 == 0 {
+		c.serial.CompareAndSwap(serial, serial+1)
+		return
+	}
+	raiseTo(&c.base, serial/2+1)
+	c.generation.CompareAndSwap(generation, generation-1)
 }
 
-// addPartWithin adds one to the part if the estimate of the part then
-// stays within base plus ratio times the total, and reports whether it
-// did. The check and the add are one atomic step.
-func (w *window) addPartWithin(now, size time.Duration, base, ratio float64) bool {
-	w.rotate(now, size)
-	weight := 1 - float64(now%size)/float64(size)
+// increment adds one if this generation still accepts events and the
+// resulting count fits the limit. A rotation consumes a serial, so an
+// increment paused just before its CAS cannot land in a reused bucket.
+func (c *windowCounter) increment(tag uint64, limit float64) bool {
 	for {
-		c := w.cur.Load()
-		prev := w.prev.Load()
-		total := float64(c>>32) + float64(prev>>32)*weight
-		part := float64(low32(c)) + float64(low32(prev))*weight
-		if part+1 > base+ratio*total {
+		gen := c.generation.Load()
+		if gen&^1 > tag {
 			return false
 		}
-		if w.cur.CompareAndSwap(c, c+windowPart) {
-			return true
+		serial := c.serial.Load()
+		switch {
+		case gen&1 != 0 || serial&1 != 0:
+			c.advance(gen, serial)
+		case gen != tag:
+			c.generation.CompareAndSwap(gen, tag|1)
+		default:
+			base := c.base.Load()
+			if gen != c.generation.Load() {
+				continue
+			}
+			if float64(serial/2-base)+1 > limit {
+				return false
+			}
+			if c.serial.CompareAndSwap(serial, serial+2) {
+				return true
+			}
 		}
 	}
 }
 
-// removePart takes back one from the part of the current bucket, if it
-// has any.
-func (w *window) removePart() {
+func (c *windowCounter) count(tag uint64) float64 {
+	if c.generation.Load() != tag {
+		return 0
+	}
+	serial := c.serial.Load()
+	base := c.base.Load()
+	if c.generation.Load() != tag || serial&1 != 0 {
+		return 0
+	}
+	return float64(serial/2 - base)
+}
+
+// raiseTo returns the larger of the stored value and next, advancing the
+// atomic to next if needed.
+func raiseTo(value *atomic.Uint64, next uint64) uint64 {
 	for {
-		c := w.cur.Load()
-		if low32(c) == 0 || w.cur.CompareAndSwap(c, c-windowPart) {
-			return
+		old := value.Load()
+		if old >= next {
+			return old
+		}
+		if value.CompareAndSwap(old, next) {
+			return next
 		}
 	}
 }
 
-func (w *window) reset() {
-	w.cur.Store(0)
-	w.prev.Store(0)
+// Count a delayed caller at the latest observed time, both when choosing
+// its bucket and when weighting the preceding one.
+func (w *window) at(now time.Duration, span uint64) (uint64, float64) {
+	elapsed := raiseTo(&w.latest, uint64(max(now, 0)))
+	return elapsed / span, 1 - float64(elapsed%span)/float64(span)
 }
 
-// restart empties the window for a new size, starting at the bucket of
-// now. Adds that race with it may land in either window.
-func (w *window) restart(now, size time.Duration) {
-	w.idx.Store(int64(now / size))
-	w.reset()
+func (w *window) estimate(idx uint64, weight float64, stream int) float64 {
+	current := w.buckets[idx&1].counts[stream].count(idx << 1)
+	if idx == 0 {
+		return current
+	}
+	return current + weight*w.buckets[(idx-1)&1].counts[stream].count((idx-1)<<1)
+}
+
+func (w *window) add(now, size time.Duration, stream int) (float64, float64) {
+	span := uint64(max(size, 1))
+	for {
+		idx, weight := w.at(now, span)
+		if w.buckets[idx&1].counts[stream].increment(idx<<1, math.Inf(1)) {
+			return w.estimate(idx, weight, 0), w.estimate(idx, weight, 1)
+		}
+	}
+}
+
+type reservation struct {
+	credits *windowCounter
+	tag     uint64
+}
+
+func (r reservation) refund() { r.credits.increment(r.tag, math.Inf(1)) }
+
+func (w *window) reserve(now, size time.Duration, base, ratio float64) reservation {
+	span := uint64(max(size, 1))
+	for {
+		idx, weight := w.at(now, span)
+		b := &w.buckets[idx&1]
+		tag := idx << 1
+		limit := base + ratio*w.estimate(idx, weight, 0)
+		if idx > 0 {
+			prev := &w.buckets[(idx-1)&1]
+			prevTag := (idx - 1) << 1
+			// Sample credits first: a concurrent issue and refund may only
+			// make this estimate more conservative.
+			credits := prev.refunds.count(prevTag)
+			limit -= weight * (prev.counts[1].count(prevTag) - credits)
+		}
+		ok := b.counts[1].increment(tag, limit+b.refunds.count(tag))
+		r := reservation{credits: &b.refunds, tag: tag}
+		if w.latest.Load()/span == idx {
+			if ok {
+				return r
+			}
+			return reservation{}
+		}
+		if ok {
+			r.refund()
+		}
+	}
 }

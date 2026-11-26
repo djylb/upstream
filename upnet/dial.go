@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/dialresult"
 )
 
 // A Dialer opens connections to the backends of Pool. A failed dial counts
@@ -85,16 +86,15 @@ func (d *Dialer[T]) DialKey(ctx context.Context, key string) (*Conn[T], error) {
 			return true, upstream.ErrNoAddress
 		}
 		start := clock.Now()
-		conn, err := dial(ctx, network, addr)
-		switch {
-		case err != nil && conn != nil:
-			_ = conn.Close()
-		case err == nil && conn == nil:
-			err = errNoConn
-		}
+		conn, err := dialresult.Check(dial(ctx, network, addr))
 		if err != nil {
 			return upstream.OutcomeOf(err) == upstream.Failure, err
 		}
+		defer func() {
+			if c == nil {
+				_ = conn.Close()
+			}
+		}()
 		l.Observe(clock.Now().Sub(start))
 		if !d.DeferReport {
 			l.Report(upstream.Success)
@@ -108,11 +108,10 @@ func (d *Dialer[T]) DialKey(ctx context.Context, key string) (*Conn[T], error) {
 	return c, nil
 }
 
-var errNoConn = errors.New("upnet: dial returned no connection")
-
 // A Conn is a connection to a backend. Closing it releases the backend's
 // lease. It forwards CloseRead, CloseWrite, ReadFrom and WriteTo to the
-// underlying connection where it has them, so that relays keep half-close
+// underlying connection where it has them. The forwarding stays in this
+// standard-library-only adapter alongside its lease lifecycle, so relays keep half-close
 // and the zero-copy paths of io.Copy.
 //
 // Report and Close never call the pool under the mutex: they claim the
@@ -164,21 +163,24 @@ func (c *Conn[T]) NetConn() net.Conn { return c.Conn }
 // Close closes the connection and releases the backend's lease; later
 // calls return the underlying connection's error and release nothing.
 func (c *Conn[T]) Close() error {
-	err := c.Conn.Close()
+	defer c.releaseOnClose()
+	return c.Conn.Close()
+}
+
+func (c *Conn[T]) releaseOnClose() {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return err
+		return
 	}
 	c.closed = true
 	if c.reporting {
 		c.mu.Unlock() // the Report releases the lease
-		return err
+		return
 	}
 	l := c.lease.Take()
 	c.mu.Unlock()
 	l.Release(upstream.Neutral) // unless reported, the outcome is neutral
-	return err
 }
 
 // CloseWrite shuts down the writing side, if the underlying connection

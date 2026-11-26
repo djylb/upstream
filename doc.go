@@ -68,7 +68,9 @@
 //
 // # Concurrency
 //
-// All types are safe for concurrent use. No lock is held while calling a
+// Construct pools with New. Pool methods support concurrent calls. Each
+// Request and Lease has one owner. Use Lease.Take to transfer ownership.
+// No lock is held while calling a
 // Balancer, a Clock, a probe or a subscriber, so callbacks may call back
 // into the pool. The pool rebuilds its view on the goroutine that changed
 // it, at most twice per change; a rebuild left over after that runs on a

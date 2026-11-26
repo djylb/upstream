@@ -146,9 +146,11 @@ type Config[K comparable] struct {
 	// goroutine the Checker owns, without any lock held. They may call any
 	// method of the Checker, including Close; waiting on Done from a
 	// callback waits for itself. Once Remove, RemoveFromGroup,
-	// RemoveGroup, SyncGroup or an address change has removed a target, no
-	// callback for it starts; one already running may finish, as with
-	// time.Timer.Stop. Reports carry the target's Generation so that
+	// RemoveGroup, SyncGroup or an address change removes a generation, the
+	// checker admits no further probes or result callbacks for it. A call
+	// starts at its final membership check. An admitted call may enter user
+	// code or finish after removal returns. OnRemove reports the removal.
+	// Reports carry the target's Generation so that
 	// consumers that buffer them can tell an old target from a new one under
 	// the same key. A callback that blocks holds back later callbacks but
 	// not checks; while it blocks, results that change nothing are

@@ -1481,3 +1481,224 @@ func TestSetConfigSameBalancerRebuilds(t *testing.T) {
 		t.Fatalf("balancer set again: %d builds, want 2", b)
 	}
 }
+
+func TestCompareBeforeMembershipCommit(t *testing.T) {
+	var p *Pool[string]
+	p = newTestPool(t, Config{Equal: func(_, _ any) bool {
+		if p.Len() != 2 {
+			t.Fatal("membership changed before comparison")
+		}
+		panic("compare")
+	}}, "a", "b")
+	func() {
+		defer func() {
+			if recover() != "compare" {
+				t.Fatal("comparison panic lost")
+			}
+		}()
+		_ = p.Sync(targets("b"))
+	}()
+	if p.Len() != 2 {
+		t.Fatal("partial sync")
+	}
+	p.Close()
+	if _, ok := p.Remove("a"); ok {
+		t.Fatal("removed after Close")
+	}
+	if _, ok := p.Drain("a"); ok || p.Resume("a") {
+		t.Fatal("drain after Close")
+	}
+}
+
+func TestEqualCanChangeAnotherMember(t *testing.T) {
+	for _, syncAll := range []bool{false, true} {
+		var p *Pool[string]
+		calls := 0
+		p = newTestPool(t, Config{Equal: func(a, b any) bool {
+			calls++
+			if calls == 1 {
+				if err := p.Put(Target[string]{ID: "other"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return a == b
+		}}, "a")
+		ts := targets("a")
+		var err error
+		if syncAll {
+			err = p.Sync(ts)
+		} else {
+			err = p.Put(ts[0])
+		}
+		_, other := p.Backend("other")
+		if err != nil || calls != 1 || other == syncAll {
+			t.Fatalf("Sync=%t: comparisons=%d other=%t err=%v", syncAll, calls, other, err)
+		}
+	}
+}
+
+func TestIndependentCheckSources(t *testing.T) {
+	p := newTestPool(t, Config{}, "a")
+	b, _ := p.Backend("a")
+	var a, z CheckSource
+	p.ReportCheckFrom(&a, b, HealthDown, CheckResult{})
+	p.ReportCheckFrom(&z, b, HealthDown, CheckResult{})
+	p.ClearCheckFrom(&a, b)
+	if b.Status().Health != HealthDown {
+		t.Fatal("cleared another source")
+	}
+	p.ClearCheckFrom(&z, b)
+	if b.Status().Health != HealthUnknown {
+		t.Fatal("verdict left behind")
+	}
+}
+
+func TestRebuiltIDIsAlreadyTried(t *testing.T) {
+	p := newTestPool(t, Config{Retry: RetryConfig{Attempts: 2}}, "a")
+	r := p.Request("")
+	l, err := r.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Release(Failure)
+	p.Remove("a")
+	if err = p.Put(targets("a")[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = r.Next(); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("retry: %v", err)
+	}
+}
+
+func TestResumeFromIdleDrainEvent(t *testing.T) {
+	p := newTestPool(t, Config{}, "a")
+	defer p.Subscribe(func(ev Event[string]) {
+		if ev.To == StateDraining {
+			p.Resume("a")
+		}
+	})()
+	d, ok := p.Drain("a")
+	if !ok || d.Canceled() {
+		t.Fatal("idle drain canceled")
+	}
+}
+
+func TestReservationRefundAcrossRotation(t *testing.T) {
+	var w window
+	old := w.reserve(0, time.Second, 2, 0)
+	current := w.reserve(time.Second, time.Second, 2, 0)
+	if old.credits == nil || current.credits == nil || old == current {
+		t.Fatal("missing distinct reservations")
+	}
+	old.refund()
+	if w.reserve(time.Second, time.Second, 2, 0).credits == nil || w.reserve(time.Second, time.Second, 2, 0).credits != nil {
+		t.Fatal("refund reached wrong bucket")
+	}
+}
+
+type addressSlice []string
+
+func (addressSlice) Address() string { panic("nil address method called") }
+
+type addressMap map[string]string
+
+func (addressMap) Address() string { panic("nil address method called") }
+
+func TestNilAddressCollections(t *testing.T) {
+	for _, v := range []Addresser{addressSlice(nil), addressMap(nil)} {
+		if _, ok := AddressOf(v); ok {
+			t.Fatal("accepted nil address")
+		}
+	}
+}
+
+func TestReportInvalidSourceHealth(t *testing.T) {
+	p := newTestPool(t, Config{}, "a")
+	b, _ := p.Backend("a")
+	var writer CheckSource
+	for _, source := range []*CheckSource{nil, &writer} {
+		other := &writer
+		if source != nil {
+			other = nil
+		}
+		p.ReportCheckFrom(other, b, HealthDown, CheckResult{})
+		p.ReportCheckFrom(source, b, Health(255), CheckResult{})
+		if b.Status().Health != HealthDown {
+			t.Fatal("lost down verdict")
+		}
+		p.ClearCheckFrom(other, b)
+		if b.Status().Health != HealthUnknown {
+			t.Fatal("invalid verdict survived")
+		}
+	}
+}
+func TestNilHealthMember(t *testing.T) {
+	p := New[string](Config{})
+	if p.ReportCheck(nil, HealthUp, CheckResult{}) || p.ClearCheckFrom(nil, nil) || p.MarkOnline(nil) {
+		t.Fatal("accepted nil")
+	}
+	p.Close()
+}
+
+func TestLateRetryBudget(t *testing.T) {
+	var w window
+	w.add(0, time.Second, 1)
+	w.add(0, time.Second, 1)
+	w.add(time.Second, time.Second, 0)
+	if w.reserve(time.Second-1, time.Second, 2, 0).credits != nil {
+		t.Fatal("late retry exceeded budget")
+	}
+}
+
+func TestRetiredReservationRefund(t *testing.T) {
+	var w window
+	for _, distance := range []time.Duration{2, 1 << 32, 2 << 32} {
+		old := w.reserve(0, 1, 1, 0)
+		next := w.reserve(distance, 1, 1, 0)
+		if old.credits == nil || next.credits == nil {
+			t.Fatal("missing reservation")
+		}
+		old.refund()
+		if w.reserve(distance, 1, 1, 0).credits != nil {
+			t.Fatal("refunded a reused counter")
+		}
+		next.refund()
+	}
+}
+
+func TestRendezvousSkipsExhaustedTrials(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		p := newTestPool(t, Config{Clock: clk, Balancer: Rendezvous(RendezvousConfig{}), Outlier: OutlierConfig{ConsecutiveFailures: 1}}, "a", "b", "c", "d")
+		for _, id := range []string{"a", "b", "c"} {
+			l, err := p.Acquire(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l.Release(Failure)
+		}
+		clk.Advance(time.Hour)
+		synctest.Wait()
+		for _, id := range []string{"a", "b", "c"} {
+			l, err := p.Acquire(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Release(Neutral)
+			if !l.Backend().core.det.trialsFull() {
+				t.Fatalf("unfilled trial on %s", id)
+			}
+		}
+		for key := range uint64(8) {
+			l, err := p.PickHash(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := l.Backend().ID()
+			l.Release(Neutral)
+			if id != "d" {
+				t.Fatalf("picked %s", id)
+			}
+		}
+	})
+}

@@ -6,6 +6,8 @@ import "time"
 // of the backend's in-flight slots until Release returns it with the
 // request's outcome.
 //
+// A lease has a single owner. Use Take to hand it to another goroutine.
+//
 // Every lease returned without error must be released exactly once, or the
 // backend's in-flight count stays raised and a drain never completes;
 // Pool.Do, Pool.DoKey and Request.Do do this for the caller. Release zeroes the lease,

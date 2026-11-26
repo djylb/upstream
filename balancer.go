@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"sync/atomic"
 )
@@ -26,12 +27,12 @@ type Candidate struct {
 	// so equal IDs map keys to the same place in every process.
 	ID string
 
-	// Weight is the backend's relative capacity. Values below 1 mean 1.
+	// Weight is the backend's relative capacity. Weights are clamped to [1, MaxWeight].
 	Weight int
 }
 
 func (c *Candidate) weight() int64 {
-	return max(int64(c.Weight), 1)
+	return int64(min(max(c.Weight, 1), MaxWeight))
 }
 
 // A Balancer builds Pickers for sets of candidates. A Pool builds one
@@ -152,15 +153,16 @@ type Picker interface {
 
 // A Ranker is a Picker that can order all its candidates for a key at
 // once, for Pickers whose Pick with a large attempt costs as much as
-// ranking, such as Rendezvous. A Pool that must look past the first choice
-// asks a Ranker for the whole order instead of calling Pick for every
-// attempt.
+// ranking. A Pool can use Rank when its tier workspace is available, and
+// Pick for successive attempts during overlapping rankings. Built-in hash
+// pickers have specialized fallback paths.
 type Ranker interface {
 	Picker
 
 	// Rank writes the index of every candidate to dst, which has one
 	// element per candidate, in the order that Pick returns them for key
-	// with attempts 0, 1, 2 and so on. It should need no memory beyond
+	// with attempts 0, 1, 2 and so on. The caller may reuse dst as soon as
+	// Rank returns. Rank should need no memory beyond
 	// dst for small candidate sets and a fixed number of allocations, not
 	// growing with the calls, for large ones: the built-in Rendezvous
 	// allocates nothing up to 64 candidates and one scratch buffer per
@@ -386,7 +388,9 @@ func (p *loadPicker) load(i int) int64 {
 // than candidate j. One is added to each load so that weights also decide
 // between idle candidates.
 func (p *loadPicker) lighter(i, j int) bool {
-	return (p.load(i)+1)*p.weights[j] < (p.load(j)+1)*p.weights[i]
+	hi, lo := bits.Mul64(uint64(max(p.load(i), 0))+1, uint64(max(p.weights[j], 0)))
+	hj, lj := bits.Mul64(uint64(max(p.load(j), 0))+1, uint64(max(p.weights[i], 0)))
+	return hi < hj || hi == hj && lo < lj
 }
 
 // PowerOfTwo returns a Balancer that samples two distinct candidates at

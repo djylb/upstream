@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -83,6 +84,45 @@ func TestScheduleKeepsEarlierTimer(t *testing.T) {
 		}
 		if got := sw.count("7"); got != 1+rounds {
 			t.Fatalf("%d checks, want %d", got, 1+rounds)
+		}
+	})
+}
+
+func TestSingleSlotLeavesWaitingTargetsScheduled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := fakeclock.New()
+		probe := func(ctx context.Context, _ Target) (Observation, error) {
+			<-ctx.Done()
+			return Observation{}, ctx.Err()
+		}
+		c := New[int, int](t.Context(), Config[int]{Clock: clk, Concurrency: 1})
+		defer c.Close()
+		for i := range 512 {
+			c.Put(i, Target{Probe: probe})
+		}
+		synctest.Wait()
+		if len(c.sched) != 511 || c.active != 1 {
+			t.Fatalf("scheduled %d active %d", len(c.sched), c.active)
+		}
+		c.Close()
+		<-c.Done()
+	})
+}
+
+func TestSyncPreservesJitteredDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, Config[string]{})
+		target := h.sw.target("a")
+		target.Options.Jitter = time.Second
+		set := map[string]Target{"a": target}
+		h.c.SyncGroup("g", set)
+		synctest.Wait()
+		e := h.c.entries["a"]
+		revision, due := e.timer, h.c.sched[e.slot-1].due
+		h.c.SyncGroup("g", set)
+		synctest.Wait()
+		if revision != e.timer || !due.Equal(h.c.sched[e.slot-1].due) {
+			t.Fatal("unchanged target rescheduled")
 		}
 	})
 }

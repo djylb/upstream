@@ -36,7 +36,7 @@ type RendezvousConfig struct {
 // would move to if the earlier ones left; attempts past the last candidate
 // start over. Unlike ConsistentHash, nothing is precomputed beyond the
 // IDs, and Update prepares only the candidates that changed. Its Pickers
-// are Rankers, so a Pool that walks past the first choice ranks once.
+// implement Ranker. A Pool scores eligible fallback candidates directly.
 func Rendezvous(cfg RendezvousConfig) Balancer { return rendezvous{cfg: cfg} }
 
 type rendezvous struct{ cfg RendezvousConfig }
@@ -171,7 +171,7 @@ func (p *rendezvousPicker) score(h uint64, w float64) float64 {
 	if p.equal {
 		return float64(h >> 11)
 	}
-	return -w / math.Log((float64(h>>11)+0.5)/(1<<53))
+	return -w / math.Log(min((float64(h>>11)+0.5)/(1<<53), math.Nextafter(1, 0)))
 }
 
 // beats reports whether (score a, member i) ranks before (score b, member
@@ -193,18 +193,27 @@ func (p *rendezvousPicker) Pick(key uint64, attempt int) int {
 	}
 	attempt %= n
 	if attempt == 0 {
-		best, bestScore := 0, 0.0
-		for i := range p.members {
-			m := &p.members[i]
-			s := p.score(p.hash(key, m), m.weight)
-			if i == 0 || p.beats(s, i, bestScore, best) {
-				best, bestScore = i, s
-			}
-		}
-		return best
+		return p.best(key, nil)
 	}
 	var buf [rankStack]rankEntry
 	return p.ranked(key, buf[:0])[attempt].index
+}
+
+// best returns the highest-ranked eligible index, or -1 if none qualifies.
+func (p *rendezvousPicker) best(key uint64, eligible func(int) bool) int {
+	best := -1
+	var score float64
+	for i := range p.members {
+		if eligible != nil && !eligible(i) {
+			continue
+		}
+		m := &p.members[i]
+		s := p.score(p.hash(key, m), m.weight)
+		if best < 0 || p.beats(s, i, score, best) {
+			best, score = i, s
+		}
+	}
+	return best
 }
 
 // Rank writes the candidates in score order, as Pick returns them for

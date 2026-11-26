@@ -16,6 +16,7 @@ func shareOf(t *testing.T, p *Pool[string], id string, n int) float64 {
 func TestSlowStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
+		clk.Advance(time.Unix(0, 0).Sub(clk.Now()))
 		p := New[string](Config{Clock: clk, SlowStart: 16 * time.Second, Outlier: OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second}})
 		if err := p.Sync(targets("a")); err != nil {
 			t.Fatal(err)
@@ -76,9 +77,10 @@ func TestSlowStartToleratesLaterStart(t *testing.T) {
 	}
 	b, _ := p.Backend("b")
 	// Another rebuild read the clock later than this one will.
-	b.core.rampStart.Store(clk.Now().Add(time.Second).UnixNano())
+	future := clk.Now().Add(time.Second)
+	b.core.rampStart.Store(&future)
 	p.refresh()
-	if b.core.rampStart.Load() == 0 {
+	if b.core.rampStart.Load() == nil {
 		t.Fatal("a ramp that started a little later than this rebuild's clock reading ended")
 	}
 }

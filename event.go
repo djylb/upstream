@@ -114,9 +114,8 @@ func (p *Pool[T]) Subscribe(fn func(Event[T])) (cancel func()) {
 		p.qmu.Unlock()
 	}
 	p.mu.Unlock()
-	p.flush()
 	var once sync.Once
-	return func() {
+	cancel = func() {
 		once.Do(func() {
 			s.off.Store(true)
 			p.mu.Lock()
@@ -128,6 +127,14 @@ func (p *Pool[T]) Subscribe(fn func(Event[T])) (cancel func()) {
 			p.mu.Unlock()
 		})
 	}
+	defer func() {
+		if v := recover(); v != nil {
+			cancel()
+			panic(v)
+		}
+	}()
+	p.flush()
+	return cancel
 }
 
 // emitLocked queues ev for the current subscribers. The caller holds mu.

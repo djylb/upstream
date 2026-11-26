@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/dialresult"
 	"github.com/djylb/upstream/internal/fakeclock"
 )
 
@@ -281,7 +282,7 @@ func TestTCPCustomDialWithoutAddress(t *testing.T) {
 		t.Fatalf("check = %+v, %v", obs, err)
 	}
 	none := TCP(TCPOptions{Dial: func(context.Context, string, string) (net.Conn, error) { return nil, nil }})
-	if _, err := none(ctx, Target{Address: "x"}); !errors.Is(err, errNoConn) {
+	if _, err := none(ctx, Target{Address: "x"}); !errors.Is(err, dialresult.ErrNoConn) {
 		t.Fatalf("check of a dial without a connection: %v", err)
 	}
 }
@@ -520,3 +521,158 @@ func TestAttachAddresser(t *testing.T) {
 type zoned struct{ addr, zone string }
 
 func (z zoned) Address() string { return z.addr }
+
+func TestEmptyKeyMigration(t *testing.T) {
+	p := upstream.New[string](upstream.Config{})
+	defer p.Close()
+	c := New[string, string](t.Context(), Config[string]{Options: Options{Disabled: true}})
+	defer c.Close()
+	if err := p.Put(upstream.Target[string]{ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	detach, err := Attach(c, "g", p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer detach()
+	if err = p.Put(upstream.Target[string]{ID: "a", Value: "next"}); err != nil {
+		t.Fatal(err)
+	}
+	if keys := c.GroupKeys("g"); len(keys) != 1 || keys[0] != "next" {
+		t.Fatalf("group keys %v", keys)
+	}
+}
+
+func TestWatchAttachAndDirectReports(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := newPool(t, upstream.Target[string]{ID: "a"})
+		sw := newSwitchable()
+		sw.set("a", true)
+		cfg := Config[string]{Clock: fakeclock.New()}
+		target := func(*upstream.Backend[string]) Target { return sw.target("a") }
+		w := mustWatch(t.Context(), t, p, target, cfg)
+		defer w.Close()
+		c := New[string, int](t.Context(), cfg)
+		defer c.Close()
+		detach := mustAttach(t, c, 1, p, target)
+		synctest.Wait()
+		b, _ := p.Backend("a")
+		bResult := upstream.CheckResult{Addr: "direct"}
+		p.ReportCheck(b, up, bResult)
+		w.Close()
+		<-w.Done()
+		if s := b.Status(); s.Health != down || s.LastCheck.Addr != "direct" {
+			t.Fatal(s)
+		}
+		detach()
+		if s := b.Status(); s.Health != up || s.LastCheck.Addr != "direct" {
+			t.Fatal(s)
+		}
+	})
+}
+
+func TestUnprobedWatcherPreservesObservation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := newPool(t, upstream.Target[string]{ID: "a"})
+		b, _ := p.Backend("a")
+		want := upstream.CheckResult{Addr: "direct", Latency: time.Second}
+		p.ReportCheck(b, down, want)
+		w := mustWatch(t.Context(), t, p, func(*upstream.Backend[string]) Target {
+			return Target{Network: "udp"}
+		}, Config[string]{Clock: fakeclock.New()})
+		defer w.Close()
+		synctest.Wait()
+		if s := b.Status(); s.Health != down || s.LastCheck != want {
+			t.Fatalf("unprobed watcher changed direct report: %+v", s)
+		}
+	})
+}
+
+func TestWatcherDoneWaitsForTarget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := newPool(t)
+		var w *Watcher
+		w = mustWatch(t.Context(), t, p, func(*upstream.Backend[string]) Target {
+			w.Close()
+			synctest.Wait()
+			select {
+			case <-w.Done():
+				t.Error("Done closed inside target")
+			default:
+			}
+			return Target{Network: "udp"}
+		}, Config[string]{Clock: fakeclock.New()})
+		defer w.Close()
+		if err := p.Put(upstream.Target[string]{ID: "a"}); err != nil {
+			t.Fatal(err)
+		}
+		<-w.Done()
+	})
+}
+
+func TestCheckerDoneWaitsForDetach(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := newPool(t, upstream.Target[string]{ID: "a", Value: "a"})
+		sw := newSwitchable()
+		sw.set("a", true)
+		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+		defer c.Close()
+		detach := mustAttach(t, c, 1, p, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) })
+		synctest.Wait()
+		if healthOf(t, p, "a") != down {
+			t.Fatal("missing initial Down verdict")
+		}
+		block := make(chan struct{})
+		defer close(block)
+		entered := false
+		defer p.Subscribe(func(ev upstream.Event[string]) {
+			if ev.Kind == upstream.EventStateChanged && ev.From == upstream.StateUnhealthy {
+				entered = true
+				<-block
+			}
+		})()
+		go detach()
+		synctest.Wait()
+		if !entered {
+			t.Fatal("detach did not withdraw the verdict")
+		}
+		c.Close()
+		synctest.Wait()
+		select {
+		case <-c.Done():
+			t.Fatal("Done closed during detach")
+		default:
+		}
+	})
+}
+
+func TestReplayRetainsItsPlaceBetweenObservations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		block := make(chan struct{})
+		var got []time.Duration
+		h := newHarness(t, Config[string]{OnResult: func(r Report[string]) {
+			if r.Key == "gate" {
+				<-block
+				return
+			}
+			got = append(got, r.Latency)
+		}})
+		h.c.Put("a", h.sw.target("a"))
+		synctest.Wait()
+		h.c.Put("gate", h.sw.target("gate"))
+		synctest.Wait()
+		for i := 1; i <= 2; i++ {
+			h.sw.latency["a"] = time.Duration(i)
+			h.c.CheckNow("a")
+			synctest.Wait()
+			if i == 1 {
+				h.c.replay("a", func(r Report[string]) { got = append(got, r.Latency) })
+			}
+		}
+		close(block)
+		synctest.Wait()
+		if want := []time.Duration{0, 1, 1, 2}; !slices.Equal(got, want) {
+			t.Fatalf("observation, replay and subsequent report: got %v, want %v", got, want)
+		}
+	})
+}

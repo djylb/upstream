@@ -13,8 +13,9 @@ var ErrClosed = errors.New("health: checker closed")
 
 // Attach makes group g of c follow the membership of pool: every member is
 // checked with the Target that target returns for it, and every result is
-// reported to the pool with Pool.ReportCheck, which takes members out of
-// rotation while they are down. A nil target checks each member's address,
+// reported through a dedicated Pool.ReportCheckFrom source. Its Down verdict
+// takes the member out of normal rotation. FallbackAll may bypass health
+// verdicts. A nil target checks each member's address,
 // as upstream.AddressOf finds it, over TCP; for a pool whose values have
 // no address, Attach returns upstream.ErrNoAddress. Attach returns
 // ErrClosed if c is closed and upstream.ErrClosed if pool is.
@@ -39,8 +40,10 @@ var ErrClosed = errors.New("health: checker closed")
 // the Checker closes; detach is idempotent and safe to call from any
 // callback. Ending it removes the group from the Checker and, unless the
 // pool closed, sets the health of the pool's members back to
-// upstream.HealthUnknown, so that no member stays out of rotation on a
-// verdict that nothing will revise.
+// the verdict of the remaining sources, or upstream.HealthUnknown.
+// Watch and Attach admit target calls by checking the current backend
+// identity. Removal discards queued work for that identity; a call that
+// passed the check may enter target or finish after removal returns.
 func Attach[G comparable, T any](c *Checker[string, G], g G, pool *upstream.Pool[T], target func(*upstream.Backend[T]) Target) (detach func(), err error) {
 	if target == nil {
 		if target = addressTarget[T](); target == nil {
@@ -112,7 +115,8 @@ type attachment[G comparable, T any] struct {
 	cancel    func()               // ends the pool subscription; guarded by mu
 	members   map[string]member[T] // by member ID; guarded by mu
 	keys      map[string]*keyState // by Checker key; guarded by mu
-	reporting int                  // reports in progress; guarded by mu
+	source    *upstream.CheckSource
+	reporting int // reports in progress; guarded by mu
 	g         G
 	off       bool // guarded by mu
 	reset     bool // a reset is left to the last report; guarded by mu
@@ -121,6 +125,7 @@ type attachment[G comparable, T any] struct {
 func newAttachment[G comparable, T any](c *Checker[string, G], g G, pool *upstream.Pool[T], target func(*upstream.Backend[T]) Target, keyOf func(string, Target) string) *attachment[G, T] {
 	a := &attachment[G, T]{
 		c:       c,
+		source:  new(upstream.CheckSource),
 		pool:    pool,
 		target:  target,
 		keyOf:   keyOf,
@@ -139,6 +144,13 @@ func (a *attachment[G, T]) start() bool {
 	if !a.c.addSink(a.sink) {
 		return false
 	}
+	go a.wait()
+	defer func() {
+		if v := recover(); v != nil {
+			a.detach()
+			panic(v)
+		}
+	}()
 	cancel := a.pool.Subscribe(a.onEvent)
 	a.mu.Lock()
 	off := a.off
@@ -149,7 +161,6 @@ func (a *attachment[G, T]) start() bool {
 	if off {
 		cancel()
 	}
-	go a.wait()
 	return true
 }
 
@@ -168,6 +179,8 @@ func (a *attachment[G, T]) wait() {
 		a.end(false)
 	case <-a.stop:
 	}
+	// An explicit detach may own cleanup while shutdown wakes wait.
+	<-a.stop
 	if a.onEnd != nil {
 		a.onEnd()
 	}
@@ -180,7 +193,7 @@ func (a *attachment[G, T]) end(poolClosed bool) {
 		return
 	}
 	a.off = true
-	close(a.stop)
+	defer close(a.stop)
 	cancel := a.cancel
 	a.cancel = nil
 	var reset []*upstream.Backend[T]
@@ -197,7 +210,7 @@ func (a *attachment[G, T]) end(poolClosed bool) {
 	}
 	a.c.removeSink(a.sink)
 	a.c.RemoveGroup(a.g)
-	resetHealth(a.pool, reset)
+	a.resetHealth(reset)
 }
 
 func (a *attachment[G, T]) backendsLocked() []*upstream.Backend[T] {
@@ -219,9 +232,9 @@ func (a *attachment[G, T]) keyBackendsLocked(ks *keyState) []*upstream.Backend[T
 
 // resetHealth sets the health of bs back to unknown, keeping their last
 // check result.
-func resetHealth[T any](pool *upstream.Pool[T], bs []*upstream.Backend[T]) {
+func (a *attachment[G, T]) resetHealth(bs []*upstream.Backend[T]) {
 	for _, b := range bs {
-		pool.ReportCheck(b, upstream.HealthUnknown, b.Status().LastCheck)
+		a.pool.ClearCheckFrom(a.source, b)
 	}
 }
 
@@ -230,9 +243,16 @@ func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
 	switch ev.Kind {
 	case upstream.EventAdded, upstream.EventUpdated:
 		id := ev.Backend.ID()
+		if !a.c.beginTarget() {
+			return
+		}
+		defer a.c.leave()
+		if !a.current(ev.Backend) {
+			return
+		}
 		t := a.target(ev.Backend)
 		key := a.keyOf(id, t)
-		if a.isOff() {
+		if !a.current(ev.Backend) {
 			return
 		}
 		gen := a.c.AddToGroup(a.g, key, t)
@@ -254,20 +274,17 @@ func (a *attachment[G, T]) onEvent(ev upstream.Event[T]) {
 		ks.ids[id] = struct{}{}
 		fresh := !had || old.key != key || gen > ks.gen
 		ks.gen = max(ks.gen, gen)
-		drop := ""
-		if had && old.key != key && a.leaveKeyLocked(id, old.key) {
-			drop = old.key
-		}
+		drop := had && old.key != key && a.leaveKeyLocked(id, old.key)
 		a.mu.Unlock()
-		if drop != "" {
-			a.c.RemoveFromGroup(a.g, drop)
+		if drop {
+			a.c.RemoveFromGroup(a.g, old.key)
 		}
 		if fresh {
 			// Reports that came before the generation was recorded were
 			// dropped, and the key may have a verdict already: the
 			// Checker passes on its current state, in order with its
 			// reports.
-			a.c.replay(key)
+			a.c.replay(key, func(r Report[string]) { a.deliver(r, id) })
 		}
 	case upstream.EventRemoved:
 		id := ev.Backend.ID()
@@ -305,10 +322,18 @@ func (a *attachment[G, T]) leaveKeyLocked(id, key string) bool {
 	return true
 }
 
-func (a *attachment[G, T]) isOff() bool {
+func (a *attachment[G, T]) current(b *upstream.Backend[T]) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.off
+	select {
+	case <-a.pool.Done():
+		return false
+	case <-a.c.ctx.Done():
+		return false
+	default:
+	}
+	cur, _ := a.pool.Backend(b.ID())
+	return !a.off && cur == b
 }
 
 // report passes a report on to the members checked under its key. A
@@ -319,15 +344,27 @@ func (a *attachment[G, T]) isOff() bool {
 // started again, such as by another pool that shares the address or by a
 // changed network. A member that joins a key gets the key's current state
 // replayed by onEvent.
-func (a *attachment[G, T]) report(r Report[string]) {
+func (a *attachment[G, T]) report(r Report[string]) { a.deliver(r, "") }
+
+func (a *attachment[G, T]) deliver(r Report[string], id string) {
 	a.mu.Lock()
 	ks := a.keys[r.Key]
 	if a.off || ks == nil || r.Generation < ks.gen {
 		a.mu.Unlock()
 		return
 	}
+	var bs []*upstream.Backend[T]
+	if id == "" {
+		bs = a.keyBackendsLocked(ks)
+	} else {
+		m, ok := a.members[id]
+		if !ok || m.key != r.Key {
+			a.mu.Unlock()
+			return
+		}
+		bs = []*upstream.Backend[T]{m.b}
+	}
 	ks.gen = r.Generation
-	bs := a.keyBackendsLocked(ks)
 	a.reporting++
 	a.mu.Unlock()
 	a.apply(bs, r)
@@ -337,7 +374,11 @@ func (a *attachment[G, T]) report(r Report[string]) {
 func (a *attachment[G, T]) apply(bs []*upstream.Backend[T], r Report[string]) {
 	defer a.applied()
 	for _, b := range bs {
-		a.pool.ReportCheck(b, r.Health, r.CheckResult)
+		if r.Health == upstream.HealthUnknown {
+			a.pool.ClearCheckFrom(a.source, b)
+		} else {
+			a.pool.ReportCheckFrom(a.source, b, r.Health, r.CheckResult)
+		}
 	}
 }
 
@@ -350,7 +391,7 @@ func (a *attachment[G, T]) applied() {
 		reset = a.backendsLocked()
 	}
 	a.mu.Unlock()
-	resetHealth(a.pool, reset)
+	a.resetHealth(reset)
 }
 
 // Watch starts a Checker that follows the membership of pool, as Attach
@@ -364,7 +405,7 @@ func (a *attachment[G, T]) applied() {
 //
 // The Watcher belongs to the pool: it closes when the pool closes.
 // Closing it earlier ends its checks and sets the members' health back to
-// upstream.HealthUnknown.
+// the other sources' verdict, or upstream.HealthUnknown.
 func Watch[T any](ctx context.Context, pool *upstream.Pool[T], target func(*upstream.Backend[T]) Target, cfg Config[string]) (*Watcher, error) {
 	if target == nil {
 		if target = addressTarget[T](); target == nil {
@@ -410,8 +451,8 @@ func (w *Watcher) CheckNow(id string) bool { return w.c.CheckNow(id) }
 // SetConfig replaces the configuration; see Checker.SetConfig.
 func (w *Watcher) SetConfig(cfg Config[string]) { w.c.SetConfig(cfg) }
 
-// Close stops the checks and sets the members' health back to
-// upstream.HealthUnknown. It does not wait: the health is reset once Done
+// Close stops the checks and withdraws this watcher's verdicts.
+// It does not wait: its verdicts are withdrawn once Done
 // is closed.
 func (w *Watcher) Close() { w.c.Close() }
 

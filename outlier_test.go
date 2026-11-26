@@ -353,10 +353,99 @@ func TestTrialsBelongToTheirPeriod(t *testing.T) {
 func TestWindowNeverMovesBack(t *testing.T) {
 	var w window
 	size := 10 * time.Second
-	w.add(65*time.Second, size, windowTotal|windowPart)
-	w.add(55*time.Second, size, windowTotal|windowPart) // a late writer with an older time
-	total, failed := w.add(66*time.Second, size, windowTotal)
+	w.add(65*time.Second, size, 1)
+	w.add(55*time.Second, size, 1) // a late writer with an older time
+	passed, failed := w.add(66*time.Second, size, 0)
+	total := passed + failed
 	if total < 3 || failed < 2 {
 		t.Fatalf("window lost counts: %v requests, %v failures", total, failed)
+	}
+}
+
+type hookedClock struct {
+	*fakeclock.Clock
+	onNow func()
+}
+
+func (c *hookedClock) Now() time.Time {
+	if c.onNow != nil {
+		c.onNow()
+	}
+	return c.Clock.Now()
+}
+
+func TestDisableDuringEjection(t *testing.T) {
+	clk := &hookedClock{Clock: fakeclock.New()}
+	d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1}, clk, nil)
+	defer d.Close()
+	clk.onNow = func() { d.SetConfig(OutlierConfig{}) }
+	fail(t, d, 1)
+	if d.State() != OutlierOK || clk.Pending() != 0 {
+		t.Fatal("stale ejection after disable")
+	}
+}
+
+func TestEjectionAcrossConfigAndReset(t *testing.T) {
+	clk := &hookedClock{Clock: fakeclock.New()}
+	epoch := time.Unix(0, 0)
+	clk.Advance(epoch.Add(-time.Second).Sub(clk.Now()))
+	cfg := OutlierConfig{ConsecutiveFailures: 2, BaseEjection: time.Second}
+	d := NewOutlierDetector(cfg, clk, nil)
+	defer d.Close()
+	fail(t, d, 1)
+	clk.onNow = d.Reset
+	fail(t, d, 1)
+	if s := d.Status(); s.State != OutlierOK || s.ConsecutiveFailures != 0 || clk.Pending() != 0 {
+		t.Fatalf("reset overtaken by stale ejection: %+v", s)
+	}
+	clk.onNow = func() { d.SetConfig(cfg) }
+	fail(t, d, 2)
+	if s := d.Status(); s.State != OutlierEjected || !s.EjectedUntil.Equal(epoch) || clk.Pending() != 1 {
+		t.Fatalf("ejection after identical config: %+v", s)
+	}
+}
+
+func TestResetAndInspectEmptyDetector(t *testing.T) {
+	var d OutlierDetector
+	d.Reset()
+	if s := d.Status(); s != (OutlierStatus{}) {
+		t.Fatal(s)
+	}
+}
+
+func TestWindowRotationCanBeHelped(t *testing.T) {
+	const tag = uint64(4)
+	for stopped := range 3 {
+		var c windowCounter
+		if !c.increment(0, 1) {
+			t.Fatal("first event refused")
+		}
+		before := c.serial.Load()
+		c.generation.Store(tag | 1)
+		if stopped > 0 {
+			c.advance(tag|1, before)
+		}
+		if stopped > 1 {
+			c.advance(tag|1, before+1)
+		}
+		if !c.increment(tag, 1) {
+			t.Fatalf("rotation stalled at step %d", stopped)
+		}
+		c.advance(tag|1, before)
+		c.advance(tag|1, before+1)
+		if c.serial.CompareAndSwap(before, before+2) || c.increment(0, 1) || c.count(tag) != 1 {
+			t.Fatalf("late operation changed new window after step %d", stopped)
+		}
+	}
+}
+
+func TestLateBudgetUsesLatestObservation(t *testing.T) {
+	var w window
+	for range 4 {
+		w.add(0, time.Second, 0)
+	}
+	w.add(1900*time.Millisecond, time.Second, 0)
+	if w.reserve(time.Second-1, time.Second, 0, .5).credits != nil {
+		t.Fatal("late reservation revived expired request credit")
 	}
 }

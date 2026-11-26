@@ -33,8 +33,7 @@ type HashConfig struct {
 // are the candidates the key would move to if the earlier ones left.
 //
 // Pick hashes the key it is given again, so any 64-bit key works. Picks do
-// not allocate, except retries (attempts above 0) on rings of more than
-// 256 candidates, which need a scratch bitset. The Balancer is a
+// not allocate, including retries. The Balancer is an
 // Updater: when members come and go, a Pool updates the ring instead of
 // building it again.
 func ConsistentHash(cfg HashConfig) Balancer {
@@ -61,13 +60,20 @@ type ringPoint struct {
 // ringCounts returns the number of ring points of each candidate and the
 // sum of their weights.
 func (h consistentHash) ringCounts(c []Candidate) (counts []int32, sum int64) {
+	if len(c) > math.MaxInt32 || len(c) > 0 && h.cfg.VirtualNodes > math.MaxInt/len(c) {
+		panic("upstream: ring size exceeds index range")
+	}
 	for i := range c {
 		sum += c[i].weight()
 	}
 	perUnit := float64(h.cfg.VirtualNodes) * float64(len(c)) / float64(sum)
 	counts = make([]int32, len(c))
 	for i := range c {
-		counts[i] = int32(min(max(math.Round(perUnit*float64(c[i].weight())), 1), math.MaxInt32))
+		points := max(math.Round(perUnit*float64(c[i].weight())), 1)
+		if points > math.MaxInt32 {
+			panic("upstream: ring size exceeds index range")
+		}
+		counts[i] = int32(points)
 	}
 	return counts, sum
 }
@@ -95,7 +101,14 @@ func pointOrder(c []Candidate) func(a, b ringPoint) int {
 
 func (h consistentHash) Build(c []Candidate) Picker {
 	counts, sum := h.ringCounts(c)
-	points := make([]ringPoint, 0, h.cfg.VirtualNodes*len(c)+len(c))
+	capacity := 0
+	for _, n := range counts {
+		if int(n) > math.MaxInt-capacity {
+			panic("upstream: ring size exceeds index range")
+		}
+		capacity += int(n)
+	}
+	points := make([]ringPoint, 0, capacity)
 	for i := range c {
 		points = appendPoints(points, c[i].ID, counts[i], i)
 	}
@@ -186,6 +199,15 @@ func (h consistentHash) picker(c []Candidate, counts []int32, sum int64, hashes 
 		weightSum:  float64(sum),
 		vnodes:     h.cfg.VirtualNodes,
 	}
+	p.gap = make([]int, len(owners))
+	last := make([]int, len(c))
+	for i, o := range owners {
+		last[o] = i - len(owners)
+	}
+	for i, o := range owners {
+		p.gap[i] = i - last[o]
+		last[o] = i
+	}
 	for i := range c {
 		p.ids[i] = c[i].ID
 	}
@@ -193,6 +215,7 @@ func (h consistentHash) picker(c []Candidate, counts []int32, sum int64, hashes 
 }
 
 type ringPicker struct {
+	gap    []int // distance to previous point of the same owner, around the ring
 	hashes []uint64
 	owners []int32
 	loadPicker
@@ -204,86 +227,61 @@ type ringPicker struct {
 }
 
 func (p *ringPicker) Pick(key uint64, attempt int) int {
-	pos, _ := slices.BinarySearch(p.hashes, mix64(key))
-	if pos == len(p.hashes) {
-		pos = 0
-	}
+	pos := p.position(key)
 	if attempt == 0 && p.factor == 0 {
 		return int(p.owners[pos])
 	}
-
-	var budget float64 // in-flight requests per unit of weight allowed
-	if p.factor > 0 {
-		var total int64
-		for i := range p.weights {
-			total += p.load(i)
+	result := int(p.owners[pos])
+	p.visit(pos, func(owner int) bool {
+		if attempt <= 0 {
+			result = owner
+			return true
 		}
-		budget = p.factor * float64(total+1) / p.weightSum
+		attempt--
+		return false
+	})
+	return result
+}
+
+func (p *ringPicker) position(key uint64) int {
+	pos, _ := slices.BinarySearch(p.hashes, mix64(key))
+	if pos == len(p.hashes) {
+		return 0
 	}
-	if attempt == 0 {
-		// The first candidate under its cap on the ring, which needs no
-		// record of the candidates seen. The caps add up to more than the
-		// load, so there is one.
+	return pos
+}
+
+// visit considers each owner once, in ring order within each load class.
+func (p *ringPicker) visit(pos int, accept func(int) bool) {
+	var budget float64
+	if p.factor > 0 {
+		var total float64
+		for i := range p.weights {
+			total += float64(p.load(i))
+		}
+		budget = p.factor * (total + 1) / p.weightSum
+	}
+	for pass := range 2 {
 		for j, i := 0, pos; j < len(p.owners); j++ {
-			if o := int(p.owners[i]); p.under(o, budget) {
-				return o
+			o := int(p.owners[i])
+			if j < p.gap[i] && p.under(o, budget) == (pass == 0) && accept(o) {
+				return
 			}
-			if i++; i == len(p.owners) {
+			i++
+			if i == len(p.owners) {
 				i = 0
 			}
 		}
-		return int(p.owners[pos])
+		if p.factor == 0 {
+			return
+		}
 	}
-	// Attempt k takes the k-th candidate of the ring walk in which the
-	// candidates under their load cap come first, so successive attempts
-	// pick distinct candidates.
-	o, under := p.walk(pos, attempt, budget, true)
-	if o >= 0 {
-		return o
-	}
-	if o, _ = p.walk(pos, attempt-under, budget, false); o >= 0 {
-		return o
-	}
-	return int(p.owners[pos])
 }
 
 // under reports whether candidate o carries less than its cap. Without
 // bounded loads every candidate is under its cap.
 func (p *ringPicker) under(o int, budget float64) bool {
 	return p.factor == 0 || float64(p.load(o)) < math.Ceil(budget*float64(p.weights[o]))
-}
-
-// walk visits the distinct candidates in ring order from pos and returns
-// the skip-th of those whose being under their cap equals under, or -1 and
-// the number it found. Without bounded loads every candidate is under its
-// cap.
-func (p *ringPicker) walk(pos, skip int, budget float64, under bool) (owner, found int) {
-	n := len(p.weights)
-	var small [4]uint64
-	seen := small[:]
-	if n > 64*len(small) {
-		seen = make([]uint64, (n+63)/64)
-	}
-	distinct := 0
-	for j, i := 0, pos; j < len(p.owners) && distinct < n; j++ {
-		o := int(p.owners[i])
-		if i++; i == len(p.owners) {
-			i = 0
-		}
-		if seen[o/64]&(1<<(o%64)) != 0 {
-			continue
-		}
-		seen[o/64] |= 1 << (o % 64)
-		distinct++
-		if p.under(o, budget) != under {
-			continue
-		}
-		if found == skip {
-			return o, found
-		}
-		found++
-	}
-	return -1, found
 }
 
 // hashString is 64-bit FNV-1a. It is part of the placement contract of

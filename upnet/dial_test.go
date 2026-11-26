@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/djylb/upstream"
+	"github.com/djylb/upstream/internal/dialresult"
 	"github.com/djylb/upstream/internal/fakeclock"
 )
 
@@ -119,7 +120,7 @@ func TestDialNeedsAddress(t *testing.T) {
 		t.Fatalf("served %q", got)
 	}
 	none := &Dialer[int]{Pool: p, Address: d.Address, DialContext: func(context.Context, string, string) (net.Conn, error) { return nil, nil }}
-	if _, err := none.Dial(context.Background()); !errors.Is(err, errNoConn) {
+	if _, err := none.Dial(context.Background()); !errors.Is(err, dialresult.ErrNoConn) {
 		t.Fatalf("Dial without a connection = %v", err)
 	}
 }
@@ -286,29 +287,27 @@ func TestDialClosesConnWithError(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	pd := &pipeDialer{served: make(chan string, 1)}
 	defer pd.wg.Wait()
-	p := newPool(t, upstream.Config{Retry: upstream.RetryConfig{Attempts: 2}},
+	clk := fakeclock.New()
+	p := newPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}},
 		upstream.Target[string]{ID: "a", Value: "half"}, upstream.Target[string]{ID: "b", Value: "b", Priority: 1})
 	d := &Dialer[string]{Pool: p, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		if address == "half" {
 			return client, errRefused
 		}
+		clk.Advance(time.Second)
 		return pd.dial(ctx, network, address)
 	}}
 	conn, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conn.Backend().ID() != "b" {
-		t.Fatalf("dialed %s", conn.Backend().ID())
+	defer func() { _ = conn.Close() }()
+	if b := conn.Backend(); b.ID() != "b" || b.Latency() != time.Second {
+		t.Fatalf("dialed %s with latency %v", b.ID(), b.Latency())
 	}
-	if _, err := client.Write([]byte{0}); !errors.Is(err, io.ErrClosedPipe) {
+	if err := client.SetDeadline(time.Time{}); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("connection left open: %v", err)
 	}
-	if conn.Backend().Latency() <= 0 {
-		t.Fatal("dial latency not observed")
-	}
-	_ = conn.Close()
-	<-pd.served
 }
 
 type zoned struct{ addr, zone string }
@@ -370,5 +369,32 @@ func TestDialNilAddresser(t *testing.T) {
 	}
 	if s := p.Status()[0]; s.InFlight != 0 {
 		t.Fatalf("lease leaked: %+v", s)
+	}
+}
+
+type panicCloseConn struct {
+	net.Conn
+	calls int
+}
+
+func (c *panicCloseConn) Close() error { c.calls++; panic("close") }
+
+func TestClosePanicReleasesLease(t *testing.T) {
+	p := newPool(t, upstream.Config{}, upstream.Target[string]{ID: "a", Value: "a"})
+	raw := new(panicCloseConn)
+	c, err := (&Dialer[string]{Pool: p, DialContext: func(context.Context, string, string) (net.Conn, error) { return raw, nil }}).Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recover() != "close" {
+				t.Error("missing panic")
+			}
+		}()
+		_ = c.Close()
+	}()
+	if raw.calls != 1 || c.Backend().InFlight() != 0 {
+		t.Fatalf("closes %d in flight %d", raw.calls, c.Backend().InFlight())
 	}
 }

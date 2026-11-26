@@ -26,6 +26,8 @@ var ErrAttemptTimeout = fmt.Errorf("uphttp: attempt timed out: %w", context.Dead
 // backend.
 var ErrHeaderTimeout = fmt.Errorf("uphttp: timed out waiting for response headers: %w", context.DeadlineExceeded)
 
+var errNoResponse = errors.New("uphttp: transport returned neither a response nor an error")
+
 // A RoundTripper sends each request to a backend picked from Pool, so that
 // an http.Client or a reverse proxy balances requests over the pool. It
 // retries a request that failed on another backend, as Retry and the
@@ -60,6 +62,10 @@ type RoundTripper[T any] struct {
 	// Rewrite, or RoundTrip fails with upstream.ErrNoAddress; a backend
 	// whose value has none, such as a nil *url.URL or a nil Addresser,
 	// fails its attempt with it, as a Failure.
+	//
+	// Rewrite may wrap or replace Body. The transport owns the outgoing
+	// body, and closing it also closes this attempt's input body once.
+	// Before handoff, including a Rewrite panic, RoundTrip closes both.
 	//
 	// The request's Host field is kept, so the backend sees the Host
 	// header the client sent; set r.Host to send the backend's own. With
@@ -115,10 +121,15 @@ type RoundTripper[T any] struct {
 
 // RoundTrip implements http.RoundTripper.
 func (rt *RoundTripper[T]) RoundTrip(req *http.Request) (*http.Response, error) {
+	ownsRequest := true
+	defer func() {
+		if ownsRequest {
+			closeBody(req)
+		}
+	}()
 	rewrite := func(r *http.Request, b *upstream.Backend[T]) error { rt.Rewrite(r, b); return nil } //nolint:unparam // shares its signature with defaultRewrite, which can fail
 	if rt.Rewrite == nil {
 		if rewrite = defaultRewrite[T](); rewrite == nil {
-			closeBody(req)
 			return nil, upstream.ErrNoAddress
 		}
 	}
@@ -127,18 +138,25 @@ func (rt *RoundTripper[T]) RoundTrip(req *http.Request) (*http.Response, error) 
 		key = rt.Key(req)
 	}
 	replayable := req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
-	var last attempt[T] // the last attempt's response, kept with its lease
+	var last attempt[T] // response and lease owned until handoff
+	defer func() {
+		if v := recover(); v != nil {
+			last.discard()
+			panic(v)
+		}
+	}()
 	r := rt.Pool.Request(key)
 	err := r.Do(req.Context(), func(l *upstream.Lease[T]) (bool, error) {
 		last.discard()
-		a := rt.try(req, l, rewrite, r.Tried() > 1)
-		retry := replayable && (idempotent(req) || notSent(a.err)) && rt.retry(a)
+		ownsRequest = false
+		last = rt.try(req, l, rewrite, r.Tried() > 1)
+		a := &last
+		retry := replayable && (idempotent(req) || notSent(a.err)) && rt.retry(*a)
 		if a.err != nil {
 			l.Release(a.o)
 			return retry, a.err
 		}
 		a.lease = l.Take()
-		last = a
 		return retry, nil
 	})
 	if err != nil && last.resp != nil {
@@ -146,9 +164,6 @@ func (rt *RoundTripper[T]) RoundTrip(req *http.Request) (*http.Response, error) 
 		return last.finish(), nil
 	}
 	if err != nil {
-		if r.Tried() == 0 {
-			closeBody(req)
-		}
 		return nil, err
 	}
 	return last.finish(), nil
@@ -165,26 +180,51 @@ type attempt[T any] struct {
 
 // discard drops the response of an attempt that is retried.
 func (a *attempt[T]) discard() {
-	if a.cancel != nil {
-		a.cancel()
-	}
-	if a.resp != nil && a.resp.Body != nil {
-		_ = a.resp.Body.Close()
-	}
-	a.lease.Release(a.o)
+	owned := *a
 	*a = attempt[T]{}
+	defer owned.lease.Release(owned.o)
+	if owned.cancel != nil {
+		owned.cancel()
+	}
+	if owned.resp != nil && owned.resp.Body != nil {
+		_ = owned.resp.Body.Close()
+	}
 }
 
 // try sends one attempt of req to the backend of l. If Rewrite, Transport,
 // the round trip or Outcome panics, it closes the response if there is
 // one and lets the panic go on; the caller releases l.
 func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite func(*http.Request, *upstream.Backend[T]) error, again bool) (a attempt[T]) {
+	var owned io.ReadCloser
+	if !again {
+		owned = req.Body
+	}
+	defer func() {
+		if owned != nil {
+			_ = owned.Close()
+		}
+	}()
+	var hdr *headerTimer
+	done := false
+	defer func() {
+		if hdr != nil && hdr.stop != nil {
+			hdr.headers()
+		}
+		if !done {
+			if a.cancel != nil {
+				a.cancel()
+				a.cancel = nil
+			}
+			if a.resp != nil && a.resp.Body != nil {
+				_ = a.resp.Body.Close()
+			}
+		}
+	}()
 	ctx := req.Context()
 	clock := rt.Pool.Clock()
 	if rt.AttemptTimeout > 0 {
 		ctx, a.cancel = clock.WithTimeout(ctx, rt.AttemptTimeout)
 	}
-	var hdr *headerTimer
 	if rt.HeaderTimeout > 0 {
 		var cancel context.CancelCauseFunc
 		ctx, cancel = context.WithCancelCause(ctx)
@@ -198,27 +238,33 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 		}
 		hdr.stop = clock.AfterFunc(rt.HeaderTimeout, hdr.fire)
 	}
-	done := false
-	defer func() {
-		if hdr != nil {
-			hdr.headers()
-		}
-		if !done {
-			if a.resp != nil && a.resp.Body != nil {
-				_ = a.resp.Body.Close()
-			}
-			if a.cancel != nil {
-				a.cancel()
-			}
-		}
-	}()
 	out := req.Clone(ctx)
 	if again && req.GetBody != nil {
 		var err error
 		if out.Body, err = req.GetBody(); err != nil {
+			owned = out.Body
 			a.err, a.o = err, upstream.Neutral
 			return a
 		}
+	}
+	owned = out.Body
+	handed := false
+	var input *onceBody
+	if rt.Rewrite != nil {
+		if owned != nil && owned != http.NoBody {
+			input = &onceBody{ReadCloser: owned}
+			out.Body = input
+		}
+		owned = nil
+		// Rewrite can install a body and then panic.
+		defer func() {
+			if !handed {
+				if input != nil {
+					defer func() { _ = input.Close() }()
+				}
+				closeBody(out)
+			}
+		}()
 	}
 	b := l.Backend()
 	if err := rewrite(out, b); err != nil {
@@ -226,15 +272,34 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 		return a
 	}
 	start := clock.Now()
-	a.resp, a.err = rt.transport(b).RoundTrip(out) //nolint:bodyclose // the response goes to the caller, who closes it
-	if hdr != nil && !hdr.headers() && req.Context().Err() == nil && errors.Is(context.Cause(ctx), ErrHeaderTimeout) {
-		if a.resp != nil && a.resp.Body != nil {
-			_ = a.resp.Body.Close()
+	transport := rt.transport(b)
+	if input != nil && out.Body != input {
+		if out.Body == nil || out.Body == http.NoBody {
+			_ = input.Close()
+		} else {
+			out.Body = &rewrittenBody{ReadCloser: out.Body, input: input}
 		}
-		a.resp, a.err = nil, ErrHeaderTimeout
 	}
-	if a.err != nil && !errors.Is(a.err, ErrHeaderTimeout) && a.cancel != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && req.Context().Err() == nil {
+	owned = nil
+	handed = true
+	a.resp, a.err = transport.RoundTrip(out) //nolint:bodyclose // the response goes to the caller, who closes it
+	headersLate := hdr != nil && !hdr.headers()
+	switch {
+	case req.Context().Err() != nil:
+		a.err = req.Context().Err()
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		a.err = ErrAttemptTimeout
+	case headersLate:
+		a.err = ErrHeaderTimeout
+	case a.resp == nil && a.err == nil:
+		a.err = errNoResponse
+	}
+	if a.err != nil && a.resp != nil {
+		resp := a.resp
+		a.resp = nil
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 	}
 	if a.err == nil {
 		l.Observe(clock.Now().Sub(start))
@@ -246,6 +311,29 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 	}
 	done = true
 	return a
+}
+
+// onceBody lets both a wrapping body and its owner close the input.
+type onceBody struct {
+	io.ReadCloser
+	closed atomic.Bool
+}
+
+func (b *onceBody) Close() error {
+	if b.closed.CompareAndSwap(false, true) {
+		return b.ReadCloser.Close()
+	}
+	return nil
+}
+
+type rewrittenBody struct {
+	io.ReadCloser
+	input *onceBody
+}
+
+func (b *rewrittenBody) Close() error {
+	defer func() { _ = b.input.Close() }()
+	return b.ReadCloser.Close()
 }
 
 // A headerTimer cancels an attempt whose response headers are late. Its
@@ -413,7 +501,7 @@ func (a *attempt[T]) finish() *http.Response {
 	}
 	a.lease.Report(a.o)
 	body := &leaseBody[T]{ReadCloser: resp.Body, l: a.lease, cancel: a.cancel}
-	if w, ok := resp.Body.(io.Writer); ok { // an upgraded connection
+	if w, ok := resp.Body.(io.Writer); ok && resp.StatusCode == http.StatusSwitchingProtocols { // an upgraded connection
 		resp.Body = &leaseConnBody[T]{leaseBody: body, w: w}
 	} else {
 		resp.Body = body
@@ -439,9 +527,8 @@ func (b *leaseBody[T]) Read(p []byte) (int, error) {
 }
 
 func (b *leaseBody[T]) Close() error {
-	err := b.ReadCloser.Close()
-	b.release()
-	return err
+	defer b.release()
+	return b.ReadCloser.Close()
 }
 
 func (b *leaseBody[T]) release() {

@@ -49,10 +49,14 @@ type TransportCache[K comparable] struct {
 	ttl          time.Duration
 	maxEntries   int
 
-	mu      sync.Mutex
-	entries map[K]*list.Element // of *cacheEntry[K]; guarded by mu
-	lru     list.List           // most recently used first; guarded by mu
+	mu       sync.Mutex
+	building map[K]*transportBuild
+	entries  map[K]*list.Element // of *cacheEntry[K]; guarded by mu
+	lru      list.List           // most recently used first; guarded by mu
 }
+
+// transportBuild counts factories sharing one cache generation.
+type transportBuild struct{ builders int }
 
 type cacheEntry[K comparable] struct {
 	used      time.Time
@@ -70,6 +74,7 @@ func NewTransportCache[K comparable](newTransport func(K) *http.Transport, cfg T
 		clock:        cfg.Clock,
 		ttl:          max(cfg.IdleTTL, 0),
 		maxEntries:   max(cfg.MaxEntries, 0),
+		building:     make(map[K]*transportBuild),
 		entries:      make(map[K]*list.Element),
 	}
 	if c.clock == nil {
@@ -88,17 +93,42 @@ func (c *TransportCache[K]) Get(key K) *http.Transport {
 		closeIdle(dropped)
 		return t
 	}
+	token := c.building[key]
+	if token == nil {
+		token = new(transportBuild)
+		c.building[key] = token
+	}
+	token.builders++
 	c.mu.Unlock()
+	defer func() {
+		if v := recover(); v != nil {
+			c.mu.Lock()
+			token.builders--
+			if token.builders == 0 && c.building[key] == token {
+				delete(c.building, key)
+			}
+			c.mu.Unlock()
+			panic(v)
+		}
+	}()
 	closeIdle(dropped)
-
 	t := c.newTransport(key)
-
+	now = c.clock.Now()
 	c.mu.Lock()
+	dropped = c.expireLocked(now)
 	if cur := c.useLocked(key, now); cur != nil {
 		c.mu.Unlock()
+		closeIdle(dropped)
 		t.CloseIdleConnections()
 		return cur
 	}
+	if c.building[key] != token {
+		c.mu.Unlock()
+		closeIdle(dropped)
+		return t
+	}
+	delete(c.building, key)
+	now = c.frontTime(now)
 	c.entries[key] = c.lru.PushFront(&cacheEntry[K]{used: now, transport: t, key: key})
 	for c.maxEntries > 0 && c.lru.Len() > c.maxEntries {
 		dropped = append(dropped, c.dropLocked(c.lru.Back()))
@@ -119,11 +149,16 @@ func (c *TransportCache[K]) useLocked(key K, now time.Time) *http.Transport {
 		return nil
 	}
 	e := entryOf[K](el)
-	if now.After(e.used) {
-		e.used = now
-	}
+	e.used = c.frontTime(now)
 	c.lru.MoveToFront(el)
 	return e.transport
+}
+
+func (c *TransportCache[K]) frontTime(now time.Time) time.Time {
+	if el := c.lru.Front(); el != nil && entryOf[K](el).used.After(now) {
+		return entryOf[K](el).used
+	}
+	return now
 }
 
 func (c *TransportCache[K]) expireLocked(now time.Time) []*http.Transport {
@@ -148,9 +183,10 @@ func (c *TransportCache[K]) dropLocked(el *list.Element) *http.Transport {
 }
 
 // Remove drops the transport for key and closes its idle connections. It
-// reports false if there was none.
+// also invalidates pending builds. It reports whether a cached entry existed.
 func (c *TransportCache[K]) Remove(key K) bool {
 	c.mu.Lock()
+	delete(c.building, key)
 	el := c.entries[key]
 	var t *http.Transport
 	if el != nil {
@@ -176,6 +212,7 @@ func (c *TransportCache[K]) Len() int {
 // connections. The cache stays usable. Call it when shutting down.
 func (c *TransportCache[K]) CloseIdleConnections() {
 	c.mu.Lock()
+	clear(c.building)
 	dropped := make([]*http.Transport, 0, c.lru.Len())
 	for el := c.lru.Back(); el != nil; el = c.lru.Back() {
 		dropped = append(dropped, c.dropLocked(el))

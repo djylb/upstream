@@ -107,6 +107,7 @@ func NewDamper[K comparable, V any](clock upstream.Clock, cfg DampConfig, emit f
 // repeat of what was passed last. Offer may return before the call to emit
 // it caused has been made, when another goroutine is inside emit.
 func (d *Damper[K, V]) Offer(key K, h upstream.Health, v V) {
+	now := d.clock.Now()
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -117,16 +118,41 @@ func (d *Damper[K, V]) Offer(key K, h upstream.Health, v V) {
 		k = &dampKey[K, V]{}
 		d.keys[key] = k
 	}
-	if d.decide(key, k, h, v) {
+	round := k.round
+	stop := k.timer
+	pass := d.decide(now, k, h, v)
+	if pass {
+		k.timer = nil
+		k.round++
+		if stop != nil {
+			defer stop()
+		}
 		d.enqueueLocked(key, v)
 		return
 	}
+	if round == k.round {
+		d.mu.Unlock()
+		return
+	}
+	round, hold := k.round, k.hold
+	k.timer = nil
 	d.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	stop = d.clock.AfterFunc(hold, func() { d.release(key, k, round) })
+	d.mu.Lock()
+	if !d.closed && d.keys[key] == k && k.round == round && k.pending {
+		k.timer = stop
+		stop = nil
+	}
+	d.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
-// decide is the rule above; true: pass v now.
-func (d *Damper[K, V]) decide(key K, k *dampKey[K, V], h upstream.Health, v V) bool {
-	now := d.clock.Now()
+func (d *Damper[K, V]) decide(now time.Time, k *dampKey[K, V], h upstream.Health, v V) bool {
 	for k.hold > 0 && now.Sub(k.until) >= d.cfg.Window {
 		k.hold /= 2
 		k.until = k.until.Add(d.cfg.Window)
@@ -137,7 +163,7 @@ func (d *Damper[K, V]) decide(key K, k *dampKey[K, V], h upstream.Health, v V) b
 	if k.has && k.reported == h && !k.pending {
 		return false
 	}
-	if now.Before(k.until) {
+	if k.pending && now.Before(k.until) {
 		k.pending, k.ph, k.val = true, h, v
 		return false
 	}
@@ -147,26 +173,17 @@ func (d *Damper[K, V]) decide(key K, k *dampKey[K, V], h upstream.Health, v V) b
 			k.flips = k.flips[1:]
 		}
 		if len(k.flips) > d.cfg.Flips {
-			k.hold = min(max(k.hold*2, d.cfg.Base), d.cfg.Max)
+			k.hold = max(k.hold+min(k.hold, d.cfg.Max-k.hold), d.cfg.Base)
 			k.until = now.Add(k.hold)
 			k.pending, k.ph, k.val = true, h, v
 			k.flips = k.flips[:0]
-			if k.timer != nil {
-				k.timer()
-			}
 			k.round++
-			round := k.round
-			k.timer = d.clock.AfterFunc(k.hold, func() { d.release(key, k, round) })
 			return false
 		}
 	}
 	k.has, k.reported, k.pending = true, h, false
 	var zero V
 	k.val = zero
-	if k.timer != nil {
-		k.timer() // a suppression that ended before its timer ran
-		k.timer = nil
-	}
 	return true
 }
 
@@ -195,6 +212,14 @@ func (d *Damper[K, V]) enqueueLocked(key K, v V) {
 		return
 	}
 	d.draining = true
+	defer func() {
+		if v := recover(); v != nil {
+			d.mu.Lock()
+			d.draining = false
+			d.mu.Unlock()
+			panic(v)
+		}
+	}()
 	for len(d.queue) > 0 {
 		o := d.queue[0]
 		d.queue[0] = dampOut[K, V]{}
@@ -214,10 +239,10 @@ func (d *Damper[K, V]) enqueueLocked(key K, v V) {
 // time.Timer.Stop. The next Offer for key starts afresh.
 func (d *Damper[K, V]) Forget(key K) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if k := d.keys[key]; k != nil && k.timer != nil {
-		k.timer()
+		defer k.timer()
 	}
+	defer d.mu.Unlock()
 	delete(d.keys, key)
 	d.queue = slices.DeleteFunc(d.queue, func(o dampOut[K, V]) bool { return o.key == key })
 }
@@ -225,15 +250,15 @@ func (d *Damper[K, V]) Forget(key K) {
 // Close forgets every key and makes Offer do nothing.
 func (d *Damper[K, V]) Close() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
 	for _, k := range d.keys {
 		if k.timer != nil {
-			k.timer()
+			defer k.timer()
 		}
 	}
 	clear(d.keys)
 	d.queue = nil
+	d.mu.Unlock()
 }
 
 // Len returns the number of keys the damper holds state for.

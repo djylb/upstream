@@ -69,7 +69,7 @@ func TestPoolRanksOnce(t *testing.T) {
 	var picks, ranks int
 	p := New[int](Config{Balancer: rankBalancer{&picks, &ranks}})
 	defer p.Close()
-	const n = 6
+	const n = rankStack + 1
 	ts := make([]Target[int], n)
 	for i := range ts {
 		ts[i] = Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1, Value: i}
@@ -97,8 +97,56 @@ func TestPoolRanksOnce(t *testing.T) {
 	if picks != 1 || ranks != 1 {
 		t.Fatalf("%d Pick and %d Rank calls, want 1 and 1", picks, ranks)
 	}
+	if !raceEnabled {
+		if nalloc := testing.AllocsPerRun(30, func() {
+			l, err := p.PickHash(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l.Release(Neutral)
+		}); nalloc != 0 {
+			t.Fatalf("%v allocations per ranked pick", nalloc)
+		}
+	}
 	for i := range held {
 		held[i].Release(Success)
+	}
+}
+
+func TestUnchangedTierKeepsRankWorkspace(t *testing.T) {
+	var picks, ranks int
+	p := New[int](Config{Balancer: rankBalancer{&picks, &ranks}})
+	defer p.Close()
+	if err := p.Sync([]Target[int]{{ID: "a"}, {ID: "b", Priority: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	before := p.view.Load().tiers[1].ranking
+	b, _ := p.Backend("a")
+	p.MarkOffline(b, nil)
+	if after := p.view.Load().tiers[0].ranking; before == nil || after != before {
+		t.Fatal("unchanged picker lost its ranking workspace")
+	}
+}
+
+func TestRendezvousStaleViewPreservesOrder(t *testing.T) {
+	// For this key d wins and a ranks second. A linear scan starts at c.
+	p := newTestPool(t, Config{Balancer: Rendezvous(RendezvousConfig{})}, "c", "b", "a", "d")
+	v := p.view.Load()
+	tier := &v.tiers[0]
+	order := make([]int, len(tier.members))
+	const hash = uint64(0)
+	tier.picker.(Ranker).Rank(hash, order)
+	p.MarkOffline(tier.members[order[0]], nil)
+	for _, ignoreHealth := range []bool{false, true} {
+		l, result := tier.pick(hash, nil, ignoreHealth)
+		if result != admitted {
+			t.Fatalf("stale view refused all members: %v", result)
+		}
+		got := l.Backend()
+		l.Release(Neutral)
+		if got != tier.members[order[1]] {
+			t.Fatalf("order %v: got %s, want %s", order, got.ID(), tier.members[order[1]].ID())
+		}
 	}
 }
 
@@ -293,9 +341,17 @@ func TestSmallTierRanksOnStack(t *testing.T) {
 		}
 	}
 	for i := range n - 1 {
-		if _, err := p.Acquire(strconv.Itoa(i)); err != nil {
+		l, err := p.Acquire(strconv.Itoa(i))
+		if err != nil {
 			t.Fatal(err)
 		}
+		defer func() {
+			b := l.Backend()
+			l.Release(Neutral)
+			if b.InFlight() != 0 {
+				t.Errorf("in-flight leases on %s", b.ID())
+			}
+		}()
 	}
 	key := uint64(0)
 	if a := testing.AllocsPerRun(100, func() {
@@ -342,7 +398,7 @@ func TestHealthyGroupSharesLists(t *testing.T) {
 
 // TestLargeTierRankAllocsBounded checks that ranking a tier past the
 // stack buffer allocates a fixed number of times per call: one scratch
-// buffer for the scores and, in a pool, one for the order.
+// buffer for an explicit Rank. A pool pick needs none.
 func TestLargeTierRankAllocsBounded(t *testing.T) {
 	if raceEnabled {
 		t.Skip("the race detector adds allocations")
@@ -366,9 +422,17 @@ func TestLargeTierRankAllocsBounded(t *testing.T) {
 		}
 	}
 	for i := range n - 1 {
-		if _, err := p.Acquire(strconv.Itoa(i)); err != nil {
+		l, err := p.Acquire(strconv.Itoa(i))
+		if err != nil {
 			t.Fatal(err)
 		}
+		defer func() {
+			b := l.Backend()
+			l.Release(Neutral)
+			if b.InFlight() != 0 {
+				t.Errorf("in-flight leases on %s", b.ID())
+			}
+		}()
 	}
 	if a := testing.AllocsPerRun(50, func() {
 		key++
@@ -377,7 +441,7 @@ func TestLargeTierRankAllocsBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		l.Release(Success)
-	}); a > 2 {
+	}); a != 0 {
 		t.Fatalf("%v allocations per pick on a full tier of %d", a, n)
 	}
 }
