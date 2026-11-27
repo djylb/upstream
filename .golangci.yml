@@ -53,11 +53,6 @@ linters:
   settings:
     govet:
       enable-all: true
-      disable:
-        # Checked on its own, as fieldalignment; what remains are
-        # pointer-byte reports, for which fields keep their order of
-        # meaning.
-        - fieldalignment
     gosec:
       excludes:
         # math/rand picks backends and spreads jitter; none of it needs
@@ -71,6 +66,10 @@ linters:
 
   exclusions:
     rules:
+      # Keep fields in semantic order when reordering saves no space.
+      - linters:
+          - govet
+        text: '^fieldalignment: (struct with \d+ pointer bytes could be \d+|.+ has \d+ leading bytes of pointer data but optimal value is \d+)$'
       # Tests build errors in place, repeat their case names, addresses
       # and paths, read globals as tables, unpack fixtures they partly
       # ignore, call the net and net/http helpers that carry no context,
