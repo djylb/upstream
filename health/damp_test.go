@@ -1,473 +1,358 @@
 package health
 
 import (
-	"math/rand"
+	"context"
+	"errors"
 	"slices"
-	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/upstream"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
-// stepClock is a Clock whose timers run synchronously, in time order, from
-// Advance, so that decisions that depend on the order of timers and calls
-// can be compared exactly.
-type stepClock struct{ *fakeclock.Clock }
-
-func newStepClock() *stepClock { return &stepClock{fakeclock.New()} }
-
-// Advance moves the clock by d, running each timer due on the way at its
-// own time.
-func (c *stepClock) Advance(d time.Duration) {
-	end := c.Now().Add(d)
-	for f := c.TakeDue(end); f != nil; f = c.TakeDue(end) {
-		f()
+// checkDamping records the first verdict and enough transitions to start a hold.
+func checkDamping(t *testing.T, h *harness, key string, firstFails bool, n int) {
+	t.Helper()
+	synctest.Wait()
+	for i := 1; i <= n; i++ {
+		forceDampingCheck(t, h, key, firstFails != (i%2 != 0))
 	}
 }
 
-type damped struct {
-	key string
-	h   upstream.Health
+func forceDampingCheck(t *testing.T, h *harness, key string, fail bool) {
+	t.Helper()
+	h.sw.set(key, fail)
+	if !h.c.CheckNow(key) {
+		t.Fatalf("target %q is not checkable", key)
+	}
+	synctest.Wait()
 }
 
-func newTestDamper(c upstream.Clock, cfg DampConfig, got *[]damped) *Damper[string, upstream.Health] {
-	return NewDamper(c, cfg, func(k string, h upstream.Health) { *got = append(*got, damped{k, h}) })
+func dampingOptions() Options {
+	return Options{Interval: time.Hour, Rise: 1, Fall: 1}
 }
 
-func TestDamperFlips(t *testing.T) {
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{}, &got)
-	defer d.Close()
-	d.Offer("a", up, up)
-	d.Offer("a", up, up) // no change
-	for range 3 {
-		d.Offer("a", down, down)
-		d.Offer("a", up, up)
-	}
-	// The first value, then three changes pass; the fourth suppresses.
-	if len(got) != 4 {
-		t.Fatalf("reports %v", got)
-	}
-	d.Offer("a", down, down)
-	if len(got) != 4 {
-		t.Fatalf("passed while suppressed: %v", got)
-	}
-	clk.Advance(30*time.Second - 1)
-	if len(got) != 4 {
-		t.Fatalf("released early: %v", got)
-	}
-	clk.Advance(1)
-	if len(got) != 5 || got[4].h != down {
-		t.Fatalf("release: %v", got)
-	}
+func TestDampingPublishesLatestObservation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var changes []Report[string]
+		h := newHarness(t, Config[string]{
+			Options: dampingOptions(),
+			Damping: DampConfig{Enabled: true},
+			OnChange: func(r Report[string]) {
+				changes = append(changes, r)
+			},
+		})
+		generation := h.c.Put("a", h.sw.target("a"))
+		synctest.Wait()
+		forceDampingCheck(t, h, "a", false) // duplicate health
+		checkDamping(t, h, "a", false, 6)
+		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up, down}) {
+			t.Fatalf("transitions during hold: %v", got)
+		}
+		if len(changes) != 4 || h.rep.len() != 5 {
+			t.Fatalf("reports during hold: OnChange=%d OnResult=%d", len(changes), h.rep.len())
+		}
+		if timers := h.clk.Pending(); timers != 1 {
+			t.Fatalf("hold and next check use %d timers, want 1", timers)
+		}
+		h.clk.Advance(29 * time.Second)
+		synctest.Wait()
+		latest := h.clk.Now()
+		forceDampingCheck(t, h, "a", true) // latest verdict equals the last published one
+		if s, _ := h.c.Status("a"); s.Health != down || s.Checks != 9 || !s.Last.Time.Before(latest) {
+			t.Fatalf("status during hold: %+v", s)
+		}
+		if len(changes) != 4 || h.rep.len() != 5 {
+			t.Fatal("released before the deadline")
+		}
+		h.tick(1)
+		if len(changes) != 5 || h.rep.len() != 6 {
+			t.Fatalf("release: OnChange=%d OnResult=%d", len(changes), h.rep.len())
+		}
+		r := changes[4]
+		if !r.DampingReleased || r.Changed() || r.Health != down || r.Generation != generation ||
+			!r.Time.Equal(latest) || !r.FinishedAt.Equal(latest) || r.Reason != ReasonOther || !errors.Is(r.Err, errDown) {
+			t.Fatalf("release did not publish the latest observation: %+v", r)
+		}
+		if s, _ := h.c.Status("a"); s.Health != down || !s.Last.Time.Equal(latest) {
+			t.Fatalf("status after release: %+v", s)
+		}
+	})
 }
 
-func TestDamperReleaseRepeatsReported(t *testing.T) {
-	// The latest value of a suppression is passed even when it equals the
-	// last one passed.
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1}, &got)
-	defer d.Close()
-	d.Offer("a", up, up)
-	d.Offer("a", down, down)
-	d.Offer("a", up, up) // second change within the window: suppressed
-	d.Offer("a", down, down)
-	d.Offer("a", up, up)
-	if len(got) != 2 {
-		t.Fatalf("reports %v", got)
+func TestDampingSlidingWindow(t *testing.T) {
+	cfg := (DampConfig{Enabled: true}).withDefaults()
+	now := time.Time{}
+	var d damping
+	for _, elapsed := range []time.Duration{0, time.Second, 2 * time.Second, cfg.Window + time.Second} {
+		if d.holdChange(now.Add(elapsed), cfg) {
+			t.Fatalf("early hold after %v", elapsed)
+		}
 	}
-	clk.Advance(30 * time.Second)
-	if len(got) != 3 || got[2].h != up {
-		t.Fatalf("release: %v", got)
-	}
-}
-
-func TestDamperDelayedRelease(t *testing.T) {
-	const base = 10 * time.Second
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1, Base: base}, &got)
-	defer d.Close()
-
-	d.Offer("a", up, up)
-	d.Offer("a", down, down)
-	d.Offer("a", up, up) // starts the first suppression
-	release := clk.TakeDue(clk.Now().Add(base))
-	if release == nil {
-		t.Fatal("first suppression did not schedule a release")
-	}
-
-	d.Offer("a", up, up)     // passes after the first suppression expires
-	d.Offer("a", down, down) // starts the second suppression
-	want := []damped{{"a", up}, {"a", down}, {"a", up}}
-	if !slices.Equal(got, want) {
-		t.Fatalf("before delayed release: got %v, want %v", got, want)
-	}
-	release()
-	if !slices.Equal(got, want) {
-		t.Fatalf("old timer released the second suppression: got %v, want %v", got, want)
-	}
-
-	clk.Advance(2*base - time.Second)
-	if !slices.Equal(got, want) {
-		t.Fatalf("before second deadline: got %v, want %v", got, want)
-	}
-	clk.Advance(time.Second)
-	want = append(want, damped{"a", down})
-	if !slices.Equal(got, want) {
-		t.Fatalf("at second deadline: got %v, want %v", got, want)
+	// The oldest change fell out of the window; a change exactly one
+	// window ago still counts.
+	if !d.holdChange(now.Add(cfg.Window+time.Second), cfg) {
+		t.Fatal("four changes inside the sliding window did not start a hold")
 	}
 }
 
-func TestDamperHoldDoublesAndDecays(t *testing.T) {
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1, Window: time.Minute, Base: 10 * time.Second, Max: 40 * time.Second}, &got)
-	defer d.Close()
-	flap := func() { // two changes: the second suppresses
-		d.Offer("a", upstream.HealthDown, upstream.HealthDown)
-		d.Offer("a", upstream.HealthUp, upstream.HealthUp)
-		d.Offer("a", upstream.HealthDown, upstream.HealthDown)
-	}
-	d.Offer("a", upstream.HealthUp, upstream.HealthUp)
-	hold := func() time.Duration {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		return d.keys["a"].hold
-	}
-	flap()
-	if hold() != 10*time.Second {
-		t.Fatalf("hold %v", hold())
-	}
-	clk.Advance(10 * time.Second) // released: reported down
-	d.Offer("a", upstream.HealthUp, upstream.HealthUp)
-	d.Offer("a", upstream.HealthDown, upstream.HealthDown)
-	if hold() != 20*time.Second {
-		t.Fatalf("hold %v", hold())
-	}
-	clk.Advance(20 * time.Second)
-	d.Offer("a", upstream.HealthUp, upstream.HealthUp)
-	d.Offer("a", upstream.HealthDown, upstream.HealthDown)
-	d.Offer("a", upstream.HealthUp, upstream.HealthUp)
-	if hold() != 40*time.Second {
-		t.Fatalf("hold %v", hold())
-	}
-	clk.Advance(40 * time.Second)
-	clk.Advance(3 * time.Minute)
-	d.Offer("a", upstream.HealthDown, upstream.HealthDown)
-	if hold() != 0 {
-		t.Fatalf("hold %v after quiet windows", hold())
-	}
-}
-
-func TestDamperForgetAndClose(t *testing.T) {
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1}, &got)
-	for _, h := range []upstream.Health{upstream.HealthUp, upstream.HealthDown, upstream.HealthUp, upstream.HealthDown} {
-		d.Offer("a", h, h)
-		d.Offer("b", h, h)
-	}
-	n := len(got)
-	d.Forget("a")
-	if d.Len() != 1 {
-		t.Fatalf("keys %d", d.Len())
-	}
-	clk.Advance(time.Hour)
-	if len(got) != n+1 || got[n].key != "b" {
-		t.Fatalf("forgotten key released: %v", got[n:])
-	}
-	d.Offer("a", upstream.HealthDown, upstream.HealthDown) // afresh: passes
-	if len(got) != n+2 {
-		t.Fatalf("afresh: %v", got[n:])
-	}
-	d.Close()
-	d.Offer("c", upstream.HealthUp, upstream.HealthUp)
-	if len(got) != n+2 || d.Len() != 0 {
-		t.Fatalf("after Close: %v", got[n:])
-	}
-	if clk.Pending() != 0 {
-		t.Fatalf("%d timers left", clk.Pending())
-	}
-}
-
-func TestDamperDelayedReleaseAfterForgetAndClose(t *testing.T) {
-	const base = 10 * time.Second
-	clk := newStepClock()
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1, Base: base}, &got)
-	defer d.Close()
-
-	takeRelease := func() func() {
+func TestDampingHoldDoublesCapsAndDecays(t *testing.T) {
+	cfg := (DampConfig{Enabled: true, Flips: 1}).withDefaults()
+	now := time.Time{}
+	var d damping
+	hold := func(want time.Duration) {
 		t.Helper()
-		d.Offer("a", up, up)
-		d.Offer("a", down, down)
-		d.Offer("a", up, up)
-		release := clk.TakeDue(clk.Now().Add(base))
-		if release == nil {
-			t.Fatal("suppression did not schedule a release")
+		if d.holdChange(now, cfg) || !d.holdChange(now, cfg) || d.until.Sub(now) != want {
+			t.Fatalf("hold = %v, want %v", d.until.Sub(now), want)
 		}
-		return release
+		now = d.until
 	}
-
-	forgotten := takeRelease()
-	d.Forget("a")
-	current := takeRelease()
-	want := []damped{{"a", up}, {"a", down}, {"a", up}, {"a", down}}
-	forgotten()
-	if !slices.Equal(got, want) {
-		t.Fatalf("delayed release after Forget: got %v, want %v", got, want)
+	for _, want := range []int{30, 60, 120, 240, 300, 300} {
+		hold(time.Duration(want) * time.Second)
 	}
+	now = now.Add(2 * cfg.Window)
+	hold(150 * time.Second)
+	now = now.Add(10 * cfg.Window)
+	hold(cfg.Base)
+}
 
-	d.Close()
-	current()
-	if !slices.Equal(got, want) {
-		t.Fatalf("delayed release after Close: got %v, want %v", got, want)
+func TestDampingRemovalDiscardsDequeuedRelease(t *testing.T) {
+	for name, remove := range map[string]func(*harness){
+		"remove":        func(h *harness) { h.c.Remove("a") },
+		"remove member": func(h *harness) { h.c.RemoveFromGroup("g", "a") },
+		"remove group":  func(h *harness) { h.c.RemoveGroup("g") },
+		"sync group":    func(h *harness) { h.c.SyncGroup("g", nil) },
+		"new address":   func(h *harness) { h.c.AddToGroup("g", "a", h.sw.target("replacement")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var removed []uint64
+				h := newHarness(t, Config[string]{
+					Options:  dampingOptions(),
+					Damping:  DampConfig{Enabled: true, Flips: 1},
+					OnRemove: func(_ string, gen uint64) { removed = append(removed, gen) },
+				})
+				old := h.c.AddToGroup("g", "a", h.sw.target("a"))
+				checkDamping(t, h, "a", false, 2)
+				release := h.clk.TakeDue(h.clk.Now().Add(30 * time.Second))
+				if release == nil {
+					t.Fatal("no timer for the hold")
+				}
+				remove(h)
+				next := h.c.AddToGroup("g", "a", h.sw.target("replacement"))
+				synctest.Wait()
+				release()
+				synctest.Wait()
+				if !slices.Equal(removed, []uint64{old}) || next == old {
+					t.Fatalf("removed %v, replaced generation %d with %d", removed, old, next)
+				}
+				s, _ := h.c.Status("a")
+				if s.Health != up || s.Generation != next || s.Checks != 1 {
+					t.Fatalf("replacement status: %+v", s)
+				}
+				for _, r := range h.rep.list {
+					if r.DampingReleased {
+						t.Fatalf("stale release after removal: %+v", r)
+					}
+				}
+				h.c.Close()
+				<-h.c.Done()
+				if h.clk.Pending() != 0 {
+					t.Fatal("closed checker kept a timer")
+				}
+			})
+		})
 	}
 }
 
-func TestDamperEmitSerialAndReentrant(t *testing.T) {
-	var (
-		mu      sync.Mutex
-		inside  int
-		maxIn   int
-		perKey  = map[int][]int{}
-		damper  *Damper[int, int]
-		started sync.WaitGroup
-	)
-	damper = NewDamper(nil, DampConfig{}, func(k, v int) {
-		mu.Lock()
-		inside++
-		maxIn = max(maxIn, inside)
-		perKey[k] = append(perKey[k], v)
-		mu.Unlock()
-		if k < 100 {
-			damper.Offer(k+100, upstream.HealthUp, 0) // from inside emit: queued, no deadlock
-		}
-		mu.Lock()
-		inside--
-		mu.Unlock()
-	})
-	defer damper.Close()
-	for g := range 8 {
-		started.Go(func() { damper.Offer(g, upstream.HealthUp, 0) })
-	}
-	started.Wait()
-	// Every goroutine's value is passed, once all deliveries have drained.
-	if len(perKey) != 16 {
-		t.Fatalf("keys %d", len(perKey))
-	}
-	if maxIn != 1 {
-		t.Fatalf("%d emits at once", maxIn)
-	}
-}
-
-// refDamper is the rule a Damper implements, written out on its own as the
-// reference for the randomized comparison: the one that already ran in a
-// client's health reports before it moved here.
-type refDamper struct {
-	clk     *stepClock
-	window  time.Duration
-	flips   int
-	base    time.Duration
-	maxHold time.Duration
-	st      map[string]*refState
-	emitted *[]damped
-}
-
-type refState struct {
-	flips    []time.Time
-	until    time.Time
-	hold     time.Duration
-	pending  *upstream.Health
-	reported upstream.Health // 0: none
-	timer    func() bool
-}
-
-// refStates are the health values the reference tells apart; 0 is "none".
-func (r *refDamper) offer(key string, h upstream.Health) {
-	d := r.st[key]
-	if d == nil {
-		d = &refState{}
-		r.st[key] = d
-	}
-	// Health values are 0..2 here; shift by one so that 0 means none.
-	s := h + 1
-	now := r.clk.Now()
-	for d.hold > 0 && now.Sub(d.until) >= r.window {
-		d.hold /= 2
-		d.until = d.until.Add(r.window)
-		if d.hold < r.base {
-			d.hold = 0
-		}
-	}
-	if d.reported == s && d.pending == nil {
-		return
-	}
-	if now.Before(d.until) {
-		p := s
-		d.pending = &p
-		return
-	}
-	if d.reported != 0 && d.reported != s {
-		d.flips = append(d.flips, now)
-		for len(d.flips) > 0 && now.Sub(d.flips[0]) > r.window {
-			d.flips = d.flips[1:]
-		}
-		if len(d.flips) > r.flips {
-			d.hold = min(max(d.hold*2, r.base), r.maxHold)
-			d.until = now.Add(d.hold)
-			p := s
-			d.pending = &p
-			d.flips = d.flips[:0]
-			d.timer = r.clk.AfterFunc(d.hold, func() { r.release(key) })
-			return
-		}
-	}
-	d.reported, d.pending = s, nil
-	*r.emitted = append(*r.emitted, damped{key, h})
-}
-
-func (r *refDamper) release(key string) {
-	d := r.st[key]
-	if d == nil || d.pending == nil {
-		return
-	}
-	s := *d.pending
-	d.pending, d.reported = nil, s
-	*r.emitted = append(*r.emitted, damped{key, s - 1})
-}
-
-func (r *refDamper) forget(key string) {
-	if d := r.st[key]; d != nil && d.timer != nil {
-		d.timer()
-	}
-	delete(r.st, key)
-}
-
-// TestDamperMatchesReference drives a Damper and the reference with the
-// same random sequences of offers, forgets and clock steps and compares
-// every value they pass.
-func TestDamperMatchesReference(t *testing.T) {
-	cfg := DampConfig{Window: time.Minute, Flips: 3, Base: 30 * time.Second, Max: 5 * time.Minute}
-	steps := []time.Duration{0, 0, time.Second, 5 * time.Second, 20 * time.Second, 30 * time.Second, time.Minute, 3 * time.Minute}
-	for seed := range 300 {
-		rng := rand.New(rand.NewSource(int64(seed)))
-		cl1, cl2 := newStepClock(), newStepClock()
-		var got, want []damped
-		d := newTestDamper(cl1, cfg, &got)
-		ref := &refDamper{clk: cl2, window: cfg.Window, flips: cfg.Flips, base: cfg.Base, maxHold: cfg.Max, st: map[string]*refState{}, emitted: &want}
-		keys := []string{"a", "b", "c"}
-		for i := range 400 {
-			k := keys[rng.Intn(len(keys))]
-			switch rng.Intn(10) {
-			case 0:
-				d.Forget(k)
-				ref.forget(k)
-			case 1, 2:
-				step := steps[rng.Intn(len(steps))]
-				cl1.Advance(step)
-				cl2.Advance(step)
-			default:
-				h := []upstream.Health{upstream.HealthUnknown, upstream.HealthUp, upstream.HealthDown}[rng.Intn(3)]
-				d.Offer(k, h, h)
-				ref.offer(k, h)
-			}
-			if !slices.Equal(got, want) {
-				t.Fatalf("seed %d step %d: passed %v, reference %v", seed, i, got, want)
-			}
-		}
-		d.Close()
-	}
-}
-
-func TestDamperRecoversDispatch(t *testing.T) {
-	delivered := 0
-	d := NewDamper(newStepClock(), DampConfig{}, func(_ string, _ int) {
-		delivered++
-		if delivered == 1 {
-			panic("emit")
+func TestDampingReleaseWhileProbeSlotsFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, Config[string]{Options: dampingOptions(), Damping: DampConfig{Enabled: true, Flips: 1}, Concurrency: 1})
+		h.c.Put("a", h.sw.target("a"))
+		checkDamping(t, h, "a", false, 2)
+		h.c.Put("slow", Target{
+			Options: Options{Timeout: time.Minute},
+			Probe: func(ctx context.Context, _ Target) (Observation, error) {
+				<-ctx.Done()
+				return Observation{}, ctx.Err()
+			},
+		})
+		h.c.Put("waiting", h.sw.target("waiting"))
+		synctest.Wait()
+		h.clk.Advance(30 * time.Second)
+		synctest.Wait()
+		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up}) || h.sw.count("waiting") != 0 {
+			t.Fatalf("target did not release while a probe owned the only slot: %v", got)
 		}
 	})
-	defer d.Close()
-	func() {
-		defer func() {
-			if recover() != "emit" {
-				t.Fatal("missing panic")
+}
+
+func TestDampingReconfiguration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := Config[string]{Options: dampingOptions(), Damping: DampConfig{Enabled: true, Flips: 1}}
+		h := newHarness(t, cfg)
+		cfg.OnResult = h.rep.add
+		h.c.Put("a", h.sw.target("a"))
+		checkDamping(t, h, "a", false, 2)
+
+		h.c.SetConfig(cfg)
+		synctest.Wait()
+		if h.rep.len() != 2 {
+			t.Fatal("an unchanged policy ended the hold")
+		}
+
+		cfg.Damping.Base = time.Minute
+		h.c.SetConfig(cfg)
+		synctest.Wait()
+		if h.rep.len() != 3 || !h.rep.list[2].DampingReleased || h.rep.list[2].Health != up {
+			t.Fatalf("policy change did not release the held observation: %+v", h.rep.list)
+		}
+
+		checkDamping(t, h, "a", false, 2)
+		cfg.Disabled = true
+		h.c.SetConfig(cfg)
+		synctest.Wait()
+		if s, _ := h.c.Status("a"); s.Health != unknown || s.Checking || h.clk.Pending() != 0 {
+			t.Fatalf("disabled target: status %+v, timers %d", s, h.clk.Pending())
+		}
+		if h.rep.len() != 5 || h.rep.list[4].DampingReleased {
+			t.Fatal("disabling published a held result or dropped the reset")
+		}
+
+		cfg.Disabled = false
+		h.c.SetConfig(cfg)
+		forceDampingCheck(t, h, "a", false)
+		if s, _ := h.c.Status("a"); s.Health != up {
+			t.Fatalf("target did not start afresh: %+v", s)
+		}
+	})
+}
+
+func TestDampingRespectsRiseAndFall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		o := dampingOptions()
+		o.Rise, o.Fall = 2, 2
+		h := newHarness(t, Config[string]{Options: o, Damping: DampConfig{Enabled: true, Flips: 1}})
+		h.c.Put("a", h.sw.target("a"))
+		synctest.Wait()
+		for _, fail := range []bool{true, false, true, true, false, false, true} {
+			forceDampingCheck(t, h, "a", fail)
+		}
+		// The held health reached Up after two passes; one subsequent
+		// failure cannot change it before release.
+		h.clk.Advance(30 * time.Second)
+		synctest.Wait()
+		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up}) {
+			t.Fatalf("transitions %v", got)
+		}
+	})
+}
+
+func TestDampingAttachReplaysEffectiveHealth(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, Config[string]{Options: dampingOptions(), Damping: DampConfig{Enabled: true, Flips: 1}})
+		target := func(b *upstream.Backend[string]) Target { return h.sw.target(b.Value()) }
+		p := newPool(t, upstream.Target[string]{ID: "a", Value: "a"})
+		mustAttach(t, h.c, "first", p, target)
+		checkDamping(t, h, "a", false, 2)
+		late := newPool(t, upstream.Target[string]{ID: "other", Value: "a"})
+		mustAttach(t, h.c, "late", late, target)
+		synctest.Wait()
+		if a, b := healthOf(t, p, "a"), healthOf(t, late, "other"); a != down || b != down {
+			t.Fatalf("verdicts during hold: first %v, late %v", a, b)
+		}
+		h.clk.Advance(30 * time.Second)
+		synctest.Wait()
+		if a, b := healthOf(t, p, "a"), healthOf(t, late, "other"); a != up || b != up {
+			t.Fatalf("released verdicts: first %v, late %v", a, b)
+		}
+		h.c.Close()
+		<-h.c.Done()
+		if a, b := healthOf(t, p, "a"), healthOf(t, late, "other"); a != unknown || b != unknown {
+			t.Fatalf("checker left its verdicts after close: first %v, late %v", a, b)
+		}
+	})
+}
+
+func TestDampingHoldEndsBeforeLaterCheckIsPublished(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, Config[string]{Options: dampingOptions(), Damping: DampConfig{Enabled: true, Flips: 1}})
+		base := h.sw.target("a")
+		blocked := make(chan struct{})
+		probe := base.Probe
+		base.Options.Timeout = time.Minute
+		base.Probe = func(ctx context.Context, target Target) (Observation, error) {
+			if h.sw.count("a") == 3 {
+				select {
+				case <-blocked:
+				case <-ctx.Done():
+					return Observation{}, ctx.Err()
+				}
 			}
-		}()
-		d.Offer("a", up, 1)
-	}()
-	d.Offer("a", down, 2)
-	if delivered != 2 {
-		t.Fatal("dispatch stopped")
-	}
+			return probe(ctx, target)
+		}
+		h.c.Put("a", base)
+		checkDamping(t, h, "a", false, 2)
+		started := h.clk.Now()
+		h.sw.set("a", true)
+		if !h.c.CheckNow("a") {
+			t.Fatal("could not start a probe during the hold")
+		}
+		synctest.Wait()
+		timer := h.clk.TakeDue(started.Add(30 * time.Second))
+		if timer == nil {
+			t.Fatal("missing release timer")
+		}
+		finished := h.clk.Now()
+		close(blocked)
+		synctest.Wait()
+		timer()
+		synctest.Wait()
+		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up, down}) {
+			t.Fatalf("transitions %v", got)
+		}
+		release, later := h.rep.list[2], h.rep.list[3]
+		if !release.DampingReleased || later.DampingReleased || !release.FinishedAt.Equal(started) ||
+			!later.Time.Equal(started) || !later.FinishedAt.Equal(finished) {
+			t.Fatalf("release %+v, later check %+v", release, later)
+		}
+	})
 }
 
-type reentrantDampClock struct {
-	*stepClock
-	inspect func()
-}
-
-func (c reentrantDampClock) Now() time.Time { c.inspect(); return c.stepClock.Now() }
-func (c reentrantDampClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.inspect()
-	stop := c.stepClock.AfterFunc(d, f)
-	return func() bool { c.inspect(); return stop() }
-}
-func TestReentrantDampClock(t *testing.T) {
-	var d *Damper[string, int]
-	clk := reentrantDampClock{newStepClock(), func() { d.Len() }}
-	d = NewDamper(clk, DampConfig{Flips: 1}, func(string, int) {})
-	d.Offer("a", up, 1)
-	d.Offer("a", down, 2)
-	d.Offer("a", up, 3)
-	d.Forget("a")
-	if clk.Pending() != 0 {
-		t.Fatal("timer left after Forget")
-	}
-
-	for _, key := range []string{"b", "c"} {
-		d.Offer(key, up, 1)
-		d.Offer(key, down, 2)
-		d.Offer(key, up, 3)
-	}
-	if n := clk.Pending(); n != 2 {
-		t.Fatalf("got %d timers before Close, want 2", n)
-	}
-	d.Close()
-	if n := clk.Pending(); n != 0 {
-		t.Fatalf("got %d timers after Close, want 0", n)
-	}
-}
-
-type offerClock struct {
-	*stepClock
-	afterRead func()
-}
-
-func (c *offerClock) Now() time.Time {
-	now := c.stepClock.Now()
-	if c.afterRead != nil {
-		c.afterRead()
-	}
-	return now
-}
-func TestDamperReleaseDuringOffer(t *testing.T) {
-	clk := &offerClock{stepClock: newStepClock()}
-	var got []damped
-	d := newTestDamper(clk, DampConfig{Flips: 1, Base: time.Second}, &got)
-	defer d.Close()
-	d.Offer("a", up, up)
-	d.Offer("a", down, down)
-	d.Offer("a", up, up)
-	clk.afterRead = func() { clk.Advance(time.Second) }
-	d.Offer("a", down, down)
-	if len(got) != 4 || got[3].h != down {
-		t.Fatalf("deliveries %v", got)
-	}
+func TestDampingReleasesInDeadlineOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var released []string
+		h := newHarness(t, Config[string]{
+			Options: dampingOptions(),
+			Damping: DampConfig{Enabled: true, Flips: 1, Base: 10 * time.Second},
+			OnChange: func(r Report[string]) {
+				if r.DampingReleased {
+					released = append(released, r.Key)
+				}
+			},
+		})
+		for _, key := range []string{"first", "removed", "last"} {
+			h.c.Put(key, h.sw.target(key))
+			checkDamping(t, h, key, false, 2)
+			h.tick(1)
+		}
+		h.c.Remove("removed")
+		if timers := h.clk.Pending(); timers != 1 {
+			t.Fatalf("%d scheduling timers for multiple holds, want 1", timers)
+		}
+		h.tick(8)
+		if !slices.Equal(released, []string{"first"}) {
+			t.Fatalf("releases after the middle deadline: %v", released)
+		}
+		h.tick(1)
+		if !slices.Equal(released, []string{"first", "last"}) {
+			t.Fatalf("releases after the last deadline: %v", released)
+		}
+		h.c.Close()
+		<-h.c.Done()
+		if h.clk.Pending() != 0 {
+			t.Fatal("checker left a timer after close")
+		}
+	})
 }

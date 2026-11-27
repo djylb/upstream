@@ -19,8 +19,8 @@ the state of every backend.
 - Passive health: ejection on consecutive failures or a failure rate, with
   exponential, capped backoff and half-open trials.
 - Active health: TCP connect checks by default, HTTP checks or any function on
-  request; rise/fall thresholds, jitter, bounded concurrency, latency
-  statistics and failure classification.
+  request; rise/fall thresholds, optional flap damping, jitter, bounded
+  concurrency, latency statistics and failure classification.
 - Retries on backends not tried yet, bounded by attempts and a retry budget;
   a dialer and an `http.RoundTripper` over a pool.
 - Runtime reconfiguration: balancer, passive health, retries, slow start and
@@ -31,7 +31,9 @@ the state of every backend.
   pool, the outlier detector for a single target, the health checker for any
   set of addresses.
 
-```
+## Install
+
+```sh
 go get github.com/djylb/upstream
 ```
 
@@ -409,11 +411,9 @@ once. Closing a pool, or calling the function `Attach` returns, ends its group.
 the context's error once it is done. An empty network and `tcp` are the same
 network, so pools that spell it differently share one check.
 
-A `Damper` limits how often changes are reported onward, for consumers that
-report a target's health to somewhere else: after more than `Flips` changes
-of a key within `Window`, reports for it are held back for `Base`, doubling
-up to `Max`, and the latest value is passed when the hold ends. Use it as the
-`OnChange` hook; it does not change any decision of the checker.
+Set `Config.Damping` on a watcher or its shared checker to keep flapping
+targets at their last published health during a hold. Pools take the
+released verdict at the end of the hold.
 
 ### Draining
 
@@ -457,7 +457,7 @@ once and stops when its last group lets go of it.
 checker := health.New[string, int](ctx, health.Config[string]{
 	Options: health.Options{Interval: 10 * time.Second, Timeout: 3 * time.Second},
 	OnChange: func(r health.Report[string]) {
-		report(r.Key, r.Health, r.Reason, r.Latency) // one call per transition
+		report(r.Key, r.Health, r.Reason, r.Latency)
 	},
 })
 defer checker.Close()
@@ -491,7 +491,7 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
 - **UDP** has no handshake to observe, so there is no generic UDP check. UDP
   targets without a `Probe` are not checked and stay `HealthUnknown`; give a
   `Probe` if you know the protocol.
-- **Results** carry the health before and after the check (`Changed` compares
+- **Results** carry the effective health before and after publication (`Changed` compares
   them), the latency and its statistics, the answering address and a
   `Reason` (`refused`, `timeout`,
   `unreachable` for unreachable or down hosts and networks and unusable local
@@ -523,10 +523,34 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
 - **Callbacks** run one at a time, in order, on a goroutine the checker owns,
   without locks held. They may call any method, `Close` included. A blocked
   callback holds back later callbacks but not checks; results that change
-  nothing are coalesced per target meanwhile.
+  nothing are coalesced per target meanwhile, with damping releases
+  delivered separately.
 
 `Config.Concurrency` bounds how many checks run at once; a hanging target holds
 one slot. Other checks wait if all slots are occupied.
+
+### Flap damping
+
+Set `Damping: health.DampConfig{Enabled: true}` in the checker's
+configuration. The zero configuration leaves damping off. The first
+verdict is immediate. After three changes in a sliding one-minute window,
+the next change starts a 30-second hold for that target. Further holds
+double up to five minutes. Each full quiet window after a hold halves its
+duration, until the duration falls below the base. Override these settings
+with `Window`, `Flips`, `Base` and `Max`.
+
+Probes and rise/fall thresholds continue during a hold. `Status.Health`
+and attached pools keep the last published verdict. `Status.Last` keeps
+the last published check, and counts and latency statistics include all
+completed checks. At the deadline, the latest held observation reaches
+both `OnResult` and `OnChange` with `DampingReleased` set. `Time` and
+`FinishedAt` record when that check started and ended. `Changed()` can
+be false if the target returned to its previous health.
+
+Removing or replacing a target discards its hold and history. Disabling
+its checks does the same and resets its health to `HealthUnknown`.
+Changing the damping policy with `SetConfig` publishes the held result
+for each target still checked and starts a fresh flap history.
 
 ## HTTP transports
 
@@ -540,7 +564,7 @@ a member's value, weight, priority, in-flight cap or cost changes.
 
 ## Concurrency and lifetimes
 
-- Create pools, checkers, dampers, detectors and transport caches with their constructors. A request and each lease have one owner. Use `Lease.Take` to hand a lease to another owner. Pool and checker methods support concurrent calls.
+- Create pools, checkers, detectors and transport caches with their constructors. A request and each lease have one owner. Use `Lease.Take` to hand a lease to another owner. Pool and checker methods support concurrent calls.
 - No lock is held while calling a balancer, a clock, a probe or a callback, so
   callbacks may call back into the pool or the checker.
 - No method waits for a probe or a callback, so none deadlocks when called
@@ -567,10 +591,10 @@ a member's value, weight, priority, in-flight cap or cost changes.
   reorders members. Under slow start a changed tier is built anew. In a
   tier split into cost bands, the bands whose members did not change keep
   their pickers, and a changed band is made again without a `Delta`.
-- The checker keeps its pending checks in one queue ordered by time behind a
-  single timer, so it holds one timer however many targets it has. It owns
-  that timer, one goroutine per running check and one goroutine for
-  callbacks. `Close` (or the end of its context) stops them and
+- The checker schedules pending checks and damping releases behind one
+  shared timer. Releases can run while all probe slots are in use. The
+  checker owns that timer, one goroutine per running check and one goroutine
+  for callbacks. `Close` (or the end of its context) stops them and
   returns at once; `Done` is closed, and `Wait` returns, once every one of them
   has ended. Waiting on `Done` from inside a probe or callback waits for
   itself.

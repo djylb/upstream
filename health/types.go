@@ -140,7 +140,8 @@ type Config[K comparable] struct {
 
 	// OnResult, if not nil, is called after every check, and when a
 	// target's health becomes upstream.HealthUnknown because its checks
-	// stopped or its network or address changed.
+	// stopped or its network or address changed. With damping enabled, a
+	// hold replaces its checks' reports with one report at release.
 	//
 	// All callbacks run one at a time, in the order of the events, on one
 	// goroutine the Checker owns, without any lock held. They may call any
@@ -154,11 +155,13 @@ type Config[K comparable] struct {
 	// consumers that buffer them can tell an old target from a new one under
 	// the same key. A callback that blocks holds back later callbacks but
 	// not checks; while it blocks, results that change nothing are
-	// coalesced per target, so only transitions accumulate.
+	// coalesced per target. Transitions and damping releases are delivered
+	// separately.
 	OnResult func(Report[K])
 
 	// OnChange is like OnResult but is called only for reports that
-	// change the health: one call per transition.
+	// change the health or release a damping hold. A release can repeat the
+	// prior health; Report.DampingReleased identifies it.
 	OnChange func(Report[K])
 
 	// OnRemove, if not nil, is called once for every generation of a
@@ -174,6 +177,11 @@ type Config[K comparable] struct {
 
 	// Options are the defaults for every target.
 	Options
+
+	// Damping optionally holds transitions for flapping targets. Changing
+	// these settings with SetConfig publishes the latest held verdict for
+	// each target still checked and resets its flap history.
+	Damping DampConfig
 
 	// Concurrency is the most checks that run at the same time; further
 	// checks wait for a free slot without their timeout running. A slow
@@ -231,13 +239,20 @@ const (
 type Result struct {
 	upstream.CheckResult
 
+	// FinishedAt is when the check completed on the Checker's clock. It
+	// remains the observation time if publication is delayed. It is zero
+	// for resets to upstream.HealthUnknown that came from a configuration
+	// change instead of a check.
+	FinishedAt time.Time
+
 	// Reason classifies Err.
 	Reason Reason
 
 	// Health is the target's health after this result. Before the first
 	// check it is upstream.HealthUnknown; the first check decides it at
 	// once; after that Rise or Fall consecutive results are needed to
-	// change it.
+	// change it. If damping holds a verdict, the effective health changes
+	// only when the hold is released.
 	Health upstream.Health
 
 	// Previous is the target's health before this result.
@@ -265,6 +280,12 @@ type Report[K comparable] struct {
 	// Generation identifies the target under its key: it is new every
 	// time the key is added, and when its address changes.
 	Generation uint64
+
+	// DampingReleased marks the latest observation published at the end of
+	// a hold. Time and FinishedAt retain the times of that check. Changed
+	// can be false if the target returned to its previous health during
+	// the hold.
+	DampingReleased bool
 }
 
 // LatencyStats summarizes the latencies of passing checks.
@@ -286,8 +307,8 @@ type LatencyStats struct {
 
 // Status is a snapshot of one target.
 type Status[K comparable] struct {
-	// Last is the latest check result; its Time is zero before the first
-	// check.
+	// Last is the latest published check result; its Time is zero before
+	// the first check.
 	Last Result
 
 	// Stats summarizes the latencies of the passing checks.

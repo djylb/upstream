@@ -8,8 +8,8 @@
 // group lets go of it. Groups can be synchronized with a full list in one
 // call, which suits configuration pushed from elsewhere.
 //
-// A Damper, placed after the Checker's OnChange hook, limits how often a
-// key that flaps between up and down is reported onward.
+// Config.Damping optionally holds the verdict of a target that flaps between
+// up and down. Each hold publishes its latest observation at release.
 //
 // By default, a target is checked by connecting over TCP and closing the
 // connection at once, without sending any data. Other checks, such as the

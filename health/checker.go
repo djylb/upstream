@@ -31,9 +31,9 @@ import (
 // been removed and added, keeping its owners; an empty network and "tcp"
 // are the same network.
 //
-// The pending checks wait in one queue ordered by time, behind a single
-// Clock timer for the earliest, so scheduling costs O(log n) and the
-// Checker holds one timer however many targets it has. Every check runs
+// Pending checks and damping releases wait in time order behind a shared
+// Clock timer, so scheduling costs O(log n) and the Checker holds one
+// scheduling timer however many targets it has. Every check runs
 // in its own goroutine, which exists only while the check runs.
 // Config.Concurrency bounds how many run at once. When all slots are
 // occupied, due checks stay queued. Callbacks run on one
@@ -65,37 +65,31 @@ type Checker[K, G comparable] struct {
 	running int                  // checker goroutines and attachment target calls; guarded by mu
 	nextGen uint64               // guarded by mu
 
-	// The schedule, guarded by mu: entries waiting for their check, in a
-	// min-heap by due time, and the one timer armed for the earliest.
-	sched   []slot[K, G]
-	armAt   time.Time   // when the armed timer fires
-	armStop func() bool // stops the armed timer; nil while it is being made
-	armSeq  uint64      // identifies the armed timer
-	armed   bool        // a timer is armed or being made
+	// The schedules share one timer for the earliest eligible deadline.
+	sched    schedule[K, G] // checks
+	releases schedule[K, G] // damping releases
+	armAt    time.Time      // when the armed timer fires
+	armStop  func() bool    // stops the armed timer; nil while it is being made
+	armSeq   uint64         // identifies the armed timer
+	armed    bool           // a timer is armed or being made
 
 	closed bool // guarded by mu
 	ended  bool // done is closed; guarded by mu
 }
 
-// A slot is an entry waiting in the schedule, with its due time beside it
-// so that ordering the heap reads no entry.
-type slot[K, G comparable] struct {
-	due time.Time
-	e   *entry[K, G]
-}
-
 // entry is the state of one generation of a key. All fields are guarded
 // by the Checker's mutex.
 type entry[K, G comparable] struct {
-	last       Result
 	lastEnd    time.Time
 	touched    time.Time // the latest Touch while the target was up
-	target     Target
-	lat        latencyWindow
+	key        K
+	damp       *damping
 	cancel     context.CancelFunc // check in progress
 	groups     map[G]struct{}
 	queued     *delivery[K, G] // a queued report that changes nothing, which a newer one replaces
-	key        K
+	last       Result
+	lat        latencyWindow
+	target     Target
 	generation uint64
 	timer      uint64 // identifies the scheduled check
 	slot       int    // 1 + index in the Checker's schedule; 0 if not scheduled
@@ -118,11 +112,11 @@ type sink[K comparable] struct {
 
 // A delivery is a queued callback: a report, or the removal of e.
 type delivery[K, G comparable] struct {
-	rep     Report[K]
 	e       *entry[K, G]
-	removed bool
-	stamp   bool            // timestamp an address change outside the checker lock
 	replay  func(Report[K]) // deliver current state only to the joining member
+	rep     Report[K]
+	removed bool
+	stamp   bool // timestamp an address change outside the checker lock
 }
 
 // New returns a Checker that runs until ctx is done or Close is called.
@@ -203,6 +197,7 @@ func (c *Checker[K, G]) endLocked() {
 }
 
 func (c *Checker[K, G]) setConfigLocked(cfg Config[K]) {
+	cfg.Damping = cfg.Damping.withDefaults()
 	c.cfg = cfg
 	o := cfg.TCP
 	o.Clock = c.clock
@@ -217,11 +212,19 @@ func (c *Checker[K, G]) SetConfig(cfg Config[K]) {
 		c.mu.Unlock()
 		return
 	}
+	oldDamping := c.cfg.Damping
 	c.setConfigLocked(cfg)
 	var w work[K, G]
 	for _, e := range c.entries {
+		if oldDamping != c.cfg.Damping {
+			if e.damp != nil && e.damp.slot != 0 {
+				c.releaseDampingLocked(e)
+			}
+			c.clearDampingLocked(e)
+		}
 		w.schedule = append(w.schedule, e)
 	}
+	c.stopIdleTimerLocked(&w)
 	c.mu.Unlock()
 	c.finish(&w)
 }
@@ -260,12 +263,13 @@ func (c *Checker[K, G]) enqueueLocked(d *delivery[K, G]) {
 		// Later observations must stay on their side of the replay.
 		d.e.queued = nil
 	} else if !d.removed {
-		if !d.rep.Changed() && d.e.queued != nil {
+		edge := d.rep.Changed() || d.rep.DampingReleased
+		if !edge && d.e.queued != nil {
 			d.e.queued.rep = d.rep
 			return
 		}
 		d.e.queued = nil
-		if !d.rep.Changed() {
+		if !edge {
 			d.e.queued = d
 		}
 	}
@@ -325,7 +329,7 @@ func (c *Checker[K, G]) dispatch() {
 		if onResult != nil && c.admit(d.e, false) {
 			onResult(rep)
 		}
-		if rep.Changed() && onChange != nil && c.admit(d.e, false) {
+		if (rep.Changed() || rep.DampingReleased) && onChange != nil && c.admit(d.e, false) {
 			onChange(rep)
 		}
 		for _, s := range sinks {
@@ -411,7 +415,9 @@ func (c *Checker[K, G]) dropLocked(e *entry[K, G], w *work[K, G], unlink bool) {
 		}
 		c.enqueueLocked(&delivery[K, G]{e: e, removed: true})
 	}
-	c.unscheduleLocked(e, w)
+	c.sched.remove(e.slot)
+	c.clearDampingLocked(e)
+	c.stopIdleTimerLocked(w)
 	if e.cancel != nil {
 		w.cancels = append(w.cancels, e.cancel)
 		e.cancel = nil
@@ -789,194 +795,6 @@ func (c *Checker[K, G]) checkableLocked(e *entry[K, G]) bool {
 	return !c.optionsLocked(e).Disabled && c.probeLocked(e.target) != nil
 }
 
-// schedule arranges the next check of e, replacing any pending one, or,
-// if e is not to be checked, unschedules it and forgets its health. While
-// a check of e runs, schedule only cancels it if e should no longer be
-// checked; the check schedules e again when it ends.
-//
-// pending counts the armed timer from when it is decided until either it
-// fires or a stop cancels it. The clock is called without the lock; the
-// timer number catches a Remove, Close or newer schedule that runs in
-// between.
-func (c *Checker[K, G]) schedule(e *entry[K, G]) {
-	now := c.clock.Now()
-	c.mu.Lock()
-	if c.closed || e.gone || e.running {
-		var cancel context.CancelFunc
-		if e.cancel != nil && !c.closed && !e.gone && !c.checkableLocked(e) {
-			cancel, e.cancel = e.cancel, nil
-		}
-		c.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		return
-	}
-	var w work[K, G]
-	c.unscheduleLocked(e, &w)
-	e.timer++
-	if !c.checkableLocked(e) {
-		if e.health != upstream.HealthUnknown {
-			prev := e.health
-			e.health, e.ok, e.fail = upstream.HealthUnknown, 0, 0
-			c.reportLocked(e, Result{CheckResult: upstream.CheckResult{Time: now}, Health: upstream.HealthUnknown, Previous: prev}, false)
-		}
-		c.mu.Unlock()
-		c.finish(&w)
-		return
-	}
-	e.slot = len(c.sched) + 1
-	c.sched = append(c.sched, slot[K, G]{due: now.Add(c.delayLocked(e, now)), e: e})
-	c.up(e.slot - 1)
-	a := c.armLocked(now)
-	c.mu.Unlock()
-	c.finish(&w)
-	c.arm(a)
-}
-
-// unscheduleLocked takes e out of the schedule, and has w stop the timer
-// if nothing is left to wait for.
-func (c *Checker[K, G]) unscheduleLocked(e *entry[K, G], w *work[K, G]) {
-	if e.slot == 0 {
-		return
-	}
-	i := e.slot - 1
-	last := len(c.sched) - 1
-	c.swap(i, last)
-	c.sched[last] = slot[K, G]{}
-	c.sched = c.sched[:last]
-	e.slot = 0
-	if i < last {
-		c.down(i)
-		c.up(i)
-	}
-	if len(c.sched) == 0 && c.armed {
-		if c.armStop != nil {
-			w.stops = append(w.stops, c.armStop)
-		}
-		c.armStop, c.armed = nil, false
-		c.armSeq++
-	}
-}
-
-func (c *Checker[K, G]) less(i, j int) bool { return c.sched[i].due.Before(c.sched[j].due) }
-
-func (c *Checker[K, G]) swap(i, j int) {
-	c.sched[i], c.sched[j] = c.sched[j], c.sched[i]
-	c.sched[i].e.slot, c.sched[j].e.slot = i+1, j+1
-}
-
-func (c *Checker[K, G]) up(i int) {
-	for i > 0 {
-		parent := (i - 1) / 2
-		if !c.less(i, parent) {
-			return
-		}
-		c.swap(i, parent)
-		i = parent
-	}
-}
-
-func (c *Checker[K, G]) down(i int) {
-	n := len(c.sched)
-	for {
-		l := 2*i + 1
-		if l >= n {
-			return
-		}
-		m := l
-		if r := l + 1; r < n && c.less(r, l) {
-			m = r
-		}
-		if !c.less(m, i) {
-			return
-		}
-		c.swap(i, m)
-		i = m
-	}
-}
-
-// An arming is a change to the schedule's timer, decided under the mutex
-// and made by arm without it.
-type arming struct {
-	stop  func() bool // the timer to stop, if any
-	d     time.Duration
-	seq   uint64
-	start bool // make a new timer for d
-}
-
-// armLocked decides whether the timer must move so that it fires by the
-// earliest due check. A timer that fires earlier stays: when it fires, it
-// starts what is due and arms again.
-func (c *Checker[K, G]) armLocked(now time.Time) arming {
-	if len(c.sched) == 0 || c.closed || c.active == c.limit {
-		return arming{}
-	}
-	due := c.sched[0].due
-	if c.armed && !due.Before(c.armAt) {
-		return arming{}
-	}
-	a := arming{stop: c.armStop, d: max(due.Sub(now), 0), start: true}
-	c.armSeq++
-	a.seq = c.armSeq
-	c.armAt, c.armStop, c.armed = due, nil, true
-	c.pending++
-	return a
-}
-
-// arm carries out a.
-func (c *Checker[K, G]) arm(a arming) {
-	if a.stop != nil && a.stop() {
-		c.unannounce()
-	}
-	if !a.start {
-		return
-	}
-	stop := c.clock.AfterFunc(a.d, func() { c.fire(a.seq) })
-	c.mu.Lock()
-	if c.closed || c.armSeq != a.seq {
-		c.mu.Unlock()
-		if stop() {
-			c.unannounce()
-		}
-		return
-	}
-	c.armStop = stop
-	c.mu.Unlock()
-}
-
-// fire starts the checks that are due and arms the timer for the next.
-func (c *Checker[K, G]) fire(seq uint64) {
-	c.enter()
-	defer c.leave()
-	now := c.clock.Now()
-	c.mu.Lock()
-	if c.armSeq == seq {
-		c.armStop, c.armed = nil, false
-	}
-	c.startDueLocked(now)
-}
-
-// startDueLocked fills free probe slots and releases mu before arming the timer.
-func (c *Checker[K, G]) startDueLocked(now time.Time) {
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	var w work[K, G]
-	for c.active < c.limit && len(c.sched) > 0 && !c.sched[0].due.After(now) {
-		c.active++
-		e := c.sched[0].e
-		c.unscheduleLocked(e, &w)
-		c.pending++
-		go c.run(e, e.timer)
-	}
-	a := c.armLocked(now)
-	c.mu.Unlock()
-	c.finish(&w)
-	c.arm(a)
-}
-
 func (c *Checker[K, G]) delayLocked(e *entry[K, G], now time.Time) time.Duration {
 	if e.checks == 0 || e.now {
 		return 0
@@ -1038,41 +856,35 @@ func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 	e.cancel = cancel
 	c.mu.Unlock()
 
-	r, end, ok := c.check(ctx, e, probe, t, o)
+	r, ok := c.check(ctx, e, probe, t, o)
 	canceled := ctx.Err() != nil // by Remove, an address change, disabling or Close
 	cancel()
 
 	c.mu.Lock()
 	e.cancel = nil
 	e.running = false
-	if ok && !canceled && !c.closed && !e.gone && c.checkableLocked(e) {
+	if ok && !canceled && !c.closed && !e.gone && e.timer == timer && c.checkableLocked(e) {
 		e.checks++
 		if r.Err != nil {
 			e.failures++
-		} else {
-			e.lat.add(r.Latency, c.window)
 		}
-		r.Previous = e.health
-		r.Health = e.observe(r.Err == nil, o.Rise, o.Fall)
-		e.last = r
-		e.lastEnd = end
-		c.enqueueLocked(&delivery[K, G]{rep: Report[K]{Result: r, Stats: e.lat.stats(), Target: t, Key: e.key, Generation: e.generation}, e: e})
+		e.lastEnd = r.FinishedAt
+		c.observeLocked(e, t, r, o)
 	}
 	c.mu.Unlock()
 	c.schedule(e)
 }
 
-// check runs one probe under the concurrency bound and returns its result
-// and when it ended. ok is false if ctx ended first. The timeout starts
-// once a slot is free.
-func (c *Checker[K, G]) check(ctx context.Context, e *entry[K, G], probe Probe, t Target, o Options) (r Result, end time.Time, ok bool) {
+// check runs one probe under the concurrency bound. ok is false if ctx
+// ended first. The timeout starts once a slot is free.
+func (c *Checker[K, G]) check(ctx context.Context, e *entry[K, G], probe Probe, t Target, o Options) (r Result, ok bool) {
 	start := c.clock.Now()
 	pctx, cancel := c.clock.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	var obs Observation
 	err := pctx.Err()
 	if ctx.Err() != nil || !c.admit(e, true) {
-		return r, end, false
+		return r, false
 	}
 	if err == nil {
 		obs, err = probe(pctx, t)
@@ -1084,32 +896,32 @@ func (c *Checker[K, G]) check(ctx context.Context, e *entry[K, G], probe Probe, 
 			err = errors.Join(context.DeadlineExceeded, err)
 		}
 	}
-	elapsed := c.clock.Now().Sub(start)
+	end := c.clock.Now()
 	if obs.Latency <= 0 {
-		obs.Latency = elapsed
+		obs.Latency = end.Sub(start)
 	}
 	cr := upstream.CheckResult{Time: start, Err: err, Addr: obs.Addr, Latency: obs.Latency}
-	return Result{CheckResult: cr, Reason: reason}, start.Add(elapsed), true
+	return Result{CheckResult: cr, FinishedAt: end, Reason: reason}, true
 }
 
 // observe applies one result to the rise and fall counters. Health changes
 // only when a run of results reaches its threshold while the target is in
 // the opposite state, so a long run of failures changes it once.
-func (e *entry[K, G]) observe(pass bool, rise, fall int) upstream.Health {
+func (e *entry[K, G]) observe(h upstream.Health, pass bool, rise, fall int) upstream.Health {
 	if pass {
 		e.fail = 0
 		e.ok++
-		if e.health == upstream.HealthUnknown || (e.health == upstream.HealthDown && e.ok >= rise) {
-			e.health = upstream.HealthUp
+		if h == upstream.HealthUnknown || (h == upstream.HealthDown && e.ok >= rise) {
+			h = upstream.HealthUp
 		}
 	} else {
 		e.ok = 0
 		e.fail++
-		if e.health == upstream.HealthUnknown || (e.health == upstream.HealthUp && e.fail >= fall) {
-			e.health = upstream.HealthDown
+		if h == upstream.HealthUnknown || (h == upstream.HealthUp && e.fail >= fall) {
+			h = upstream.HealthDown
 		}
 	}
-	return e.health
+	return h
 }
 
 // latencyWindow keeps the latency statistics of one target.

@@ -1,33 +1,37 @@
 package health
 
 import (
-	"slices"
-	"sync"
 	"time"
 
 	"github.com/djylb/upstream"
 )
 
-// DampConfig configures a Damper. Zero fields take their defaults.
+// DampConfig controls flap damping for a Checker's targets. The zero value
+// leaves damping off.
 type DampConfig struct {
-	// Window is the period over which changes are counted. The default is
-	// one minute.
+	// Enabled turns on damping. Non-positive settings below take their defaults.
+	Enabled bool
+
+	// Window is the sliding period over which changes are counted.
+	// The default is one minute.
 	Window time.Duration
 
-	// Flips is the number of changes within Window that are still
-	// reported; one more suppresses the key. The default is 3.
+	// Flips is the number of changes allowed in Window before the next
+	// change starts a hold. The default is 3.
 	Flips int
 
-	// Base is the first suppression time. The default is 30s.
+	// Base is the length of the first hold. The default is 30 seconds.
 	Base time.Duration
 
-	// Max is the longest suppression time. Each suppression that follows
-	// another within a Window doubles the time, up to Max. The default is
-	// 5 minutes, and never less than Base.
+	// Max is the longest hold. The default is five minutes, and it is
+	// always at least Base.
 	Max time.Duration
 }
 
 func (c DampConfig) withDefaults() DampConfig {
+	if !c.Enabled {
+		return DampConfig{}
+	}
 	if c.Window <= 0 {
 		c.Window = time.Minute
 	}
@@ -44,227 +48,102 @@ func (c DampConfig) withDefaults() DampConfig {
 	return c
 }
 
-// A Damper limits how often the health of keys is reported, so that a key
-// that keeps changing between up and down does not flood its consumer. The
-// Checker's Rise and Fall decide when a target's health changes; a Damper
-// sits after that, on the stream of what is to be reported, and does not
-// change any decision.
-//
-// A key's value is passed to emit when its health differs from the last
-// one passed, until the key has changed more than Flips times within
-// Window. Then reports for the key are held back for Base, and each
-// further suppression doubles the time, up to Max; the latest value offered is passed
-// when a suppression ends, even if it equals the one passed before. The
-// time of a key that stays quiet is halved for every Window after its
-// last suppression ended, and gone below Base. The first value offered for
-// a key is always passed.
-//
-// A Damper is for use as the OnResult or OnChange hook of a Checker, which
-// delivers reports one at a time, and is safe for concurrent use anyway.
-type Damper[K comparable, V any] struct {
-	cfg   DampConfig
-	clock upstream.Clock
-	emit  func(K, V)
-
-	mu       sync.Mutex
-	keys     map[K]*dampKey[K, V]
-	queue    []dampOut[K, V]
-	draining bool
-	closed   bool
+// damping is the flap history of one entry. A scheduled release holds the
+// latest observation, including the health judged by the rise/fall counters.
+type damping struct {
+	until  time.Time
+	flips  []time.Time
+	latest Result
+	target Target
+	hold   time.Duration
+	slot   int // 1 + index in the release schedule, or 0 when not held
 }
 
-type dampOut[K comparable, V any] struct {
-	key K
-	val V
-}
-
-type dampKey[K comparable, V any] struct {
-	flips    []time.Time
-	until    time.Time
-	hold     time.Duration
-	val      V
-	pending  bool // val holds the latest value, held back; ph is its health
-	ph       upstream.Health
-	has      bool // a value has been passed: reported is valid
-	reported upstream.Health
-	round    uint64
-	timer    func() bool
-}
-
-// NewDamper returns a Damper that passes values to emit. A nil clock is
-// upstream.SystemClock. emit is called on one goroutine at a time, in the
-// order of the decisions, without any lock held; it may call any method of
-// the Damper.
-func NewDamper[K comparable, V any](clock upstream.Clock, cfg DampConfig, emit func(K, V)) *Damper[K, V] {
-	if clock == nil {
-		clock = upstream.SystemClock()
-	}
-	return &Damper[K, V]{cfg: cfg.withDefaults(), clock: clock, emit: emit, keys: map[K]*dampKey[K, V]{}}
-}
-
-// Offer gives the damper the latest health h of key and the value v that
-// reports it. It may pass v to emit now, hold it back, or drop it as a
-// repeat of what was passed last. Offer may return before the call to emit
-// it caused has been made, when another goroutine is inside emit.
-func (d *Damper[K, V]) Offer(key K, h upstream.Health, v V) {
-	now := d.clock.Now()
-	d.mu.Lock()
-	if d.closed {
-		d.mu.Unlock()
-		return
-	}
-	k := d.keys[key]
-	if k == nil {
-		k = &dampKey[K, V]{}
-		d.keys[key] = k
-	}
-	round := k.round
-	stop := k.timer
-	pass := d.decide(now, k, h, v)
-	if pass {
-		k.timer = nil
-		k.round++
-		if stop != nil {
-			defer stop()
-		}
-		d.enqueueLocked(key, v)
-		return
-	}
-	if round == k.round {
-		d.mu.Unlock()
-		return
-	}
-	round, hold := k.round, k.hold
-	k.timer = nil
-	d.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
-	stop = d.clock.AfterFunc(hold, func() { d.release(key, k, round) })
-	d.mu.Lock()
-	if !d.closed && d.keys[key] == k && k.round == round && k.pending {
-		k.timer = stop
-		stop = nil
-	}
-	d.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
-}
-
-func (d *Damper[K, V]) decide(now time.Time, k *dampKey[K, V], h upstream.Health, v V) bool {
-	for k.hold > 0 && now.Sub(k.until) >= d.cfg.Window {
-		k.hold /= 2
-		k.until = k.until.Add(d.cfg.Window)
-		if k.hold < d.cfg.Base {
-			k.hold = 0
+// holdChange records a change from the effective health and returns whether
+// it starts a hold. It runs only when there is no release outstanding.
+func (d *damping) holdChange(now time.Time, cfg DampConfig) bool {
+	for d.hold > 0 && now.Sub(d.until) >= cfg.Window {
+		d.hold /= 2
+		d.until = d.until.Add(cfg.Window)
+		if d.hold < cfg.Base {
+			d.hold = 0
 		}
 	}
-	if k.has && k.reported == h && !k.pending {
+
+	expired := 0
+	for expired < len(d.flips) && now.Sub(d.flips[expired]) > cfg.Window {
+		expired++
+	}
+	if expired != 0 {
+		d.flips = append(d.flips[:0], d.flips[expired:]...)
+	}
+	if len(d.flips) < cfg.Flips {
+		d.flips = append(d.flips, now)
 		return false
 	}
-	if k.pending && now.Before(k.until) {
-		k.pending, k.ph, k.val = true, h, v
-		return false
-	}
-	if k.has && k.reported != h {
-		k.flips = append(k.flips, now)
-		for len(k.flips) > 0 && now.Sub(k.flips[0]) > d.cfg.Window {
-			k.flips = k.flips[1:]
-		}
-		if len(k.flips) > d.cfg.Flips {
-			k.hold = max(k.hold+min(k.hold, d.cfg.Max-k.hold), d.cfg.Base)
-			k.until = now.Add(k.hold)
-			k.pending, k.ph, k.val = true, h, v
-			k.flips = k.flips[:0]
-			k.round++
-			return false
-		}
-	}
-	k.has, k.reported, k.pending = true, h, false
-	var zero V
-	k.val = zero
+
+	d.hold = max(d.hold+min(d.hold, cfg.Max-d.hold), cfg.Base)
+	d.until = now.Add(d.hold)
+	d.flips = d.flips[:0]
 	return true
 }
 
-// release passes the latest value if the timer still owns the suppression.
-func (d *Damper[K, V]) release(key K, k *dampKey[K, V], round uint64) {
-	d.mu.Lock()
-	if d.closed || d.keys[key] != k || k.round != round || !k.pending {
-		d.mu.Unlock()
+// observeLocked feeds the result through thresholds and then damping. The
+// effective health stays at the last published verdict during a hold.
+func (c *Checker[K, G]) observeLocked(e *entry[K, G], t Target, r Result, o Options) {
+	d := e.damp
+	if d != nil && d.slot != 0 && !r.FinishedAt.Before(d.until) {
+		// A probe can finish before the timer goroutine processes a due
+		// release. Publish the held observation before judging this one.
+		c.releaseDampingLocked(e)
+	}
+	if r.Err == nil {
+		e.lat.add(r.Latency, c.window)
+	}
+	judged := e.health
+	if d != nil && d.slot != 0 {
+		judged = d.latest.Health
+	}
+	r.Health = e.observe(judged, r.Err == nil, o.Rise, o.Fall)
+	if d != nil && d.slot != 0 {
+		d.latest, d.target = r, t
 		return
 	}
-	v := k.val
-	k.reported, k.pending = k.ph, false
-	var zero V
-	k.val = zero
-	k.timer = nil
-	d.enqueueLocked(key, v)
-}
-
-// enqueueLocked queues a value for emit and, unless another goroutine is
-// delivering already, delivers the queue itself. It returns with d.mu
-// released.
-func (d *Damper[K, V]) enqueueLocked(key K, v V) {
-	d.queue = append(d.queue, dampOut[K, V]{key, v})
-	if d.draining {
-		d.mu.Unlock()
-		return
-	}
-	d.draining = true
-	defer func() {
-		if v := recover(); v != nil {
-			d.mu.Lock()
-			d.draining = false
-			d.mu.Unlock()
-			panic(v)
+	cfg := c.cfg.Damping
+	if cfg.Enabled && e.health != upstream.HealthUnknown && r.Health != e.health {
+		if d == nil {
+			d = new(damping)
+			e.damp = d
 		}
-	}()
-	for len(d.queue) > 0 {
-		o := d.queue[0]
-		d.queue[0] = dampOut[K, V]{}
-		d.queue = d.queue[1:]
-		d.mu.Unlock()
-		d.emit(o.key, o.val)
-		d.mu.Lock()
-	}
-	d.queue = nil
-	d.draining = false
-	d.mu.Unlock()
-}
-
-// Forget drops everything held for key: its flap history, a value held
-// back and the timer that would pass it. Once Forget returns, no call to
-// emit for key starts; one already running may finish, as with
-// time.Timer.Stop. The next Offer for key starts afresh.
-func (d *Damper[K, V]) Forget(key K) {
-	d.mu.Lock()
-	if k := d.keys[key]; k != nil && k.timer != nil {
-		defer k.timer()
-	}
-	defer d.mu.Unlock()
-	delete(d.keys, key)
-	d.queue = slices.DeleteFunc(d.queue, func(o dampOut[K, V]) bool { return o.key == key })
-}
-
-// Close forgets every key and makes Offer do nothing.
-func (d *Damper[K, V]) Close() {
-	d.mu.Lock()
-	d.closed = true
-	keys := d.keys
-	d.keys = nil
-	d.queue = nil
-	d.mu.Unlock()
-	for _, k := range keys {
-		if k.timer != nil {
-			k.timer()
+		if d.holdChange(r.FinishedAt, cfg) {
+			d.latest, d.target = r, t
+			c.releases.add(d.until, e, &d.slot)
+			return
 		}
 	}
+	c.publishLocked(e, t, r, false)
 }
 
-// Len returns the number of keys the damper holds state for.
-func (d *Damper[K, V]) Len() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.keys)
+func (c *Checker[K, G]) publishLocked(e *entry[K, G], t Target, r Result, released bool) {
+	r.Previous = e.health
+	e.health, e.last = r.Health, r
+	c.enqueueLocked(&delivery[K, G]{e: e, rep: Report[K]{
+		Result: r, Stats: e.lat.stats(), Target: t, Key: e.key, Generation: e.generation, DampingReleased: released,
+	}})
+}
+
+func (c *Checker[K, G]) releaseDampingLocked(e *entry[K, G]) {
+	d := e.damp
+	c.releases.remove(d.slot)
+	if c.checkableLocked(e) {
+		c.publishLocked(e, d.target, d.latest, true)
+	}
+	d.latest, d.target = Result{}, Target{}
+}
+
+func (c *Checker[K, G]) clearDampingLocked(e *entry[K, G]) {
+	if e.damp != nil {
+		c.releases.remove(e.damp.slot)
+		e.damp = nil
+	}
 }
