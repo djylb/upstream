@@ -24,11 +24,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         if: matrix.go == 'go.mod'
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version-file: go.mod
           cache: false
       - uses: actions/setup-go@v7
         if: matrix.go != 'go.mod'
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version: ${{ matrix.go }}
           cache: false
@@ -39,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version-file: go.mod
           cache: false
@@ -77,6 +83,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version-file: go.mod
           cache: false
@@ -89,6 +97,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version: stable
           cache: false
@@ -102,6 +112,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        # Both inputs are declared by the action at this ref.
+        #noinspection UndefinedParamsPresent
         with:
           go-version-file: go.mod
           cache: false

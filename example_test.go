@@ -110,9 +110,16 @@ func ExampleRequest_Do() {
 func ExampleLease_Report() {
 	pool := upstream.New[string](upstream.Config{Balancer: upstream.LeastConn()})
 	defer pool.Close()
-	_ = pool.Sync([]upstream.Target[string]{{ID: "relay", Value: "10.0.0.1:9000"}})
+	if err := pool.Sync([]upstream.Target[string]{{ID: "relay"}}); err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	lease, _ := pool.Pick()
+	lease, err := pool.Pick()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	// The connection is up: report the outcome now and keep the in-flight
 	// slot until the connection closes.
 	lease.Report(upstream.Success)
@@ -143,27 +150,47 @@ func ExampleParseBalancer() {
 func ExamplePool_PickKey() {
 	pool := upstream.New[string](upstream.Config{Balancer: upstream.ConsistentHash(upstream.HashConfig{})})
 	defer pool.Close()
-	_ = pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}, {ID: "c"}})
+	if err := pool.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}, {ID: "c"}}); err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	first, _ := pool.PickKey("198.51.100.7")
-	again, _ := pool.PickKey("198.51.100.7")
+	const key = "session"
+	first, err := pool.PickKey(key)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer first.Release(upstream.Success)
+	again, err := pool.PickKey(key)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer again.Release(upstream.Success)
 	fmt.Println("sticky:", first.Backend() == again.Backend())
-	first.Release(upstream.Success)
-	again.Release(upstream.Success)
 	// Output: sticky: true
 }
 
 func ExamplePool_Remove() {
 	pool := upstream.New[string](upstream.Config{})
 	defer pool.Close()
-	_ = pool.Sync([]upstream.Target[string]{{ID: "old"}, {ID: "new"}})
-
-	lease, _ := pool.PickKey("")
-	for lease.Backend().ID() != "old" {
-		lease.Release(upstream.Neutral)
-		lease, _ = pool.PickKey("")
+	if err := pool.Sync([]upstream.Target[string]{{ID: "old"}, {ID: "new"}}); err != nil {
+		fmt.Println(err)
+		return
 	}
-	drained, _ := pool.Remove("old")
+
+	lease, err := pool.Acquire("old")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	drained, ok := pool.Remove("old")
+	if !ok {
+		lease.Release(upstream.Neutral)
+		fmt.Println("backend already removed")
+		return
+	}
 	select {
 	case <-drained.Done():
 	default:
@@ -235,13 +262,21 @@ func ExampleTarget_priority() {
 	// down, and, with Overflow, when both are at their MaxInFlight.
 	pool := upstream.New[string](upstream.Config{Overflow: true})
 	defer pool.Close()
-	_ = pool.Sync([]upstream.Target[string]{
-		{ID: "primary-1", Value: "10.0.0.1:8080", MaxInFlight: 1},
-		{ID: "primary-2", Value: "10.0.0.2:8080", MaxInFlight: 1},
-		{ID: "backup", Value: "10.0.0.9:8080", Priority: 1},
-	})
+	if err := pool.Sync([]upstream.Target[string]{
+		{ID: "primary-1", MaxInFlight: 1},
+		{ID: "primary-2", MaxInFlight: 1},
+		{ID: "backup", Priority: 1},
+	}); err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	var leases []upstream.Lease[string]
+	defer func() {
+		for i := range leases {
+			leases[i].Release(upstream.Neutral)
+		}
+	}()
 	for range 3 {
 		l, err := pool.Pick()
 		if err != nil {
@@ -251,9 +286,6 @@ func ExampleTarget_priority() {
 		leases = append(leases, l)
 	}
 	fmt.Println("third pick:", leases[2].Backend().ID())
-	for i := range leases {
-		leases[i].Release(upstream.Success)
-	}
 	// Output:
 	// third pick: backup
 }

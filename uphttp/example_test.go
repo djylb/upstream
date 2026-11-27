@@ -2,11 +2,11 @@ package uphttp_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"time"
 
 	"github.com/djylb/upstream"
@@ -27,7 +27,7 @@ func ExampleProbe() {
 	// Use it as the Probe of a health.Target; the check runs only for
 	// targets that name it.
 	target := health.Target{
-		Address: strings.TrimPrefix(srv.URL, "http://"),
+		Address: srv.Listener.Addr().String(),
 		Probe: uphttp.Probe(uphttp.Check{
 			Path:       "/healthz",
 			Host:       "api.internal",
@@ -54,18 +54,25 @@ func ExampleTransportCache() {
 	}, uphttp.TransportCacheConfig{IdleTTL: 10 * time.Minute, MaxEntries: 1024})
 	defer cache.CloseIdleConnections()
 
-	// Drop a backend's connections when it leaves the pool.
+	// Drop a backend's connections when it leaves or changes.
 	defer pool.Subscribe(func(ev upstream.Event[string]) {
-		if ev.Kind == upstream.EventRemoved {
+		if ev.Kind == upstream.EventRemoved || ev.Kind == upstream.EventUpdated {
 			cache.Remove(ev.Backend.ID())
 		}
 	})()
 
-	_ = pool.Sync([]upstream.Target[string]{{ID: "a", Value: "10.0.0.1:80"}})
-	lease, _ := pool.Pick()
+	if err := pool.Sync([]upstream.Target[string]{{ID: "a"}}); err != nil {
+		fmt.Println(err)
+		return
+	}
+	lease, err := pool.Pick()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer lease.Release(upstream.Success)
 	t := cache.Get(lease.Backend().ID())
 	fmt.Println(t == cache.Get("a"))
-	lease.Release(upstream.Success)
 	// Output: true
 }
 
@@ -87,7 +94,10 @@ func ExampleRoundTripper() {
 		Retry:    upstream.RetryConfig{Attempts: 2, Budget: 0.2},
 	})
 	defer pool.Close()
-	_ = pool.Sync([]upstream.Target[string]{{ID: "web-1", Value: strings.TrimPrefix(backend.URL, "http://")}})
+	if err := pool.Sync([]upstream.Target[string]{{ID: "web-1", Value: backend.Listener.Addr().String()}}); err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	cache := uphttp.NewTransportCache(func(string) *http.Transport {
 		return &http.Transport{IdleConnTimeout: time.Minute}
@@ -109,8 +119,12 @@ func ExampleRoundTripper() {
 		fmt.Println(err)
 		return
 	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Println(string(body))
 	// Output: hello from shop.internal
 }

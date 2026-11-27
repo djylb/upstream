@@ -160,34 +160,42 @@ func TestLeastConn(t *testing.T) {
 	}
 }
 
-func ringOwners(b Balancer, c []Candidate, keys int) map[int]string {
+func hashOwners(b Balancer, c []Candidate, keys []uint64) []string {
 	p := b.Build(c)
-	m := make(map[int]string, keys)
-	for k := range keys {
-		m[k] = c[p.Pick(hashString(strconv.Itoa(k)), 0)].ID
+	owners := make([]string, len(keys))
+	for i, key := range keys {
+		owners[i] = c[p.Pick(key, 0)].ID
 	}
-	return m
+	return owners
 }
 
-func TestConsistentHashStability(t *testing.T) {
-	const keys = 20000
-	h := ConsistentHash(HashConfig{})
-	base := candidates(1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
-	before := ringOwners(h, base, keys)
-
-	// The ring does not depend on candidate order.
+func checkHashOrder(t *testing.T, b Balancer, base []Candidate, keys []uint64) []string {
+	t.Helper()
+	before := hashOwners(b, base, keys)
 	shuffled := slices.Clone(base)
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-	for k, id := range ringOwners(h, shuffled, keys) {
+	for k, id := range hashOwners(b, shuffled, keys) {
 		if before[k] != id {
 			t.Fatalf("key %d moved from %s to %s when candidates were reordered", k, before[k], id)
 		}
 	}
+	return before
+}
+
+func TestConsistentHashStability(t *testing.T) {
+	const count = 20000
+	keys := make([]uint64, count)
+	for i := range keys {
+		keys[i] = hashString(strconv.Itoa(i))
+	}
+	h := ConsistentHash(HashConfig{})
+	base := candidates(1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+	before := checkHashOrder(t, h, base, keys)
 
 	// Adding an 11th candidate moves only keys to it, about 1/11 of them.
 	added := append(slices.Clone(base), Candidate{InFlight: new(atomic.Int64), ID: "new", Weight: 1})
 	moved := 0
-	for k, id := range ringOwners(h, added, keys) {
+	for k, id := range hashOwners(h, added, keys) {
 		if id != before[k] {
 			moved++
 			if id != "new" {
@@ -195,14 +203,14 @@ func TestConsistentHashStability(t *testing.T) {
 			}
 		}
 	}
-	if frac := float64(moved) / keys; frac < 0.05 || frac > 0.14 {
+	if frac := float64(moved) / count; frac < 0.05 || frac > 0.14 {
 		t.Fatalf("adding moved %.3f of keys, want about 1/11", frac)
 	}
 
 	// Removing a candidate moves only its own keys.
 	removed := slices.Delete(slices.Clone(base), 3, 4)
 	moved = 0
-	for k, id := range ringOwners(h, removed, keys) {
+	for k, id := range hashOwners(h, removed, keys) {
 		if id != before[k] {
 			moved++
 			if before[k] != base[3].ID {
@@ -210,7 +218,7 @@ func TestConsistentHashStability(t *testing.T) {
 			}
 		}
 	}
-	if frac := float64(moved) / keys; frac < 0.05 || frac > 0.15 {
+	if frac := float64(moved) / count; frac < 0.05 || frac > 0.15 {
 		t.Fatalf("removing moved %.3f of keys, want about 1/10", frac)
 	}
 }

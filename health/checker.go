@@ -90,7 +90,6 @@ type entry[K, G comparable] struct {
 	last       Result
 	lastEnd    time.Time
 	touched    time.Time // the latest Touch while the target was up
-	hasTouch   bool
 	target     Target
 	lat        latencyWindow
 	cancel     context.CancelFunc // check in progress
@@ -104,6 +103,7 @@ type entry[K, G comparable] struct {
 	failures   uint64
 	ok, fail   int
 	health     upstream.Health
+	hasTouch   bool
 	direct     bool
 	running    bool // a check is in progress
 	now        bool // CheckNow asked for the next check at once
@@ -343,7 +343,7 @@ func (c *Checker[K, G]) dispatch() {
 func (c *Checker[K, G]) admit(e *entry[K, G], probe bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.closed && (e == nil || !e.gone) && (!probe || c.checkableLocked(e))
+	return !c.closed && (e == nil || !e.gone) && (!probe || e != nil && c.checkableLocked(e))
 }
 
 // currentLocked returns a report of e's current state that changes
@@ -595,9 +595,7 @@ func (c *Checker[K, G]) replay(key K, deliver func(Report[K])) {
 func (c *Checker[K, G]) removeSink(s *sink[K]) {
 	c.mu.Lock()
 	if i := slices.Index(c.sinks, s); i >= 0 {
-		sinks := make([]*sink[K], 0, len(c.sinks)-1)
-		sinks = append(sinks, c.sinks[:i]...)
-		c.sinks = append(sinks, c.sinks[i+1:]...)
+		c.sinks = slices.Concat(c.sinks[:i], c.sinks[i+1:])
 	}
 	c.mu.Unlock()
 }

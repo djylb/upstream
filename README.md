@@ -47,6 +47,8 @@ import `net/http`.
 
 ## Picking backends
 
+Pass your backend addresses as `addrA` and `addrB`.
+
 ```go
 pool := upstream.New[string](upstream.Config{
 	Balancer:  upstream.PowerOfTwo(),
@@ -56,10 +58,12 @@ pool := upstream.New[string](upstream.Config{
 })
 defer pool.Close()
 
-err := pool.Sync([]upstream.Target[string]{
-	{ID: "a", Value: "10.0.0.1:8080", Weight: 2},
-	{ID: "b", Value: "10.0.0.2:8080"},
-})
+if err := pool.Sync([]upstream.Target[string]{
+	{ID: "a", Value: addrA, Weight: 2},
+	{ID: "b", Value: addrB},
+}); err != nil {
+	return err
+}
 
 lease, err := pool.Pick() // or PickKey(clientIP) for affinity
 if err != nil {
@@ -93,10 +97,10 @@ response-header times themselves.
 `Sync` replaces the membership in one step; `Put` adds or replaces one
 backend. A backend keeps its counters and health across updates as long as its
 ID stays the same. Leases keep the version of the backend they were issued
-with. An update that changes neither a member's weight nor its value
-(compared with `==`, or with `Config.Equal`) keeps the backend, emits no event
-and rebuilds nothing. An empty key carries no affinity: `PickKey("")` is
-`Pick`.
+with. If the value, weight, priority, in-flight cap and cost are unchanged,
+the update keeps the backend and skips events and rebuilds. Values are
+compared with `==` or with `Config.Equal`. An empty key carries no affinity:
+`PickKey("")` is `Pick`.
 
 `Acquire(id)` leases one backend by ID, bypassing the balancer, for requests
 that must reach that backend, such as the continuation of a session. It
@@ -284,7 +288,8 @@ and panic mode go through the bands in the same order.
 
 The default cost, 0 for every member, leaves each tier one band. A cost is
 part of the target: `Put` or `Sync` the new cost when it changes; an update
-that changes nothing does nothing, so resyncing unchanged costs is cheap.
+with unchanged costs can reuse the existing bands when membership and other
+routing inputs also stay the same.
 
 ```go
 pool := upstream.New[string](upstream.Config{CostTolerance: 20})
@@ -388,7 +393,7 @@ Thresholds apply in the checker: before its first check a target is
 consecutive passes bring it up and `Fall` consecutive failures take it down.
 Transitions are reported once each. Each watcher or attachment owns its verdict.
 Closing it withdraws that verdict. Any remaining Down verdict keeps the member
-down. Otherwise an Up verdict keeps it up, and a member with no verdict is
+down. Otherwise, an Up verdict keeps it up, and a member with no verdict is
 unknown. For example, if a watcher and a direct check both report Down,
 `pool.ClearCheckFrom(nil, backend)` withdraws the direct verdict. The watcher
 keeps the member down until it recovers or the watcher closes. Clearing a
@@ -531,7 +536,7 @@ least recently used beyond `MaxEntries`. Dropping a transport closes its idle
 connections; give transports an `IdleConnTimeout` so that connections still in
 use when it was dropped close once they go idle. Keyed by backend ID, remove a
 transport on `EventRemoved` and on `EventUpdated`, which a pool emits only when
-a member's value, weight, priority or cap really changed.
+a member's value, weight, priority, in-flight cap or cost changes.
 
 ## Concurrency and lifetimes
 

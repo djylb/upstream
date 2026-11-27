@@ -735,6 +735,19 @@ func ejectToHalfOpen(t *testing.T, p *Pool[string], clk *fakeclock.Clock, id str
 	}
 }
 
+func pickHalfOpenTrial(t *testing.T) (*Pool[string], Lease[string]) {
+	t.Helper()
+	clk := fakeclock.New()
+	p := newOrderedPool(t, Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}}, "a", "b")
+	ejectToHalfOpen(t, p, clk, "a")
+	trial := mustPick(t, p)
+	if id := trial.Backend().ID(); id != "a" {
+		trial.Release(Neutral)
+		t.Fatalf("trial went to %s, want a", id)
+	}
+	return p, trial
+}
+
 func TestPickFallsBackWhenBalancerInsists(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := fakeclock.New()
@@ -1376,21 +1389,7 @@ func TestHandedOffBuildPanicIsReported(t *testing.T) {
 		bal := &stepBalancer{gate: make(chan chan struct{})}
 		p := newTestPool(t, Config{Balancer: bal}, "a")
 		panics := panicEvents(p)
-		bal.armed.Store(true)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			_ = p.Put(Target[string]{ID: "b", Value: "b"})
-		}()
-		round := <-bal.gate
-		_ = p.Put(Target[string]{ID: "c", Value: "c"})
-		close(round)
-		round = <-bal.gate
-		_ = p.Put(Target[string]{ID: "d", Value: "d"})
-		close(round)
-		round = <-bal.gate // handed off
-		<-done
-		bal.armed.Store(false)
+		round := handOffBuild(t, p, bal)
 		bal.panic.Store(true)
 		close(round)
 		synctest.Wait()
@@ -1400,7 +1399,9 @@ func TestHandedOffBuildPanicIsReported(t *testing.T) {
 		if n := p.Available(); n != 3 {
 			t.Fatalf("view has %d members, want the last published 3", n)
 		}
-		_ = p.Put(Target[string]{ID: "e", Value: "e"})
+		if err := p.Put(Target[string]{ID: "e", Value: "e"}); err != nil {
+			t.Fatal(err)
+		}
 		if n := p.Available(); n != 5 {
 			t.Fatalf("view has %d members after the next commit, want 5", n)
 		}
@@ -1413,27 +1414,38 @@ func TestCommitBuildsAreBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		bal := &stepBalancer{gate: make(chan chan struct{})}
 		p := newTestPool(t, Config{Balancer: bal}, "a")
-		bal.armed.Store(true)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			_ = p.Put(Target[string]{ID: "b", Value: "b"})
-		}()
-		round := <-bal.gate
-		_ = p.Put(Target[string]{ID: "c", Value: "c"}) // coalesces
-		close(round)
-		round = <-bal.gate // the committer's second build
-		_ = p.Put(Target[string]{ID: "d", Value: "d"})
-		close(round)
-		round = <-bal.gate // handed off: the committer has returned
-		<-done
-		bal.armed.Store(false)
+		round := handOffBuild(t, p, bal)
 		close(round)
 		synctest.Wait()
 		if n := p.Available(); n != 4 {
 			t.Fatalf("view has %d members, want 4", n)
 		}
 	})
+}
+
+// handOffBuild leaves the third build blocked in the handed-off goroutine.
+// The caller closes the returned channel to let that build finish.
+func handOffBuild(t *testing.T, p *Pool[string], bal *stepBalancer) chan struct{} {
+	t.Helper()
+	bal.armed.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Put(Target[string]{ID: "b", Value: "b"})
+	}()
+	round := <-bal.gate
+	errC := p.Put(Target[string]{ID: "c", Value: "c"}) // coalesces
+	close(round)
+	round = <-bal.gate // the committer's second build
+	errD := p.Put(Target[string]{ID: "d", Value: "d"})
+	close(round)
+	round = <-bal.gate // the committer must return without finishing this build
+	errB := <-done
+	bal.armed.Store(false)
+	if err := errors.Join(errB, errC, errD); err != nil {
+		close(round)
+		t.Fatal(err)
+	}
+	return round
 }
 
 // inOrder is a Balancer that picks its candidates in order.
@@ -1633,11 +1645,12 @@ func TestReportInvalidSourceHealth(t *testing.T) {
 	}
 }
 func TestNilHealthMember(t *testing.T) {
-	p := New[string](Config{})
+	p := newTestPool(t, Config{}, "a")
+	// Each method deliberately receives a nil backend and must reject it.
+	//goland:noinspection GoMaybeNil
 	if p.ReportCheck(nil, HealthUp, CheckResult{}) || p.ClearCheckFrom(nil, nil) || p.MarkOnline(nil) {
 		t.Fatal("accepted nil")
 	}
-	p.Close()
 }
 
 func TestLateRetryBudget(t *testing.T) {
@@ -1684,7 +1697,7 @@ func TestRendezvousSkipsExhaustedTrials(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer l.Release(Neutral)
+			t.Cleanup(func() { l.Release(Neutral) })
 			if !l.Backend().core.det.trialsFull() {
 				t.Fatalf("unfilled trial on %s", id)
 			}

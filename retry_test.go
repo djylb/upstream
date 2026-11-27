@@ -223,17 +223,8 @@ func TestRequestDoesNotAllocate(t *testing.T) {
 // of holding the trial slot until it is released.
 func TestReportEndsTrial(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
-		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
-		defer p.Close()
-		if err := p.Sync(ordered("a", "b")); err != nil {
-			t.Fatal(err)
-		}
-		ejectToHalfOpen(t, p, clk, "a")
-		trial := mustPick(t, p)
-		if trial.Backend().ID() != "a" {
-			t.Fatalf("trial went to %s", trial.Backend().ID())
-		}
+		p, trial := pickHalfOpenTrial(t)
+		defer trial.Release(Neutral)
 		trial.Report(Success)
 		trial.Report(Failure) // ignored
 		synctest.Wait()

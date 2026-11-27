@@ -15,8 +15,8 @@ const (
 	// EventAdded reports a new member.
 	EventAdded EventKind = iota
 
-	// EventUpdated reports a member replaced with a new weight or value;
-	// Backend is the new version. Updates that change neither emit none.
+	// EventUpdated reports a change in a member's value, weight, priority,
+	// in-flight cap or cost. Backend is the new version.
 	EventUpdated
 
 	// EventRemoved reports a member that left the pool.
@@ -61,9 +61,9 @@ func (k EventKind) MarshalText() ([]byte, error) { return []byte(k.String()), ni
 // one per failure.
 type Event[T any] struct {
 	// Err is the cause of an EventStateChanged to StateUnhealthy (the last
-	// check error) or to StateEjected or StateHalfOpen (the ejection
-	// cause), the *BalancerPanicError of an EventBalancerPanic, and nil
-	// otherwise.
+	// check error), to StateEjected or StateHalfOpen (the ejection cause),
+	// or to StateOffline (the offline cause). For EventBalancerPanic it is
+	// a *BalancerPanicError. It is nil for other events.
 	Err error
 
 	// Backend is the member concerned; nil for EventBalancerPanic.
@@ -120,9 +120,7 @@ func (p *Pool[T]) Subscribe(fn func(Event[T])) (cancel func()) {
 			s.off.Store(true)
 			p.mu.Lock()
 			if i := slices.Index(p.subs, s); i >= 0 {
-				subs := make([]*subscriber[T], 0, len(p.subs)-1)
-				subs = append(subs, p.subs[:i]...)
-				p.subs = append(subs, p.subs[i+1:]...)
+				p.subs = slices.Concat(p.subs[:i], p.subs[i+1:])
 			}
 			p.mu.Unlock()
 		})

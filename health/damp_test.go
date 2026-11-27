@@ -427,9 +427,21 @@ func TestReentrantDampClock(t *testing.T) {
 	d.Offer("a", down, 2)
 	d.Offer("a", up, 3)
 	d.Forget("a")
-	d.Close()
 	if clk.Pending() != 0 {
 		t.Fatal("timer left after Forget")
+	}
+
+	for _, key := range []string{"b", "c"} {
+		d.Offer(key, up, 1)
+		d.Offer(key, down, 2)
+		d.Offer(key, up, 3)
+	}
+	if n := clk.Pending(); n != 2 {
+		t.Fatalf("got %d timers before Close, want 2", n)
+	}
+	d.Close()
+	if n := clk.Pending(); n != 0 {
+		t.Fatalf("got %d timers after Close, want 0", n)
 	}
 }
 

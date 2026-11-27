@@ -110,17 +110,8 @@ func TestTiersKeyAffinity(t *testing.T) {
 // health, here a half-open member out of trial slots, passes the pick on.
 func TestTiersHalfOpenPassesOn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
-		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
-		defer p.Close()
-		if err := p.Sync(ordered("a", "b")); err != nil {
-			t.Fatal(err)
-		}
-		ejectToHalfOpen(t, p, clk, "a")
-		trial := mustPick(t, p)
-		if trial.Backend().ID() != "a" {
-			t.Fatalf("trial went to %s", trial.Backend().ID())
-		}
+		p, trial := pickHalfOpenTrial(t)
+		defer trial.Release(Neutral)
 		if l := mustPick(t, p); l.Backend().ID() != "b" {
 			t.Fatalf("pick during the trial went to %s", l.Backend().ID())
 		} else {

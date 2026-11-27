@@ -60,7 +60,7 @@ func parseCode(s string) (int, bool) {
 // Contains reports whether code is in the range.
 func (r StatusRange) Contains(code int) bool { return code >= r.Min && code <= r.Max }
 
-// String formats the range in the form ParseStatusRange accepts.
+// String formats a valid range in the form ParseStatusRange accepts.
 func (r StatusRange) String() string {
 	if r.Min == r.Max {
 		return strconv.Itoa(r.Min)

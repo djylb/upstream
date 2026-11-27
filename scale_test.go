@@ -97,6 +97,8 @@ func TestPoolRanksOnce(t *testing.T) {
 	if picks != 1 || ranks != 1 {
 		t.Fatalf("%d Pick and %d Rank calls, want 1 and 1", picks, ranks)
 	}
+	// The race build selects the other definition of raceEnabled.
+	//goland:noinspection GoBoolExpressions
 	if !raceEnabled {
 		if nalloc := testing.AllocsPerRun(30, func() {
 			l, err := p.PickHash(1)
@@ -329,38 +331,50 @@ func TestStateChangeCostIsPerTier(t *testing.T) {
 	}
 }
 
-// TestSmallTierRanksOnStack checks that a pick past the first choice on a
-// small Rendezvous tier does not allocate.
-func TestSmallTierRanksOnStack(t *testing.T) {
+func nearlyFullRendezvousTier(t *testing.T, n int) *Pool[int] {
+	t.Helper()
 	p := New[int](Config{Balancer: Rendezvous(RendezvousConfig{})})
-	defer p.Close()
-	const n = 8
-	for i := range n {
-		if err := p.Put(Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1}); err != nil {
-			t.Fatal(err)
-		}
+	t.Cleanup(p.Close)
+	targets := make([]Target[int], n)
+	for i := range targets {
+		targets[i] = Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1}
+	}
+	if err := p.Sync(targets); err != nil {
+		t.Fatal(err)
 	}
 	for i := range n - 1 {
 		l, err := p.Acquire(strconv.Itoa(i))
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
+		t.Cleanup(func() {
 			b := l.Backend()
 			l.Release(Neutral)
 			if b.InFlight() != 0 {
 				t.Errorf("in-flight leases on %s", b.ID())
 			}
-		}()
+		})
 	}
+	return p
+}
+
+// TestSmallTierRanksOnStack checks that a pick past the first choice on a
+// small Rendezvous tier does not allocate.
+func TestSmallTierRanksOnStack(t *testing.T) {
+	const n = 8
+	p := nearlyFullRendezvousTier(t, n)
 	key := uint64(0)
 	if a := testing.AllocsPerRun(100, func() {
 		key++
 		l, err := p.PickHash(key)
-		if err != nil || l.Backend().ID() != strconv.Itoa(n-1) {
-			t.Fatalf("pick %v: %v", l.Backend(), err)
+		if err != nil {
+			t.Fatal(err)
 		}
+		id := l.Backend().ID()
 		l.Release(Success)
+		if id != strconv.Itoa(n-1) {
+			t.Fatalf("pick = %s, want %d", id, n-1)
+		}
 	}); a != 0 {
 		t.Fatalf("%v allocations per pick", a)
 	}
@@ -414,26 +428,7 @@ func TestLargeTierRankAllocsBounded(t *testing.T) {
 	if a := testing.AllocsPerRun(50, func() { key++; rk.Rank(key, dst) }); a > 1 {
 		t.Fatalf("%v allocations per Rank of %d candidates", a, n)
 	}
-	p := New[int](Config{Balancer: Rendezvous(RendezvousConfig{})})
-	defer p.Close()
-	for i := range n {
-		if err := p.Put(Target[int]{ID: strconv.Itoa(i), MaxInFlight: 1}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i := range n - 1 {
-		l, err := p.Acquire(strconv.Itoa(i))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			b := l.Backend()
-			l.Release(Neutral)
-			if b.InFlight() != 0 {
-				t.Errorf("in-flight leases on %s", b.ID())
-			}
-		}()
-	}
+	p := nearlyFullRendezvousTier(t, n)
 	if a := testing.AllocsPerRun(50, func() {
 		key++
 		l, err := p.PickHash(key)

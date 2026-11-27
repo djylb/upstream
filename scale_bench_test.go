@@ -85,8 +85,7 @@ func BenchmarkPickFullTier(b *testing.B) {
 	}
 }
 
-// BenchmarkRequestManyRetries measures a Request that retries through all
-// of n backends.
+// BenchmarkRequestManyRetries measures a Request that tries every backend.
 func BenchmarkRequestManyRetries(b *testing.B) {
 	for _, n := range []int{10, 128, 1024} {
 		b.Run(strconv.Itoa(n), func(b *testing.B) {

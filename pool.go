@@ -530,7 +530,7 @@ func applyPending[T any](list, pend []*Backend[T], want func(*Backend[T]) bool) 
 // new to the group has slot -1. It returns nil if b does not keep the
 // order of a, as after a Sync that reorders members.
 //
-// With a empty there is no Picker to update, and it returns nil too.
+// An empty first list has no Picker to update, so diffLists returns nil.
 func diffLists[T any](a, b []*Backend[T]) *Delta {
 	if len(a) == 0 {
 		return nil
@@ -906,7 +906,7 @@ type CheckSource struct{ _ byte }
 
 // ReportCheckFrom records source's verdict and the latest observation.
 // Any Down excludes b from normal rotation. FallbackAll may bypass health.
-// Otherwise any Up takes precedence over Unknown.
+// Otherwise, any Up takes precedence over Unknown.
 // An unrecognized health value withdraws the source verdict.
 // A nil source identifies the writer used by ReportCheck.
 func (p *Pool[T]) ReportCheckFrom(source *CheckSource, b *Backend[T], h Health, r CheckResult) bool {
@@ -1337,7 +1337,7 @@ func sameList[T any](a, b []*Backend[T]) bool {
 // ramping its weights. A tier whose list derives from that one by a known
 // Delta updates the candidates by copying, and an Updater updates its
 // Picker with the Delta, so a change costs time in proportion to what
-// changed, plus copying. Otherwise the candidates are made again; a tier
+// changed, plus copying. Otherwise, the candidates are made again; a tier
 // whose candidates are equal to the Picker's keeps it, an Updater updates
 // it without a Delta, and other Balancers build a new one. Under slow
 // start, changed tiers are made again. The Pickers are kept only if every

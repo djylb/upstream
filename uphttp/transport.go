@@ -42,7 +42,7 @@ type TransportCacheConfig struct {
 // backend's value, such as its TLS server name, so it must go when that
 // value changes: subscribe to the pool and call Remove on
 // upstream.EventRemoved and on upstream.EventUpdated, which a pool emits
-// only when a member's weight or value really changed.
+// when a member's value, weight, priority, in-flight cap or cost changes.
 type TransportCache[K comparable] struct {
 	newTransport func(K) *http.Transport
 	clock        upstream.Clock

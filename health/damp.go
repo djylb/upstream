@@ -82,9 +82,9 @@ type dampKey[K comparable, V any] struct {
 	flips    []time.Time
 	until    time.Time
 	hold     time.Duration
+	val      V
 	pending  bool // val holds the latest value, held back; ph is its health
 	ph       upstream.Health
-	val      V
 	has      bool // a value has been passed: reported is valid
 	reported upstream.Health
 	round    uint64
@@ -251,14 +251,15 @@ func (d *Damper[K, V]) Forget(key K) {
 func (d *Damper[K, V]) Close() {
 	d.mu.Lock()
 	d.closed = true
-	for _, k := range d.keys {
-		if k.timer != nil {
-			defer k.timer()
-		}
-	}
-	clear(d.keys)
+	keys := d.keys
+	d.keys = nil
 	d.queue = nil
 	d.mu.Unlock()
+	for _, k := range keys {
+		if k.timer != nil {
+			k.timer()
+		}
+	}
 }
 
 // Len returns the number of keys the damper holds state for.

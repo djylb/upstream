@@ -213,10 +213,9 @@ func healthFlags(h Health) uint32 {
 }
 
 // A Backend is one member of a Pool: a Target as the pool currently routes
-// to it. Changing a target's weight or value in the pool creates a new
-// Backend that shares the old one's counters and health state, so leases
-// keep the version they were issued with; an update that changes neither
-// keeps the Backend.
+// to it. Changing the target's value, weight, priority, in-flight cap or
+// cost creates a new Backend that shares the previous version's counters
+// and health. Leases keep the version they were issued with.
 type Backend[T any] struct {
 	core     *core
 	id       string
@@ -297,9 +296,9 @@ type core struct {
 	failures     atomic.Uint64
 	flags        atomic.Uint32
 	reported     State // last state announced in an event; guarded by the pool's mutex
+	directHealth Health
 	det          OutlierDetector
 	drain        atomic.Pointer[Drain]
-	directHealth Health
 	checkSources map[*CheckSource]Health
 	check        atomic.Pointer[CheckResult]
 	rampStart    atomic.Pointer[time.Time] // nil, pendingRamp, or start instant

@@ -11,7 +11,7 @@
 // A Damper, placed after the Checker's OnChange hook, limits how often a
 // key that flaps between up and down is reported onward.
 //
-// By default a target is checked by connecting over TCP and closing the
+// By default, a target is checked by connecting over TCP and closing the
 // connection at once, without sending any data. Other checks, such as the
 // HTTP check in package uphttp, are used only when a target names them.
 // There is no generic check for UDP, which has no handshake to observe: UDP

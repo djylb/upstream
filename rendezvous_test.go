@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"encoding/binary"
-	"math/rand/v2"
 	"slices"
 	"strconv"
 	"testing"
@@ -27,38 +26,24 @@ func TestSipHash24Vector(t *testing.T) {
 	}
 }
 
-func rendezvousOwners(b Balancer, c []Candidate, keys int) []string {
-	p := b.Build(c)
-	owners := make([]string, keys)
-	for k := range owners {
-		owners[k] = c[p.Pick(uint64(k)*0x9e3779b97f4a7c15, 0)].ID
-	}
-	return owners
-}
-
 func TestRendezvousStability(t *testing.T) {
-	const keys = 20000
+	keys := make([]uint64, 20000)
+	for i := range keys {
+		keys[i] = uint64(i) * 0x9e3779b97f4a7c15
+	}
 	h := Rendezvous(RendezvousConfig{})
 	base := candidates(1, 2, 1, 3, 1, 1, 2, 1, 1, 1)
-	before := rendezvousOwners(h, base, keys)
-
-	shuffled := slices.Clone(base)
-	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-	for k, id := range rendezvousOwners(h, shuffled, keys) {
-		if before[k] != id {
-			t.Fatalf("key %d moved from %s to %s when candidates were reordered", k, before[k], id)
-		}
-	}
+	before := checkHashOrder(t, h, base, keys)
 
 	added := append(slices.Clone(base), Candidate{ID: "new", Weight: 2})
-	for k, id := range rendezvousOwners(h, added, keys) {
+	for k, id := range hashOwners(h, added, keys) {
 		if id != before[k] && id != "new" {
 			t.Fatalf("key %d moved from %s to %s, not to the new candidate", k, before[k], id)
 		}
 	}
 
 	removed := slices.Delete(slices.Clone(base), 3, 4)
-	for k, id := range rendezvousOwners(h, removed, keys) {
+	for k, id := range hashOwners(h, removed, keys) {
 		if id != before[k] && before[k] != base[3].ID {
 			t.Fatalf("key %d moved from %s to %s although %s was removed", k, before[k], id, base[3].ID)
 		}
@@ -67,7 +52,7 @@ func TestRendezvousStability(t *testing.T) {
 	// A weight change moves keys only to or from that candidate.
 	heavier := slices.Clone(base)
 	heavier[5].Weight = 5
-	for k, id := range rendezvousOwners(h, heavier, keys) {
+	for k, id := range hashOwners(h, heavier, keys) {
 		if id != before[k] && id != base[5].ID {
 			t.Fatalf("key %d moved from %s to %s when %s grew", k, before[k], id, base[5].ID)
 		}

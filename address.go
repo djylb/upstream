@@ -44,9 +44,9 @@ func AddressOf[T any](v T) (addr string, ok bool) {
 	return "", false
 }
 
-// Addressable reports whether every value of type T has an address for
-// AddressOf: T is a string type, or T implements Addresser. Packages that
-// derive addresses check it once, up front, and fail with ErrNoAddress.
+// Addressable reports whether T is a string type or implements Addresser.
+// Packages that derive addresses check it up front and fail with
+// ErrNoAddress. AddressOf still checks the individual value for nil.
 func Addressable[T any]() bool {
 	t := reflect.TypeFor[T]()
 	return t.Kind() == reflect.String || t.Implements(reflect.TypeFor[Addresser]())
