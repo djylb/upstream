@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 	"github.com/djylb/upstream/internal/latency"
 )
@@ -48,7 +49,7 @@ type Checker[K, G comparable] struct {
 	ctx           context.Context //nolint:containedctx // the Checker's lifetime, canceled by Close; probes and callbacks derive from it
 	cancel        context.CancelFunc
 	stopAfter     func() bool
-	clock         upstream.Clock
+	clock         timeshim.Clock
 	limit, active int           // probe slots, guarded by mu
 	notify        chan struct{} // wakes the dispatcher
 	window        int
@@ -69,7 +70,7 @@ type Checker[K, G comparable] struct {
 	sched    schedule[K, G] // checks
 	releases schedule[K, G] // damping releases
 	armAt    time.Time      // when the armed timer fires
-	armStop  func() bool    // stops the armed timer; nil while it is being made
+	armTimer timeshim.Timer // nil while the timer is being made
 	armSeq   uint64         // identifies the armed timer
 	armed    bool           // a timer is armed or being made
 
@@ -122,15 +123,12 @@ type delivery[K, G comparable] struct {
 // New returns a Checker that runs until ctx is done or Close is called.
 func New[K, G comparable](ctx context.Context, cfg Config[K]) *Checker[K, G] {
 	c := &Checker[K, G]{
-		clock:   cfg.Clock,
+		clock:   timeshim.Or(cfg.Clock),
 		window:  cfg.LatencyWindow,
 		notify:  make(chan struct{}, 1),
 		entries: make(map[K]*entry[K, G]),
 		groups:  make(map[G]map[K]struct{}),
 		done:    make(chan struct{}),
-	}
-	if c.clock == nil {
-		c.clock = upstream.SystemClock()
 	}
 	if c.window <= 0 {
 		c.window = 16
@@ -232,14 +230,14 @@ func (c *Checker[K, G]) SetConfig(cfg Config[K]) {
 // work collects what an operation does after releasing the mutex.
 type work[K, G comparable] struct {
 	schedule []*entry[K, G]
-	stops    []func() bool
+	timers   []timeshim.Timer
 	cancels  []context.CancelFunc
 }
 
 // finish runs the deferred part of an operation without the mutex.
 func (c *Checker[K, G]) finish(w *work[K, G]) {
-	for _, stop := range w.stops {
-		if stop() {
+	for _, timer := range w.timers {
+		if timer.Stop() {
 			c.unannounce()
 		}
 	}
@@ -879,7 +877,7 @@ func (c *Checker[K, G]) run(e *entry[K, G], timer uint64) {
 // ended first. The timeout starts once a slot is free.
 func (c *Checker[K, G]) check(ctx context.Context, e *entry[K, G], probe Probe, t Target, o Options) (r Result, ok bool) {
 	start := c.clock.Now()
-	pctx, cancel := c.clock.WithTimeout(ctx, o.Timeout)
+	pctx, cancel := timeshim.WithTimeout(ctx, c.clock, o.Timeout)
 	defer cancel()
 	var obs Observation
 	err := pctx.Err()

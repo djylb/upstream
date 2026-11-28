@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 )
 
@@ -97,7 +98,7 @@ type RoundTripper[T any] struct {
 
 	// AttemptTimeout, if positive, bounds each attempt, from sending the
 	// request until its response body ends or is closed. The attempt's
-	// context comes from the pool's Clock.WithTimeout, so the transport,
+	// context uses the pool's clock via timeshim.WithTimeout, so the transport,
 	// its dialer and the TLS handshake see the deadline. An attempt that
 	// times out before the response headers fails with ErrAttemptTimeout
 	// and may be retried, so that a backend that does not answer cannot use
@@ -207,7 +208,7 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 	var hdr *headerTimer
 	done := false
 	defer func() {
-		if hdr != nil && hdr.stop != nil {
+		if hdr != nil && hdr.timer != nil {
 			hdr.headers()
 		}
 		if !done {
@@ -223,7 +224,7 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 	ctx := req.Context()
 	clock := rt.Pool.Clock()
 	if rt.AttemptTimeout > 0 {
-		ctx, a.cancel = clock.WithTimeout(ctx, rt.AttemptTimeout)
+		ctx, a.cancel = timeshim.WithTimeout(ctx, clock, rt.AttemptTimeout)
 	}
 	if rt.HeaderTimeout > 0 {
 		var cancel context.CancelCauseFunc
@@ -236,7 +237,7 @@ func (rt *RoundTripper[T]) try(req *http.Request, l *upstream.Lease[T], rewrite 
 				outer()
 			}
 		}
-		hdr.stop = clock.AfterFunc(rt.HeaderTimeout, hdr.fire)
+		hdr.timer = clock.AfterFunc(rt.HeaderTimeout, hdr.fire)
 	}
 	out := req.Clone(ctx)
 	if again && req.GetBody != nil {
@@ -341,7 +342,7 @@ func (b *rewrittenBody) Close() error {
 // fire and headers runs first wins.
 type headerTimer struct {
 	cancel context.CancelCauseFunc
-	stop   func() bool
+	timer  timeshim.Timer
 	state  atomic.Bool // set by the first of fire and headers
 }
 
@@ -355,7 +356,7 @@ func (h *headerTimer) fire() {
 // reports whether they won the race; later calls report false.
 func (h *headerTimer) headers() bool {
 	if h.state.CompareAndSwap(false, true) {
-		h.stop()
+		h.timer.Stop()
 		return true
 	}
 	return false

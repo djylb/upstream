@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -9,9 +8,8 @@ import (
 )
 
 // TestDependencies checks what the README promises: every package, tests
-// included, depends on the standard library and this module alone, the
-// root package does not link net/http or even net, and upnet does not link
-// net/http.
+// included, depends on the standard library and the shared clock. The root
+// package does not link net, and upnet does not link net/http.
 func TestDependencies(t *testing.T) {
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("cannot run the go command")
@@ -21,13 +19,18 @@ func TestDependencies(t *testing.T) {
 		t.Skip("no go command")
 	}
 	const module = "github.com/djylb/upstream"
+	const clock = "github.com/djylb/timeshim"
 
-	mod, err := os.ReadFile("go.mod")
+	cmd := exec.Command(goCmd, "list", "-m", "-f", "{{.Path}}", "all")
+	cmd.Env = append(cmd.Environ(), "GOWORK=off")
+	mods, err := cmd.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("go list -m: %v", err)
 	}
-	if strings.Contains(string(mod), "require") {
-		t.Error("go.mod has requirements")
+	for mod := range strings.Lines(string(mods)) {
+		if name := strings.TrimSpace(mod); name != module && name != clock {
+			t.Errorf("unexpected module: %s", name)
+		}
 	}
 
 	out, err := exec.Command(goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", "./...").Output()
@@ -40,8 +43,8 @@ func TestDependencies(t *testing.T) {
 		for _, prefix := range []string{module + "/", module + "_test", module + " ", module + ".test"} {
 			ours = ours || strings.HasPrefix(path, prefix)
 		}
-		if std != "true" && !ours {
-			t.Errorf("dependency outside the standard library: %s", path)
+		if std != "true" && !ours && path != clock {
+			t.Errorf("unexpected package dependency: %s", path)
 		}
 	}
 

@@ -3,6 +3,7 @@ package health
 import (
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 )
 
@@ -116,10 +117,10 @@ func (c *Checker[K, G]) stopCheckingLocked(e *entry[K, G], now time.Time, w *wor
 
 func (c *Checker[K, G]) stopIdleTimerLocked(w *work[K, G]) {
 	if len(c.sched) == 0 && len(c.releases) == 0 && c.armed {
-		if c.armStop != nil {
-			w.stops = append(w.stops, c.armStop)
+		if c.armTimer != nil {
+			w.timers = append(w.timers, c.armTimer)
 		}
-		c.armStop, c.armed = nil, false
+		c.armTimer, c.armed = nil, false
 		c.armSeq++
 	}
 }
@@ -127,7 +128,7 @@ func (c *Checker[K, G]) stopIdleTimerLocked(w *work[K, G]) {
 // An arming is a timer change decided under the mutex and made without it.
 type arming struct {
 	due   time.Time
-	stop  func() bool
+	timer timeshim.Timer
 	seq   uint64
 	start bool
 }
@@ -150,29 +151,29 @@ func (c *Checker[K, G]) armLocked() arming {
 		return arming{}
 	}
 	c.armSeq++
-	a := arming{due: due, stop: c.armStop, seq: c.armSeq, start: true}
-	c.armAt, c.armStop, c.armed = due, nil, true
+	a := arming{due: due, timer: c.armTimer, seq: c.armSeq, start: true}
+	c.armAt, c.armTimer, c.armed = due, nil, true
 	c.pending++
 	return a
 }
 
 func (c *Checker[K, G]) arm(a arming) {
-	if a.stop != nil && a.stop() {
+	if a.timer != nil && a.timer.Stop() {
 		c.unannounce()
 	}
 	if !a.start {
 		return
 	}
-	stop := c.clock.AfterFunc(max(a.due.Sub(c.clock.Now()), 0), func() { c.fire(a.seq) })
+	timer := c.clock.AfterFunc(max(a.due.Sub(c.clock.Now()), 0), func() { c.fire(a.seq) })
 	c.mu.Lock()
 	if c.closed || !c.armed || c.armSeq != a.seq {
 		c.mu.Unlock()
-		if stop() {
+		if timer.Stop() {
 			c.unannounce()
 		}
 		return
 	}
-	c.armStop = stop
+	c.armTimer = timer
 	c.mu.Unlock()
 }
 
@@ -182,7 +183,7 @@ func (c *Checker[K, G]) fire(seq uint64) {
 	now := c.clock.Now()
 	c.mu.Lock()
 	if c.armSeq == seq {
-		c.armStop, c.armed = nil, false
+		c.armTimer, c.armed = nil, false
 	}
 	c.startDueLocked(now)
 }

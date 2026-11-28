@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream/health"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 func hostOf(t *testing.T, s *httptest.Server) string {
@@ -184,7 +184,7 @@ func FuzzParseStatusRange(f *testing.F) {
 }
 
 func TestTransportCache(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	created := map[string]int{}
 	var mu sync.Mutex
 	c := NewTransportCache(func(k string) *http.Transport {

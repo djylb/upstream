@@ -14,8 +14,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 // fakeBackends answers requests in memory: each backend address maps to a
@@ -418,7 +418,7 @@ func TestRewriteURLJoinsPath(t *testing.T) {
 // TestRoundTripperLatencyUsesPoolClock checks that the latency to the
 // response headers comes from the pool's Clock.
 func TestRoundTripperLatencyUsesPoolClock(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	rt := &RoundTripper[string]{Pool: p, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -469,7 +469,7 @@ func TestRoundTripperNilAddress(t *testing.T) {
 // fails if its request's context has ended.
 type slowBody struct {
 	ctx   context.Context //nolint:containedctx // a body reads on behalf of one request, as its Body does
-	clk   *fakeclock.Clock
+	clk   *timeshim.Fake
 	step  time.Duration
 	reads int
 }
@@ -496,7 +496,7 @@ func (b *slowBody) Close() error { return nil }
 // attempt with ErrHeaderTimeout, that it is retried, that the attempt's
 // context has no deadline, and that the timer does not outlive the attempt.
 func TestRoundTripperHeaderTimeout(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newOrderedRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}}, "hole", "ok")
 	tr := rtFunc(func(r *http.Request) (*http.Response, error) {
 		if _, ok := r.Context().Deadline(); ok {
@@ -530,7 +530,7 @@ func TestRoundTripperHeaderTimeout(t *testing.T) {
 
 func TestRoundTripperRetryClosesStalledBody(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newOrderedRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}}, "stalled", "ok")
 		reader, writer := io.Pipe() // The first backend sends no body bytes or EOF.
 		closes := 0
@@ -588,7 +588,7 @@ func TestRoundTripperRetryClosesStalledBody(t *testing.T) {
 // TestRoundTripperHeaderTimeoutLoses checks the race: a response that the
 // transport returns after the timer fired is closed and the attempt fails.
 func TestRoundTripperHeaderTimeoutLoses(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	closed := false
 	rt := &RoundTripper[string]{Pool: p, HeaderTimeout: time.Millisecond, Transport: func(*upstream.Backend[string]) http.RoundTripper {
@@ -619,7 +619,7 @@ func TestRoundTripperHeaderTimeoutStreams(t *testing.T) {
 		attempt time.Duration
 		wantErr error
 	}{{0, nil}, {35 * time.Millisecond, context.DeadlineExceeded}} {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 		rt := &RoundTripper[string]{Pool: p, HeaderTimeout: 10 * time.Millisecond, AttemptTimeout: tc.attempt, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 			return rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -645,7 +645,7 @@ func TestRoundTripperHeaderTimeoutStreams(t *testing.T) {
 	}
 	// Combined, late headers: the header timeout wins over the longer
 	// attempt timeout.
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	rt := &RoundTripper[string]{Pool: p, HeaderTimeout: 10 * time.Millisecond, AttemptTimeout: time.Second, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -660,7 +660,7 @@ func TestRoundTripperHeaderTimeoutStreams(t *testing.T) {
 }
 
 func TestRoundTripperGetBodyErrorStopsTimer(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 3}}, "a", "b")
 	rt := &RoundTripper[string]{Pool: p, AttemptTimeout: time.Hour, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -700,7 +700,7 @@ func TestRewriteFailureClosesBody(t *testing.T) {
 }
 
 func TestRetryPanicDiscardsResponse(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	body := &rwBody{Reader: strings.NewReader("")}
 	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Hour, Retry: func(*http.Response, error) bool { panic("retry") },
@@ -741,7 +741,7 @@ func TestInvalidationDuringTransportFactory(t *testing.T) {
 }
 
 func TestAttemptTimeoutDiscardsLateSuccess(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	body := &rwBody{Reader: strings.NewReader("")}
 	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Second, Transport: func(*upstream.Backend[string]) http.RoundTripper {
@@ -762,7 +762,7 @@ func TestAttemptTimeoutDiscardsLateSuccess(t *testing.T) {
 }
 
 func TestFinishPanicOwnsResponse(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	cfg := upstream.Config{Clock: clk, Outlier: upstream.OutlierConfig{ConsecutiveFailures: 1}}
 	p := newRTPool(t, cfg, "a")
 	defer p.Subscribe(func(e upstream.Event[string]) {
@@ -859,7 +859,7 @@ func TestErrorResponseClosePanic(t *testing.T) {
 }
 
 func TestTransportMissingResponse(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newRTPool(t, upstream.Config{Clock: clk}, "a")
 	rt := RoundTripper[string]{Pool: p, AttemptTimeout: time.Minute, Transport: func(*upstream.Backend[string]) http.RoundTripper {
 		return rtFunc(func(*http.Request) (*http.Response, error) { return nil, nil })

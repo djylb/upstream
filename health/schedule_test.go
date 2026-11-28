@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 // TestScheduleOneTimer checks that targets on different intervals share
@@ -23,7 +23,7 @@ func TestScheduleOneTimer(t *testing.T) {
 			tg.Options.Interval = time.Duration(i+1) * time.Second
 			h.c.Put(strconv.Itoa(i), tg)
 		}
-		synctest.Wait()
+		runDue(h.clk)
 		if p := h.clk.Pending(); p != 1 {
 			t.Fatalf("%d timers for %d targets, want 1", p, n)
 		}
@@ -41,7 +41,7 @@ func TestScheduleOneTimer(t *testing.T) {
 		for i := range n {
 			h.c.Remove(strconv.Itoa(i))
 		}
-		synctest.Wait()
+		runDue(h.clk)
 		if p := h.clk.Pending(); p != 0 {
 			t.Fatalf("%d timers with no targets", p)
 		}
@@ -50,13 +50,15 @@ func TestScheduleOneTimer(t *testing.T) {
 
 // countingClock counts the timers made.
 type countingClock struct {
-	*fakeclock.Clock
+	*timeshim.Fake
 	timers atomic.Int64
 }
 
-func (c *countingClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.timers.Add(1)
-	return c.Clock.AfterFunc(d, f)
+func (c *countingClock) AfterFunc(d time.Duration, f func()) timeshim.Timer {
+	if d < time.Minute { // probe deadlines are one minute in this test
+		c.timers.Add(1)
+	}
+	return c.Fake.AfterFunc(d, f)
 }
 
 // TestScheduleKeepsEarlierTimer checks that scheduling a check due after
@@ -64,20 +66,20 @@ func (c *countingClock) AfterFunc(d time.Duration, f func()) func() bool {
 // one timer per round, not one per target.
 func TestScheduleKeepsEarlierTimer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := &countingClock{Clock: fakeclock.New()}
+		clk := &countingClock{Fake: timeshim.NewFake(time.Unix(0, 0))}
 		sw := newSwitchable()
-		c := New[string, string](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1}})
+		c := New[string, string](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1, Timeout: time.Minute}})
 		defer c.Close()
 		const n = 50
 		for i := range n {
 			c.Put(strconv.Itoa(i), sw.target(strconv.Itoa(i)))
 		}
-		synctest.Wait()
+		runDue(clk.Fake)
 		before := clk.timers.Load()
 		const rounds = 5
 		for range rounds {
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk.Fake)
 		}
 		if got := clk.timers.Load() - before; got > 2*rounds {
 			t.Fatalf("%d timers for %d rounds of %d targets", got, rounds, n)
@@ -90,7 +92,7 @@ func TestScheduleKeepsEarlierTimer(t *testing.T) {
 
 func TestSingleSlotLeavesWaitingTargetsScheduled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		probe := func(ctx context.Context, _ Target) (Observation, error) {
 			<-ctx.Done()
 			return Observation{}, ctx.Err()
@@ -100,7 +102,7 @@ func TestSingleSlotLeavesWaitingTargetsScheduled(t *testing.T) {
 		for i := range 512 {
 			c.Put(i, Target{Probe: probe})
 		}
-		synctest.Wait()
+		runDue(clk)
 		if len(c.sched) != 511 || c.active != 1 {
 			t.Fatalf("scheduled %d active %d", len(c.sched), c.active)
 		}
@@ -116,11 +118,11 @@ func TestSyncPreservesJitteredDeadline(t *testing.T) {
 		target.Options.Jitter = time.Second
 		set := map[string]Target{"a": target}
 		h.c.SyncGroup("g", set)
-		synctest.Wait()
+		runDue(h.clk)
 		e := h.c.entries["a"]
 		revision, due := e.timer, h.c.sched[e.slot-1].due
 		h.c.SyncGroup("g", set)
-		synctest.Wait()
+		runDue(h.clk)
 		if revision != e.timer || !due.Equal(h.c.sched[e.slot-1].due) {
 			t.Fatal("unchanged target rescheduled")
 		}

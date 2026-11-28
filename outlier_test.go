@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 // fail admits and fails n requests.
@@ -25,7 +25,7 @@ func fail(t *testing.T, d *OutlierDetector, n int) {
 
 func TestOutlierConsecutiveFailures(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		var changes atomic.Int32
 		d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 3}, clk, func() { changes.Add(1) })
 		defer d.Close()
@@ -66,7 +66,7 @@ func TestOutlierConsecutiveFailures(t *testing.T) {
 
 func TestOutlierBackoffAndHalfOpen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		var changes atomic.Int32
 		d := NewOutlierDetector(OutlierConfig{
 			ConsecutiveFailures: 1,
@@ -142,7 +142,7 @@ func TestOutlierBackoffAndHalfOpen(t *testing.T) {
 
 func TestOutlierFailureRate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		d := NewOutlierDetector(OutlierConfig{FailurePercent: 50, MinRequests: 10, Window: 10 * time.Second}, clk, nil)
 		defer d.Close()
 		record := func(o Outcome, n int) {
@@ -185,7 +185,7 @@ func TestOutlierDisabledAndClosed(t *testing.T) {
 		t.Fatal("disabled detector ejected")
 	}
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1}, clk, nil)
 		fail(t, d, 1)
 		d.Close()
@@ -223,7 +223,7 @@ func TestBackoffBounds(t *testing.T) {
 
 func TestPoolPassiveHealth(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 2, BaseEjection: time.Second}})
 		defer p.Close()
 		if err := p.Sync(targets("a", "b")); err != nil {
@@ -299,7 +299,7 @@ func TestPoolPassiveHealth(t *testing.T) {
 
 func TestPoolCloseStopsTimers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
 		if err := p.Sync(targets("a")); err != nil {
 			t.Fatal(err)
@@ -318,7 +318,7 @@ func TestPoolCloseStopsTimers(t *testing.T) {
 
 func TestTrialsBelongToTheirPeriod(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second, HalfOpenRequests: 2, HalfOpenSuccesses: 2}, clk, nil)
 		defer d.Close()
 		fail(t, d, 1)
@@ -363,7 +363,7 @@ func TestWindowNeverMovesBack(t *testing.T) {
 }
 
 type hookedClock struct {
-	*fakeclock.Clock
+	*timeshim.Fake
 	onNow func()
 }
 
@@ -371,11 +371,11 @@ func (c *hookedClock) Now() time.Time {
 	if c.onNow != nil {
 		c.onNow()
 	}
-	return c.Clock.Now()
+	return c.Fake.Now()
 }
 
 func TestDisableDuringEjection(t *testing.T) {
-	clk := &hookedClock{Clock: fakeclock.New()}
+	clk := &hookedClock{Fake: timeshim.NewFake(time.Unix(0, 0))}
 	d := NewOutlierDetector(OutlierConfig{ConsecutiveFailures: 1}, clk, nil)
 	defer d.Close()
 	clk.onNow = func() { d.SetConfig(OutlierConfig{}) }
@@ -386,9 +386,8 @@ func TestDisableDuringEjection(t *testing.T) {
 }
 
 func TestEjectionAcrossConfigAndReset(t *testing.T) {
-	clk := &hookedClock{Clock: fakeclock.New()}
 	epoch := time.Unix(0, 0)
-	clk.Advance(epoch.Add(-time.Second).Sub(clk.Now()))
+	clk := &hookedClock{Fake: timeshim.NewFake(epoch.Add(-time.Second))}
 	cfg := OutlierConfig{ConsecutiveFailures: 2, BaseEjection: time.Second}
 	d := NewOutlierDetector(cfg, clk, nil)
 	defer d.Close()

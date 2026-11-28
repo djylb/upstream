@@ -14,7 +14,7 @@ import (
 // checkDamping records the first verdict and enough transitions to start a hold.
 func checkDamping(t *testing.T, h *harness, key string, firstFails bool, n int) {
 	t.Helper()
-	synctest.Wait()
+	runDue(h.clk)
 	for i := 1; i <= n; i++ {
 		forceDampingCheck(t, h, key, firstFails != (i%2 != 0))
 	}
@@ -26,7 +26,7 @@ func forceDampingCheck(t *testing.T, h *harness, key string, fail bool) {
 	if !h.c.CheckNow(key) {
 		t.Fatalf("target %q is not checkable", key)
 	}
-	synctest.Wait()
+	runDue(h.clk)
 }
 
 func dampingOptions() Options {
@@ -44,7 +44,7 @@ func TestDampingPublishesLatestObservation(t *testing.T) {
 			},
 		})
 		generation := h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		forceDampingCheck(t, h, "a", false) // duplicate health
 		checkDamping(t, h, "a", false, 6)
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up, down}) {
@@ -57,7 +57,7 @@ func TestDampingPublishesLatestObservation(t *testing.T) {
 			t.Fatalf("hold and next check use %d timers, want 1", timers)
 		}
 		h.clk.Advance(29 * time.Second)
-		synctest.Wait()
+		runDue(h.clk)
 		latest := h.clk.Now()
 		forceDampingCheck(t, h, "a", true) // latest verdict equals the last published one
 		if s, _ := h.c.Status("a"); s.Health != down || s.Checks != 9 || !s.Last.Time.Before(latest) {
@@ -117,6 +117,21 @@ func TestDampingHoldDoublesCapsAndDecays(t *testing.T) {
 	hold(cfg.Base)
 }
 
+// dequeueDampingRelease holds the scheduler callback after its timer has
+// stopped being pending, so the test can run checker operations before it.
+func dequeueDampingRelease(t *testing.T, h *harness) func() {
+	t.Helper()
+	c := h.c
+	c.mu.Lock()
+	timer, due, seq := c.armTimer, c.armAt, c.armSeq
+	c.mu.Unlock()
+	if due.Sub(h.clk.Now()) != 30*time.Second || timer == nil || !timer.Stop() {
+		t.Fatal("no timer for the damping release")
+	}
+	h.clk.AdvanceTo(due)
+	return func() { c.fire(seq) }
+}
+
 func TestDampingRemovalDiscardsDequeuedRelease(t *testing.T) {
 	for name, remove := range map[string]func(*harness){
 		"remove":        func(h *harness) { h.c.Remove("a") },
@@ -135,15 +150,12 @@ func TestDampingRemovalDiscardsDequeuedRelease(t *testing.T) {
 				})
 				old := h.c.AddToGroup("g", "a", h.sw.target("a"))
 				checkDamping(t, h, "a", false, 2)
-				release := h.clk.TakeDue(h.clk.Now().Add(30 * time.Second))
-				if release == nil {
-					t.Fatal("no timer for the hold")
-				}
+				release := dequeueDampingRelease(t, h)
 				remove(h)
 				next := h.c.AddToGroup("g", "a", h.sw.target("replacement"))
-				synctest.Wait()
+				runDue(h.clk)
 				release()
-				synctest.Wait()
+				runDue(h.clk)
 				if !slices.Equal(removed, []uint64{old}) || next == old {
 					t.Fatalf("removed %v, replaced generation %d with %d", removed, old, next)
 				}
@@ -179,9 +191,9 @@ func TestDampingReleaseWhileProbeSlotsFull(t *testing.T) {
 			},
 		})
 		h.c.Put("waiting", h.sw.target("waiting"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.clk.Advance(30 * time.Second)
-		synctest.Wait()
+		runDue(h.clk)
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up}) || h.sw.count("waiting") != 0 {
 			t.Fatalf("target did not release while a probe owned the only slot: %v", got)
 		}
@@ -197,14 +209,14 @@ func TestDampingReconfiguration(t *testing.T) {
 		checkDamping(t, h, "a", false, 2)
 
 		h.c.SetConfig(cfg)
-		synctest.Wait()
+		runDue(h.clk)
 		if h.rep.len() != 2 {
 			t.Fatal("an unchanged policy ended the hold")
 		}
 
 		cfg.Damping.Base = time.Minute
 		h.c.SetConfig(cfg)
-		synctest.Wait()
+		runDue(h.clk)
 		if h.rep.len() != 3 || !h.rep.list[2].DampingReleased || h.rep.list[2].Health != up {
 			t.Fatalf("policy change did not release the held observation: %+v", h.rep.list)
 		}
@@ -212,7 +224,7 @@ func TestDampingReconfiguration(t *testing.T) {
 		checkDamping(t, h, "a", false, 2)
 		cfg.Disabled = true
 		h.c.SetConfig(cfg)
-		synctest.Wait()
+		runDue(h.clk)
 		if s, _ := h.c.Status("a"); s.Health != unknown || s.Checking || h.clk.Pending() != 0 {
 			t.Fatalf("disabled target: status %+v, timers %d", s, h.clk.Pending())
 		}
@@ -235,14 +247,14 @@ func TestDampingRespectsRiseAndFall(t *testing.T) {
 		o.Rise, o.Fall = 2, 2
 		h := newHarness(t, Config[string]{Options: o, Damping: DampConfig{Enabled: true, Flips: 1}})
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		for _, fail := range []bool{true, false, true, true, false, false, true} {
 			forceDampingCheck(t, h, "a", fail)
 		}
 		// The held health reached Up after two passes; one subsequent
 		// failure cannot change it before release.
 		h.clk.Advance(30 * time.Second)
-		synctest.Wait()
+		runDue(h.clk)
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up}) {
 			t.Fatalf("transitions %v", got)
 		}
@@ -258,12 +270,12 @@ func TestDampingAttachReplaysEffectiveHealth(t *testing.T) {
 		checkDamping(t, h, "a", false, 2)
 		late := newPool(t, upstream.Target[string]{ID: "other", Value: "a"})
 		mustAttach(t, h.c, "late", late, target)
-		synctest.Wait()
+		runDue(h.clk)
 		if a, b := healthOf(t, p, "a"), healthOf(t, late, "other"); a != down || b != down {
 			t.Fatalf("verdicts during hold: first %v, late %v", a, b)
 		}
 		h.clk.Advance(30 * time.Second)
-		synctest.Wait()
+		runDue(h.clk)
 		if a, b := healthOf(t, p, "a"), healthOf(t, late, "other"); a != up || b != up {
 			t.Fatalf("released verdicts: first %v, late %v", a, b)
 		}
@@ -299,16 +311,13 @@ func TestDampingHoldEndsBeforeLaterCheckIsPublished(t *testing.T) {
 		if !h.c.CheckNow("a") {
 			t.Fatal("could not start a probe during the hold")
 		}
-		synctest.Wait()
-		timer := h.clk.TakeDue(started.Add(30 * time.Second))
-		if timer == nil {
-			t.Fatal("missing release timer")
-		}
+		runDue(h.clk)
+		fire := dequeueDampingRelease(t, h)
 		finished := h.clk.Now()
 		close(blocked)
-		synctest.Wait()
-		timer()
-		synctest.Wait()
+		runDue(h.clk)
+		fire()
+		runDue(h.clk)
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up, down, up, down}) {
 			t.Fatalf("transitions %v", got)
 		}

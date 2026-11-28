@@ -13,7 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 func TestAttemptsAreDistinct(t *testing.T) {
@@ -84,7 +84,7 @@ func TestAttemptsManyTries(t *testing.T) {
 }
 
 func TestRetryBudget(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Attempts: 3, Budget: 0.5, MinRetries: -1}}, "a", "b", "c")
 	retries := 0
 	for range 10 {
@@ -125,7 +125,7 @@ func TestRetryBudget(t *testing.T) {
 }
 
 func TestRetryBudgetMinimum(t *testing.T) {
-	p := newTestPool(t, Config{Clock: fakeclock.New(), Retry: RetryConfig{Attempts: 2, Budget: 0.01}}, "a", "b")
+	p := newTestPool(t, Config{Clock: timeshim.NewFake(time.Unix(0, 0)), Retry: RetryConfig{Attempts: 2, Budget: 0.01}}, "a", "b")
 	n := 0
 	for range 20 {
 		a := p.Request("")
@@ -529,7 +529,7 @@ func TestRetryWindowAllocations(t *testing.T) {
 	if raceEnabled {
 		t.Skip("the race detector adds allocations")
 	}
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Window: time.Second, Budget: 1, Attempts: 2}}, "a", "b")
 	if allocs := testing.AllocsPerRun(30, func() {
 		clk.Advance(time.Second)
@@ -550,7 +550,7 @@ func TestBudgetAcrossLargeClockSteps(t *testing.T) {
 	if raceEnabled {
 		t.Skip("the race detector adds allocations")
 	}
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newTestPool(t, Config{Clock: clk, Retry: RetryConfig{Window: 1, Budget: 1, Attempts: 2}}, "a", "b")
 	if n := testing.AllocsPerRun(10, func() {
 		clk.Advance(1 << 32)

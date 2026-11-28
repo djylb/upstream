@@ -71,7 +71,7 @@
 // Construct pools with New. Pool methods support concurrent calls. Each
 // Request and Lease has one owner. Use Lease.Take to transfer ownership.
 // No lock is held while calling a
-// Balancer, a Clock, a probe or a subscriber, so callbacks may call back
+// Balancer, a clock, a probe or a subscriber, so callbacks may call back
 // into the pool. The pool rebuilds its view on the goroutine that changed
 // it, at most twice per change; a rebuild left over after that runs on a
 // short-lived goroutine of the pool, which builds nothing once Close has

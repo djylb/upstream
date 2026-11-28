@@ -9,9 +9,9 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 	"github.com/djylb/upstream/internal/dialresult"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 func mustWatch[T any](ctx context.Context, t *testing.T, p *upstream.Pool[T], target func(*upstream.Backend[T]) Target, cfg Config[string]) *Watcher {
@@ -62,9 +62,10 @@ func TestCloseResetsPoolHealth(t *testing.T) {
 			sw.set("a", true)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			clk := timeshim.NewFake(time.Unix(0, 0))
 			w := mustWatch(ctx, t, p, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) },
-				Config[string]{Clock: fakeclock.New()})
-			synctest.Wait()
+				Config[string]{Clock: clk})
+			runDue(clk)
 			if _, err := p.Pick(); !errors.Is(err, upstream.ErrUnavailable) {
 				t.Fatalf("Pick with the only member down: %v", err)
 			}
@@ -94,7 +95,7 @@ func TestCloseResetsPoolHealth(t *testing.T) {
 // checker: the target is checked once and reported to both.
 func TestAttachSharesChecks(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		sw.set("shared", true)
 		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1}})
@@ -104,7 +105,7 @@ func TestAttachSharesChecks(t *testing.T) {
 		target := func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) }
 		detach1 := mustAttach(t, c, 1, p1, target)
 		mustAttach(t, c, 2, p2, target)
-		synctest.Wait()
+		runDue(clk)
 		if sw.count("shared") != 1 || healthOf(t, p1, "shared") != down || healthOf(t, p2, "shared") != down || healthOf(t, p1, "one") != up {
 			t.Fatalf("checks %d, health %v %v %v", sw.count("shared"), healthOf(t, p1, "shared"), healthOf(t, p2, "shared"), healthOf(t, p1, "one"))
 		}
@@ -114,7 +115,7 @@ func TestAttachSharesChecks(t *testing.T) {
 
 		detach1()
 		detach1()
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p1, "shared") != unknown || healthOf(t, p1, "one") != unknown {
 			t.Fatal("detached pool kept its health verdicts")
 		}
@@ -123,12 +124,12 @@ func TestAttachSharesChecks(t *testing.T) {
 		}
 		sw.set("shared", false)
 		clk.Advance(time.Second)
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p2, "shared") != down { // Rise is 2
 			t.Fatal("rose after one check")
 		}
 		clk.Advance(time.Second)
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p2, "shared") != up || healthOf(t, p1, "shared") != unknown {
 			t.Fatalf("health %v, detached %v", healthOf(t, p2, "shared"), healthOf(t, p1, "shared"))
 		}
@@ -137,12 +138,12 @@ func TestAttachSharesChecks(t *testing.T) {
 		if err := p2.Put(upstream.Target[string]{ID: "two", Value: "two"}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		if keys := c.GroupKeys(2); len(keys) != 2 {
 			t.Fatalf("group 2: %v", keys)
 		}
 		p2.Close()
-		synctest.Wait()
+		runDue(clk)
 		if c.Len() != 0 || len(c.Groups()) != 0 {
 			t.Fatalf("after the pool closed: %d keys, groups %v", c.Len(), c.Groups())
 		}
@@ -153,7 +154,7 @@ func TestAttachSharesChecks(t *testing.T) {
 // while the attachment ends does not stay in the checker.
 func TestAttachEndsBeforeAdd(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+		c := New[string, int](t.Context(), Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 		defer c.Close()
 		p := newPool(t)
 		inTarget := make(chan struct{})
@@ -183,7 +184,8 @@ func TestAttachReplaysMissedReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		sw := newSwitchable()
 		sw.set("a", true)
-		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New(), Options: Options{Interval: time.Hour}})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Hour}})
 		defer c.Close()
 		p := newPool(t, upstream.Target[string]{ID: "a", Value: "a"})
 		b, _ := p.Backend("a")
@@ -193,12 +195,12 @@ func TestAttachReplaysMissedReport(t *testing.T) {
 		c.sinks = append(c.sinks, a.sink)
 		c.mu.Unlock()
 		gen := c.AddToGroup(1, "a", sw.target("a"))
-		synctest.Wait() // the check ran and its report was dropped
+		runDue(clk) // the check ran and its report was dropped
 		if b.Status().Health != unknown || sw.count("a") != 1 {
 			t.Fatalf("health %v after %d checks", b.Status().Health, sw.count("a"))
 		}
 		a.onEvent(upstream.Event[string]{Kind: upstream.EventAdded, Backend: b})
-		synctest.Wait()
+		runDue(clk)
 		if b.Status().Health != down || sw.count("a") != 1 {
 			t.Fatalf("health %v after %d checks: the missed verdict was not replayed", b.Status().Health, sw.count("a"))
 		}
@@ -213,7 +215,7 @@ func TestAttachReplaysMissedReport(t *testing.T) {
 func TestAttachNilTarget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := newPool(t, upstream.Target[string]{ID: "a", Value: "192.0.2.1:22"})
-		w := mustWatch(t.Context(), t, p, nil, Config[string]{Clock: fakeclock.New(), Options: Options{Disabled: true}})
+		w := mustWatch(t.Context(), t, p, nil, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0)), Options: Options{Disabled: true}})
 		defer w.Close()
 		synctest.Wait()
 		s, ok := w.Status("a")
@@ -238,11 +240,11 @@ func TestCheckNowAndReports(t *testing.T) {
 		h := newHarness(t, Config[string]{Options: Options{Interval: time.Hour}})
 		h.sw.latency["a"] = 3 * time.Millisecond
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		if !h.c.CheckNow("a") {
 			t.Fatal("CheckNow found no target")
 		}
-		synctest.Wait()
+		runDue(h.clk)
 		if n := h.sw.count("a"); n != 2 {
 			t.Fatalf("%d checks after CheckNow", n)
 		}
@@ -306,7 +308,7 @@ func TestReasonText(t *testing.T) {
 // another address leaves the old one.
 func TestAttachKeysByAddress(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1}})
 		defer c.Close()
@@ -317,12 +319,12 @@ func TestAttachKeysByAddress(t *testing.T) {
 			}
 			return sw.target(b.Value())
 		})
-		synctest.Wait()
+		runDue(clk)
 		if sw.count("addr") != 1 || healthOf(t, p, "a") != up || healthOf(t, p, "b") != up {
 			t.Fatalf("checks %d, health %v %v", sw.count("addr"), healthOf(t, p, "a"), healthOf(t, p, "b"))
 		}
 		p.Remove("a")
-		synctest.Wait()
+		runDue(clk)
 		if keys := c.GroupKeys(1); !slices.Equal(keys, []string{"addr"}) {
 			t.Fatalf("keys %v after one of two members left", keys)
 		}
@@ -332,7 +334,7 @@ func TestAttachKeysByAddress(t *testing.T) {
 		if err := p.Put(upstream.Target[string]{ID: "u", Value: "dns"}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		keys := c.GroupKeys(1)
 		slices.Sort(keys)
 		if !slices.Equal(keys, []string{"other", "udp/dns"}) {
@@ -345,7 +347,7 @@ func TestAttachKeysByAddress(t *testing.T) {
 // address. Pool 1's member never hears again, and stays down.
 func TestAttachSharedIDDivergentTargets(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		sw.set("old", true)
 		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1, Rise: 1, Fall: 1}})
@@ -353,17 +355,17 @@ func TestAttachSharedIDDivergentTargets(t *testing.T) {
 		p1 := newPool(t, upstream.Target[string]{ID: "x", Value: "old"}, upstream.Target[string]{ID: "y", Value: "y"})
 		target := func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) }
 		mustAttach(t, c, 1, p1, target)
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p1, "x") != down {
 			t.Fatalf("setup: %v", healthOf(t, p1, "x"))
 		}
 		p2 := newPool(t, upstream.Target[string]{ID: "x", Value: "new"})
 		mustAttach(t, c, 2, p2, target)
-		synctest.Wait()
+		runDue(clk)
 		sw.set("old", false)
 		for range 5 {
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk)
 		}
 		if h := healthOf(t, p1, "x"); h == down {
 			t.Fatalf("pool 1 member stuck %v; checks of old %d", h, sw.count("old"))
@@ -375,7 +377,7 @@ func TestAttachSharedIDDivergentTargets(t *testing.T) {
 // the next interval.
 func TestLateAttachTakesVerdict(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		sw.set("s", true)
 		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Hour, Jitter: -1, Rise: 1, Fall: 1}})
@@ -383,10 +385,10 @@ func TestLateAttachTakesVerdict(t *testing.T) {
 		target := func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) }
 		p1 := newPool(t, upstream.Target[string]{ID: "s", Value: "s"})
 		mustAttach(t, c, 1, p1, target)
-		synctest.Wait()
+		runDue(clk)
 		p2 := newPool(t, upstream.Target[string]{ID: "s", Value: "s"})
 		mustAttach(t, c, 2, p2, target)
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p1, "s") != down || healthOf(t, p2, "s") != down {
 			t.Fatalf("p1 %v p2 %v", healthOf(t, p1, "s"), healthOf(t, p2, "s"))
 		}
@@ -400,10 +402,10 @@ func TestWatchEndsWithPool(t *testing.T) {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
 			Config[string]{Clock: clk})
-		synctest.Wait()
+		runDue(clk)
 		p.Close()
 		<-c.Done()
 		if len(c.Statuses()) != 0 || clk.Pending() != 0 {
@@ -420,17 +422,18 @@ func TestWatchMatchesGenerations(t *testing.T) {
 			t.Fatal(err)
 		}
 		sw := newSwitchable()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
-			Config[string]{Clock: fakeclock.New()})
+			Config[string]{Clock: clk})
 		defer c.Close()
-		synctest.Wait()
+		runDue(clk)
 		old, _ := c.Status("a")
 		// Remove and re-add with the same address: a new generation.
 		p.Remove("a")
 		if err := p.Put(upstream.Target[string]{ID: "a", Value: "x"}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		cur, _ := c.Status("a")
 		if cur.Generation == old.Generation {
 			t.Fatal("re-added member kept its generation")
@@ -451,7 +454,7 @@ func TestWatchMatchesGenerations(t *testing.T) {
 // down before the other attached recovers with the address.
 func TestAttachNetworkSpellings(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		sw.set("x", true)
 		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Interval: time.Second, Jitter: -1, Rise: 1, Fall: 1}})
@@ -459,7 +462,7 @@ func TestAttachNetworkSpellings(t *testing.T) {
 		pa := newPool(t, upstream.Target[string]{ID: "a", Value: "x"})
 		pb := newPool(t, upstream.Target[string]{ID: "b", Value: "x"})
 		mustAttach(t, c, 2, pb, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) })
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, pb, "b") != down {
 			t.Fatal("b is not down")
 		}
@@ -468,12 +471,12 @@ func TestAttachNetworkSpellings(t *testing.T) {
 			t.Network = "tcp"
 			return t
 		})
-		synctest.Wait()
+		runDue(clk)
 		_ = pa.Put(upstream.Target[string]{ID: "a", Value: "x", Weight: 2}) // another AddToGroup
-		synctest.Wait()
+		runDue(clk)
 		sw.set("x", false)
 		clk.Advance(time.Second)
-		synctest.Wait()
+		runDue(clk)
 		s, _ := c.Status("x")
 		if s.Generation != 1 || healthOf(t, pa, "a") != up || healthOf(t, pb, "b") != up {
 			t.Fatalf("generation %d, health a %v, b %v", s.Generation, healthOf(t, pa, "a"), healthOf(t, pb, "b"))
@@ -487,13 +490,13 @@ func TestAttachNetworkSpellings(t *testing.T) {
 // TestAttachClosed checks that Attach reports a closed Checker or pool
 // instead of returning a detach function that does nothing.
 func TestAttachClosed(t *testing.T) {
-	c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+	c := New[string, int](t.Context(), Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 	p := newPool(t)
 	c.Close()
 	if _, err := Attach(c, 1, p, nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Attach to a closed checker = %v", err)
 	}
-	c = New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+	c = New[string, int](t.Context(), Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 	defer c.Close()
 	p.Close()
 	if _, err := Attach(c, 1, p, nil); !errors.Is(err, upstream.ErrClosed) {
@@ -505,7 +508,7 @@ func TestAttachClosed(t *testing.T) {
 // is checked without a target function.
 func TestAttachAddresser(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New(), Options: Options{Disabled: true}})
+		c := New[string, int](t.Context(), Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0)), Options: Options{Disabled: true}})
 		defer c.Close()
 		p := upstream.New[zoned](upstream.Config{})
 		defer p.Close()
@@ -548,14 +551,15 @@ func TestWatchAttachAndDirectReports(t *testing.T) {
 		p := newPool(t, upstream.Target[string]{ID: "a"})
 		sw := newSwitchable()
 		sw.set("a", true)
-		cfg := Config[string]{Clock: fakeclock.New()}
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		cfg := Config[string]{Clock: clk}
 		target := func(*upstream.Backend[string]) Target { return sw.target("a") }
 		w := mustWatch(t.Context(), t, p, target, cfg)
 		defer w.Close()
 		c := New[string, int](t.Context(), cfg)
 		defer c.Close()
 		detach := mustAttach(t, c, 1, p, target)
-		synctest.Wait()
+		runDue(clk)
 		b, _ := p.Backend("a")
 		bResult := upstream.CheckResult{Addr: "direct"}
 		p.ReportCheck(b, up, bResult)
@@ -579,7 +583,7 @@ func TestUnprobedWatcherPreservesObservation(t *testing.T) {
 		p.ReportCheck(b, down, want)
 		w := mustWatch(t.Context(), t, p, func(*upstream.Backend[string]) Target {
 			return Target{Network: "udp"}
-		}, Config[string]{Clock: fakeclock.New()})
+		}, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 		defer w.Close()
 		synctest.Wait()
 		if s := b.Status(); s.Health != down || s.LastCheck != want {
@@ -601,7 +605,7 @@ func TestWatcherDoneWaitsForTarget(t *testing.T) {
 			default:
 			}
 			return Target{Network: "udp"}
-		}, Config[string]{Clock: fakeclock.New()})
+		}, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 		defer w.Close()
 		if err := p.Put(upstream.Target[string]{ID: "a"}); err != nil {
 			t.Fatal(err)
@@ -615,10 +619,11 @@ func TestCheckerDoneWaitsForDetach(t *testing.T) {
 		p := newPool(t, upstream.Target[string]{ID: "a", Value: "a"})
 		sw := newSwitchable()
 		sw.set("a", true)
-		c := New[string, int](t.Context(), Config[string]{Clock: fakeclock.New()})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c := New[string, int](t.Context(), Config[string]{Clock: clk})
 		defer c.Close()
 		detach := mustAttach(t, c, 1, p, func(b *upstream.Backend[string]) Target { return sw.target(b.Value()) })
-		synctest.Wait()
+		runDue(clk)
 		if healthOf(t, p, "a") != down {
 			t.Fatal("missing initial Down verdict")
 		}
@@ -632,12 +637,12 @@ func TestCheckerDoneWaitsForDetach(t *testing.T) {
 			}
 		})()
 		go detach()
-		synctest.Wait()
+		runDue(clk)
 		if !entered {
 			t.Fatal("detach did not withdraw the verdict")
 		}
 		c.Close()
-		synctest.Wait()
+		runDue(clk)
 		select {
 		case <-c.Done():
 			t.Fatal("Done closed during detach")
@@ -658,19 +663,19 @@ func TestReplayRetainsItsPlaceBetweenObservations(t *testing.T) {
 			got = append(got, r.Latency)
 		}})
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.c.Put("gate", h.sw.target("gate"))
-		synctest.Wait()
+		runDue(h.clk)
 		for i := 1; i <= 2; i++ {
 			h.sw.latency["a"] = time.Duration(i)
 			h.c.CheckNow("a")
-			synctest.Wait()
+			runDue(h.clk)
 			if i == 1 {
 				h.c.replay("a", func(r Report[string]) { got = append(got, r.Latency) })
 			}
 		}
 		close(block)
-		synctest.Wait()
+		runDue(h.clk)
 		if want := []time.Duration{0, 1, 1, 2}; !slices.Equal(got, want) {
 			t.Fatalf("observation, replay and subsequent report: got %v, want %v", got, want)
 		}

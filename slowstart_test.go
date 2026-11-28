@@ -5,7 +5,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 func shareOf(t *testing.T, p *Pool[string], id string, n int) float64 {
@@ -15,8 +15,7 @@ func shareOf(t *testing.T, p *Pool[string], id string, n int) float64 {
 
 func TestSlowStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
-		clk.Advance(time.Unix(0, 0).Sub(clk.Now()))
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := New[string](Config{Clock: clk, SlowStart: 16 * time.Second, Outlier: OutlierConfig{ConsecutiveFailures: 1, BaseEjection: time.Second}})
 		if err := p.Sync(targets("a")); err != nil {
 			t.Fatal(err)
@@ -69,7 +68,7 @@ func TestSlowStart(t *testing.T) {
 }
 
 func TestSlowStartToleratesLaterStart(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := New[string](Config{Clock: clk, SlowStart: time.Minute})
 	defer p.Close()
 	if err := p.Sync(targets("a", "b")); err != nil {

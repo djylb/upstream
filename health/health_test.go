@@ -15,8 +15,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 var errDown = errors.New("down")
@@ -95,7 +95,7 @@ const (
 )
 
 type harness struct {
-	clk *fakeclock.Clock
+	clk *timeshim.Fake
 	sw  *switchable
 	rep *reports
 	c   *Checker[string, string]
@@ -105,7 +105,7 @@ type harness struct {
 // jitter.
 func newHarness(t *testing.T, cfg Config[string]) *harness {
 	t.Helper()
-	h := &harness{clk: fakeclock.New(), sw: newSwitchable(), rep: new(reports)}
+	h := &harness{clk: timeshim.NewFake(time.Unix(0, 0)), sw: newSwitchable(), rep: new(reports)}
 	cfg.Clock = h.clk
 	if cfg.Interval == 0 {
 		cfg.Interval = time.Second
@@ -121,10 +121,23 @@ func newHarness(t *testing.T, cfg Config[string]) *harness {
 	return h
 }
 
+// runDue drives zero-delay timers and gives their probes and callbacks
+// time to finish or block, without advancing beyond the current time.
+func runDue(clk *timeshim.Fake) {
+	for {
+		synctest.Wait()
+		at, ok := clk.Next()
+		if !ok || at.After(clk.Now()) {
+			return
+		}
+		clk.Advance(0)
+	}
+}
+
 func (h *harness) tick(n int) {
 	for range n {
 		h.clk.Advance(time.Second)
-		synctest.Wait()
+		runDue(h.clk)
 	}
 }
 
@@ -135,7 +148,7 @@ func TestRiseAndFall(t *testing.T) {
 		if s, _ := h.c.Status("a"); s.Health != unknown && s.Checks != 0 {
 			t.Fatalf("status before the first check: %+v", s)
 		}
-		synctest.Wait()
+		runDue(h.clk)
 		// The first check decides at once.
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{up}) {
 			t.Fatalf("changes %v after the first check", got)
@@ -183,7 +196,7 @@ func TestFirstFailureDecides(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.sw.set("a", true)
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		if got := h.rep.changes(); !slices.Equal(got, []upstream.Health{down}) {
 			t.Fatalf("changes %v", got)
 		}
@@ -198,7 +211,7 @@ func TestUncheckedNetworks(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.c.Put("dns", Target{Network: "udp", Address: "192.0.2.1:53"})
 		h.c.Put("custom", Target{Network: "udp", Address: "x", Probe: h.sw.probe})
-		synctest.Wait()
+		runDue(h.clk)
 		s, _ := h.c.Status("dns")
 		if s.Checking || s.Health != unknown || s.Checks != 0 {
 			t.Fatalf("UDP target without a probe: %+v", s)
@@ -218,7 +231,7 @@ func TestIntervals(t *testing.T) {
 		h.sw.set("down", true)
 		h.c.Put("up", h.sw.target("up"))
 		h.c.Put("down", h.sw.target("down"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(10)
 		if up, down := h.sw.count("up"), h.sw.count("down"); up != 2 || down != 11 {
 			t.Fatalf("checks: up %d, down %d; want 2 and 11", up, down)
@@ -247,7 +260,7 @@ func TestRuntimeOptions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{Options: Options{Interval: time.Hour}})
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 
 		// A shorter interval applies to the pending check at once.
 		cfg := Config[string]{Clock: h.clk, OnResult: h.rep.add, Options: Options{Interval: time.Second, Jitter: -1}}
@@ -259,7 +272,7 @@ func TestRuntimeOptions(t *testing.T) {
 
 		// Disabling one target forgets its health and stops its checks.
 		h.c.Put("a", Target{Probe: h.sw.probe, Address: "a", Options: Options{Disabled: true}})
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(5)
 		s, _ := h.c.Status("a")
 		if h.sw.count("a") != 2 || s.Checking || s.Health != unknown || h.clk.Pending() != 0 {
@@ -270,24 +283,24 @@ func TestRuntimeOptions(t *testing.T) {
 		}
 		// Enabling it checks at once.
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		if got := h.sw.count("a"); got != 3 {
 			t.Fatalf("checks after enabling: %d", got)
 		}
 
 		// Disabling globally stops every target.
 		h.c.Put("b", h.sw.target("b"))
-		synctest.Wait()
+		runDue(h.clk)
 		cfg.Disabled = true
 		h.c.SetConfig(cfg)
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(3)
 		if h.sw.count("a") != 3 || h.sw.count("b") != 1 || h.clk.Pending() != 0 {
 			t.Fatalf("globally disabled: a %d, b %d, %d timers", h.sw.count("a"), h.sw.count("b"), h.clk.Pending())
 		}
 		cfg.Disabled = false
 		h.c.SetConfig(cfg)
-		synctest.Wait()
+		runDue(h.clk)
 		if h.sw.count("a") != 4 || h.sw.count("b") != 2 {
 			t.Fatal("re-enabling did not check at once")
 		}
@@ -298,9 +311,9 @@ func TestAddressChangeStartsAfresh(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.c.AddToGroup("tunnel", "k", h.sw.target("old"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.c.AddToGroup("tunnel", "k", h.sw.target("new"))
-		synctest.Wait()
+		runDue(h.clk)
 		s, _ := h.c.Status("k")
 		if s.Checks != 1 || s.Target.Address != "new" || s.Health != up {
 			t.Fatalf("status %+v", s)
@@ -326,7 +339,7 @@ func TestGroupsShareTargets(t *testing.T) {
 		h.c.AddToGroup("t1", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
 		h.c.AddToGroup("t1", "10.0.0.2:80", h.sw.target("10.0.0.2:80"))
 		h.c.AddToGroup("t2", "10.0.0.1:80", h.sw.target("10.0.0.1:80"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(2)
 		if got := h.sw.count("10.0.0.1:80"); got != 3 {
 			t.Fatalf("shared target checked %d times, want once per interval (3)", got)
@@ -352,7 +365,7 @@ func TestGroupsShareTargets(t *testing.T) {
 		if !h.c.RemoveFromGroup("t2", "10.0.0.1:80") || h.c.RemoveFromGroup("t2", "10.0.0.1:80") {
 			t.Fatal("RemoveFrom")
 		}
-		synctest.Wait() // OnRemove runs on the dispatcher
+		runDue(h.clk) // OnRemove runs on the dispatcher
 		if h.c.Len() != 0 || len(h.c.Groups()) != 0 || h.clk.Pending() != 0 {
 			t.Fatalf("left %d keys, %d groups, %d timers", h.c.Len(), len(h.c.Groups()), h.clk.Pending())
 		}
@@ -379,10 +392,10 @@ func TestSyncGroup(t *testing.T) {
 		h := newHarness(t, Config[string]{})
 		h.c.SyncGroup("t", map[string]Target{"a": h.sw.target("a"), "b": h.sw.target("b")})
 		h.c.AddToGroup("other", "a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(1)
 		h.c.SyncGroup("t", map[string]Target{"b": h.sw.target("b"), "c": h.sw.target("c")})
-		synctest.Wait()
+		runDue(h.clk)
 		keys := h.c.GroupKeys("t")
 		slices.Sort(keys)
 		if !slices.Equal(keys, []string{"b", "c"}) {
@@ -414,18 +427,19 @@ func TestRemoveCancelsCheck(t *testing.T) {
 			return Observation{}, ctx.Err()
 		}
 		sw := newSwitchable()
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		c := New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: rep.add, Concurrency: 1, Options: Options{Timeout: time.Hour}})
 		defer c.Close()
 		c.Put("hang", Target{Probe: hang})
+		clk.Advance(0)
 		<-started
 		c.Put("next", Target{Probe: sw.probe, Address: "next"}) // waits for the only slot
-		synctest.Wait()
+		runDue(clk)
 		if sw.count("next") != 0 {
 			t.Fatal("concurrency bound not applied")
 		}
 		c.Remove("hang")
-		synctest.Wait()
+		runDue(clk)
 		if !canceled.Load() {
 			t.Fatal("check of a removed target not canceled")
 		}
@@ -437,7 +451,7 @@ func TestRemoveCancelsCheck(t *testing.T) {
 		}
 		// Adding the key again starts afresh.
 		c.Put("hang", Target{Probe: sw.probe, Address: "hang"})
-		synctest.Wait()
+		runDue(clk)
 		if s, _ := c.Status("hang"); s.Checks != 1 || s.Health != up {
 			t.Fatalf("re-added: %+v", s)
 		}
@@ -460,7 +474,7 @@ func TestSlowTargetDoesNotDelayOthers(t *testing.T) {
 		h.c.Put("slow", Target{Probe: slow})
 		h.c.Put("x", h.sw.target("x"))
 		h.c.Put("y", h.sw.target("y"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.tick(5)
 		if x, y := h.sw.count("x"), h.sw.count("y"); x != 6 || y != 6 {
 			t.Fatalf("fast checks %d and %d, want 6 each", x, y)
@@ -485,16 +499,17 @@ func TestConcurrencyBound(t *testing.T) {
 			running.Add(-1)
 			return Observation{}, nil
 		}
-		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), Concurrency: 3})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c := New[string, string](t.Context(), Config[string]{Clock: clk, Concurrency: 3})
 		for _, id := range []string{"a", "b", "c", "d", "e", "f", "g"} {
 			c.Put(id, Target{Probe: probe})
 		}
-		synctest.Wait()
+		runDue(clk)
 		if peak.Load() != 3 || running.Load() != 3 {
 			t.Fatalf("peak %d, running %d; want 3", peak.Load(), running.Load())
 		}
 		close(gate)
-		synctest.Wait()
+		runDue(clk)
 		if peak.Load() != 3 {
 			t.Fatalf("peak %d after the gate opened", peak.Load())
 		}
@@ -506,7 +521,7 @@ func TestLatencyStats(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, Config[string]{LatencyWindow: 3})
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		for _, ms := range []int{40, 10, 30, 20} {
 			h.sw.mu.Lock()
 			h.sw.latency["a"] = time.Duration(ms) * time.Millisecond
@@ -538,8 +553,10 @@ func TestCloseAndContext(t *testing.T) {
 			<-ctx.Done()
 			return Observation{}, ctx.Err()
 		}
-		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: rep.add, Options: Options{Timeout: time.Hour}})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c := New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: rep.add, Options: Options{Timeout: time.Hour}})
 		c.Put("a", Target{Probe: probe})
+		clk.Advance(0)
 		<-started
 		c.Close()
 		c.Close()
@@ -553,14 +570,14 @@ func TestCloseAndContext(t *testing.T) {
 		}
 	})
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		ctx, cancel := context.WithCancel(t.Context())
 		sw := newSwitchable()
 		c := New[string, string](ctx, Config[string]{Clock: clk})
 		c.Put("a", sw.target("a"))
-		synctest.Wait()
+		runDue(clk)
 		cancel()
-		synctest.Wait()
+		runDue(clk)
 		if clk.Pending() != 0 || len(c.Statuses()) != 0 {
 			t.Fatal("checker survives its context")
 		}
@@ -573,7 +590,7 @@ func TestCloseAndContext(t *testing.T) {
 // removes everything and checks that no timer or goroutine is left.
 func TestConcurrentChurn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		probe := func(ctx context.Context, t Target) (Observation, error) {
 			select {
 			case <-ctx.Done():
@@ -628,7 +645,7 @@ func TestConcurrentChurn(t *testing.T) {
 		for g := range 5 {
 			c.RemoveGroup(g)
 		}
-		synctest.Wait()
+		runDue(clk)
 		if len(c.Statuses()) != 0 || clk.Pending() != 0 {
 			t.Fatalf("%d keys and %d timers after removing every group", len(c.Statuses()), clk.Pending())
 		}
@@ -638,7 +655,7 @@ func TestConcurrentChurn(t *testing.T) {
 
 func TestWatchPool(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := upstream.New[string](upstream.Config{})
 		defer p.Close()
 		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "b", Value: "2"}}); err != nil {
@@ -657,7 +674,7 @@ func TestWatchPool(t *testing.T) {
 		sw.set("2", true)
 		target := func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} }
 		c := mustWatch(t.Context(), t, p, target, Config[string]{Clock: clk, Options: Options{Interval: time.Second, Fall: 2, Jitter: -1}})
-		synctest.Wait()
+		runDue(clk)
 		b, _ := p.Backend("b")
 		if b.State() != upstream.StateUnhealthy || !errors.Is(b.Status().LastCheck.Err, errDown) || b.Status().Health != down {
 			t.Fatalf("b is %v, status %+v", b.State(), b.Status())
@@ -667,7 +684,7 @@ func TestWatchPool(t *testing.T) {
 		}
 		for range 5 {
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk)
 		}
 		mu.Lock()
 		got := slices.Clone(states)
@@ -679,13 +696,13 @@ func TestWatchPool(t *testing.T) {
 		if err := p.Sync([]upstream.Target[string]{{ID: "a", Value: "1"}, {ID: "c", Value: "3"}}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		if len(c.Statuses()) != 2 || sw.count("3") != 1 {
 			t.Fatalf("checker has %d targets, c checked %d times", len(c.Statuses()), sw.count("3"))
 		}
 		before := sw.count("2")
 		clk.Advance(time.Second)
-		synctest.Wait()
+		runDue(clk)
 		if sw.count("2") != before {
 			t.Fatal("removed backend still checked")
 		}
@@ -693,7 +710,7 @@ func TestWatchPool(t *testing.T) {
 		if err := p.Put(upstream.Target[string]{ID: "d", Value: "4"}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		if sw.count("4") != 0 {
 			t.Fatal("closed checker still follows the pool")
 		}
@@ -705,11 +722,11 @@ func TestWatchClosedContext(t *testing.T) {
 	defer p.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if w, err := Watch(ctx, p, nil, Config[string]{Clock: fakeclock.New()}); !errors.Is(err, context.Canceled) || w != nil {
+	if w, err := Watch(ctx, p, nil, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))}); !errors.Is(err, context.Canceled) || w != nil {
 		t.Fatalf("Watch with a done context = %v, %v", w, err)
 	}
 	p.Close()
-	if _, err := Watch(t.Context(), p, nil, Config[string]{Clock: fakeclock.New()}); !errors.Is(err, upstream.ErrClosed) {
+	if _, err := Watch(t.Context(), p, nil, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))}); !errors.Is(err, upstream.ErrClosed) {
 		t.Fatalf("Watch of a closed pool = %v", err)
 	}
 }
@@ -810,7 +827,7 @@ func TestTCP(t *testing.T) {
 
 func TestDisableCancelsCheck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		var rep reports
 		gate := make(chan struct{})
 		var canceled atomic.Bool
@@ -827,12 +844,12 @@ func TestDisableCancelsCheck(t *testing.T) {
 		defer c.Close()
 		c.Put("a", Target{Probe: probe})
 		close(gate)
-		synctest.Wait() // first check: up
+		runDue(clk) // first check: up
 		gate = make(chan struct{})
 		clk.Advance(time.Hour)
-		synctest.Wait() // second check hangs
+		runDue(clk) // second check hangs
 		c.Put("a", Target{Probe: probe, Options: Options{Disabled: true}})
-		synctest.Wait()
+		runDue(clk)
 		s, _ := c.Status("a")
 		if !canceled.Load() || s.Health != unknown || s.Checking || clk.Pending() != 0 {
 			t.Fatalf("canceled %v, status %+v, %d timers", canceled.Load(), s, clk.Pending())
@@ -852,10 +869,11 @@ func TestWatchIgnoresStaleAddress(t *testing.T) {
 		}
 		sw := newSwitchable()
 		sw.set("old", true)
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
-			Config[string]{Clock: fakeclock.New()})
+			Config[string]{Clock: clk})
 		defer c.Close()
-		synctest.Wait()
+		runDue(clk)
 		// Reports about the old address do not apply to the new one.
 		c.c.mu.Lock()
 		sink := c.c.sinks[0].fn
@@ -863,7 +881,7 @@ func TestWatchIgnoresStaleAddress(t *testing.T) {
 		if err := p.Put(upstream.Target[string]{ID: "a", Value: "new"}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait()
+		runDue(clk)
 		sink(Report[string]{Result: Result{Health: down, Previous: up}, Key: "a", Target: Target{Probe: sw.probe, Address: "old"}})
 		if b, _ := p.Backend("a"); b.Status().Health != up {
 			t.Fatalf("stale report applied: %+v", b.Status())
@@ -875,12 +893,14 @@ func TestCloseFromCallbacks(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var c *Checker[string, string]
 		closed := make(chan struct{})
-		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnChange: func(Report[string]) {
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c = New[string, string](t.Context(), Config[string]{Clock: clk, OnChange: func(Report[string]) {
 			c.Close() // must not wait for this callback
 			close(closed)
 		}})
 		sw := newSwitchable()
 		c.Put("a", sw.target("a"))
+		clk.Advance(0)
 		<-closed
 		c.Close() // from outside too: does not wait
 		<-c.Done()
@@ -895,8 +915,10 @@ func TestCloseFromCallbacks(t *testing.T) {
 			return Observation{}, nil
 		}
 		var rep reports
-		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: rep.add})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c = New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: rep.add})
 		c.Put("a", Target{Probe: probe})
+		clk.Advance(0)
 		<-c.Done()
 		if rep.len() != 0 {
 			t.Fatal("result of a check that closed the checker was reported")
@@ -906,14 +928,15 @@ func TestCloseFromCallbacks(t *testing.T) {
 		// Removal methods from a callback.
 		var c *Checker[string, string]
 		sw := newSwitchable()
-		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnChange: func(r Report[string]) {
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c = New[string, string](t.Context(), Config[string]{Clock: clk, OnChange: func(r Report[string]) {
 			c.RemoveGroup("g")
 			c.SyncGroup("h", map[string]Target{"z": sw.target("z")})
 			c.Remove(r.Key)
 		}})
 		defer c.Close()
 		c.AddToGroup("g", "a", sw.target("a"))
-		synctest.Wait()
+		runDue(clk)
 		if _, ok := c.Status("a"); ok || len(c.GroupKeys("g")) != 0 {
 			t.Fatal("removal from a callback did not apply")
 		}
@@ -922,7 +945,7 @@ func TestCloseFromCallbacks(t *testing.T) {
 
 func TestNoCallbackAfterRemove(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		block := make(chan struct{})
 		var mu sync.Mutex
@@ -955,12 +978,12 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 		})
 		defer c.Close()
 		c.Put("block", sw.target("block"))
-		synctest.Wait() // the dispatcher is stuck in block's first callback
+		runDue(clk) // the dispatcher is stuck in block's first callback
 		c.Put("x", sw.target("x"))
 		c.Put("y", sw.target("y"))
 		for range 50 {
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk)
 		}
 		gen := func() uint64 { s, _ := c.Status("x"); return s.Generation }()
 		c.Remove("x")
@@ -968,7 +991,7 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 		removedAt = true
 		mu.Unlock()
 		close(block)
-		synctest.Wait()
+		runDue(clk)
 		mu.Lock()
 		defer mu.Unlock()
 		if late != 0 || xReports != 0 {
@@ -986,7 +1009,7 @@ func TestNoCallbackAfterRemove(t *testing.T) {
 
 func TestBlockedCallbackCoalesces(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		sw := newSwitchable()
 		block := make(chan struct{})
 		var n atomic.Int32
@@ -1004,12 +1027,12 @@ func TestBlockedCallbackCoalesces(t *testing.T) {
 		})
 		defer c.Close()
 		c.Put("block", sw.target("block"))
-		synctest.Wait()
+		runDue(clk)
 		c.Put("y", sw.target("y"))
-		synctest.Wait()
+		runDue(clk)
 		for range 100 {
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk)
 		}
 		c.mu.Lock()
 		queued := len(c.queue)
@@ -1018,7 +1041,7 @@ func TestBlockedCallbackCoalesces(t *testing.T) {
 			t.Fatalf("%d callbacks queued behind a blocked one", queued)
 		}
 		close(block)
-		synctest.Wait()
+		runDue(clk)
 		if s, _ := c.Status("y"); n.Load() > 3 || s.Checks != 101 {
 			t.Fatalf("y: %d reports delivered, %d checks", n.Load(), s.Checks)
 		}
@@ -1044,13 +1067,14 @@ func TestWatchCloseFromPoolSubscriber(t *testing.T) {
 				once.Do(func() { w.Close(); close(closed) }) // on the dispatcher, through ReportCheck
 			}
 		})
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		c := mustWatch(t.Context(), t, p, func(b *upstream.Backend[string]) Target { return Target{Probe: sw.probe, Address: b.Value()} },
-			Config[string]{Clock: fakeclock.New(), Options: Options{Rise: 1}})
-		synctest.Wait()
+			Config[string]{Clock: clk, Options: Options{Rise: 1}})
+		runDue(clk)
 		cp.Store(c)
 		sw.set("a", false)
 		c.CheckNow("a") // a state change after the pointer is set
-		synctest.Wait()
+		runDue(clk)
 		select {
 		case <-closed:
 		default:
@@ -1162,9 +1186,10 @@ func TestDoneAndWait(t *testing.T) {
 			<-gate // ignores ctx on purpose: Done must wait for it
 			return Observation{}, nil
 		}
-		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New()})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c := New[string, string](t.Context(), Config[string]{Clock: clk})
 		c.Put("a", Target{Probe: probe})
-		synctest.Wait()
+		runDue(clk)
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		if err := c.Wait(ctx); !errors.Is(err, context.Canceled) {
@@ -1201,10 +1226,12 @@ func TestConcurrentCloseEverywhere(t *testing.T) {
 			c.Close()
 			return Observation{}, nil
 		}
-		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(), OnResult: func(Report[string]) { c.Close() }})
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c = New[string, string](t.Context(), Config[string]{Clock: clk, OnResult: func(Report[string]) { c.Close() }})
 		for _, k := range []string{"a", "b", "c", "d"} {
 			c.Put(k, Target{Probe: probe})
 		}
+		clk.Advance(0)
 		var wg sync.WaitGroup
 		for range 3 {
 			wg.Go(c.Close)
@@ -1234,10 +1261,10 @@ func TestAddressChangeEndsGeneration(t *testing.T) {
 			},
 		})
 		h.c.Put("k", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		h.c.Put("k", Target{Probe: h.sw.probe, Network: "tcp", Address: "a"}) // the same network
 		h.c.Put("k", h.sw.target("b"))
-		synctest.Wait()
+		runDue(h.clk)
 		mu.Lock()
 		defer mu.Unlock()
 		want := []string{"result 1 up", "remove k 1", "result 2 unknown", "result 2 up"}
@@ -1280,7 +1307,7 @@ func TestTCPNoAddress(t *testing.T) {
 // timeout runs on it.
 func TestCheckerClockIsOnlyTimeSource(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		dial := func(context.Context, string, string) (net.Conn, error) {
 			clk.Advance(3 * time.Second)
 			a, b := net.Pipe()
@@ -1290,18 +1317,18 @@ func TestCheckerClockIsOnlyTimeSource(t *testing.T) {
 		results := make(chan Report[string], 4)
 		c := New[string, string](t.Context(), Config[string]{
 			Clock:    clk,
-			TCP:      TCPOptions{Dial: dial, Clock: upstream.SystemClock()},
+			TCP:      TCPOptions{Dial: dial, Clock: timeshim.Real},
 			Options:  Options{Interval: time.Hour, Timeout: time.Minute},
 			OnResult: func(r Report[string]) { results <- r },
 		})
 		defer c.Close()
 		c.Put("tcp", Target{Address: "tcp.invalid:80"})
-		synctest.Wait()
+		runDue(clk)
 		if r := <-results; r.Err != nil || r.Latency != 3*time.Second {
 			t.Fatalf("TCP check: err %v, latency %v, want nil, 3s", r.Err, r.Latency)
 		}
 		c.Remove("tcp")
-		synctest.Wait()
+		runDue(clk)
 
 		deadlines := make(chan time.Time, 1)
 		hang := func(ctx context.Context, _ Target) (Observation, error) {
@@ -1315,17 +1342,17 @@ func TestCheckerClockIsOnlyTimeSource(t *testing.T) {
 		}
 		want := clk.Now().Add(time.Minute)
 		c.Put("hang", Target{Probe: hang})
-		synctest.Wait()
+		runDue(clk)
 		if d := <-deadlines; !d.Equal(want) {
 			t.Fatalf("probe deadline %v, want %v", d, want)
 		}
 		clk.Advance(time.Minute - time.Nanosecond)
-		synctest.Wait()
+		runDue(clk)
 		if len(results) != 0 {
 			t.Fatal("check timed out early")
 		}
 		clk.Advance(time.Nanosecond)
-		synctest.Wait()
+		runDue(clk)
 		if r := <-results; r.Reason != ReasonTimeout || !errors.Is(r.Err, context.DeadlineExceeded) {
 			t.Fatalf("timed out check: %v (%v), want ReasonTimeout", r.Err, r.Reason)
 		}
@@ -1333,7 +1360,7 @@ func TestCheckerClockIsOnlyTimeSource(t *testing.T) {
 }
 
 func TestTCPLatencyUsesClock(t *testing.T) {
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	dial := func(context.Context, string, string) (net.Conn, error) {
 		clk.Advance(2 * time.Second)
 		a, b := net.Pipe()
@@ -1378,7 +1405,7 @@ func TestTouchPostponesChecksWhileUp(t *testing.T) {
 			t.Fatal("Touch of a missing key")
 		}
 		h.c.Put("a", h.sw.target("a"))
-		synctest.Wait()
+		runDue(h.clk)
 		if got := h.sw.count("a"); got != 1 {
 			t.Fatalf("first check: %d", got)
 		}
@@ -1419,12 +1446,13 @@ func TestRemoveDuringOnResult(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var c *Checker[string, string]
 		var removed bool
-		c = New[string, string](t.Context(), Config[string]{Clock: fakeclock.New(),
+		clk := timeshim.NewFake(time.Unix(0, 0))
+		c = New[string, string](t.Context(), Config[string]{Clock: clk,
 			OnResult: func(r Report[string]) { removed = c.Remove(r.Key) },
 			OnChange: func(Report[string]) { t.Error("change callback after remove") }})
 		defer c.Close()
 		c.Put("a", Target{Probe: newSwitchable().probe})
-		synctest.Wait()
+		runDue(clk)
 		if !removed {
 			t.Fatal("OnResult did not remove the target")
 		}
@@ -1438,7 +1466,7 @@ func TestAttachmentReplayPanic(t *testing.T) {
 		if err := p.Sync([]upstream.Target[string]{{ID: "a"}, {ID: "b"}}); err != nil {
 			t.Fatal(err)
 		}
-		c := New[string, string](t.Context(), Config[string]{Clock: fakeclock.New()})
+		c := New[string, string](t.Context(), Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 		func() {
 			defer func() {
 				if recover() != "target" {
@@ -1477,16 +1505,16 @@ func TestTCPRejectsUDP(t *testing.T) {
 func TestLateProbeResults(t *testing.T) {
 	for _, probeErr := range []error{nil, &net.DNSError{Err: "missing"}, os.ErrNotExist} {
 		synctest.Test(t, func(t *testing.T) {
-			clk := fakeclock.New()
+			clk := timeshim.NewFake(time.Unix(0, 0))
 			c := New[string, string](t.Context(), Config[string]{Clock: clk, Options: Options{Timeout: time.Second}})
 			defer c.Close()
 			c.Put("a", Target{Probe: func(ctx context.Context, _ Target) (Observation, error) {
 				<-ctx.Done()
 				return Observation{}, probeErr
 			}})
-			synctest.Wait()
+			runDue(clk)
 			clk.Advance(time.Second)
-			synctest.Wait()
+			runDue(clk)
 			s, _ := c.Status("a")
 			if s.Last.Reason != ReasonTimeout || !errors.Is(s.Last.Err, context.DeadlineExceeded) || probeErr != nil && !errors.Is(s.Last.Err, probeErr) {
 				t.Fatalf("late result %+v", s.Last)
@@ -1517,7 +1545,7 @@ func TestWatchSkipsReplacedEvent(t *testing.T) {
 				t.Error("stale target")
 			}
 			return Target{Network: "udp"}
-		}, Config[string]{Clock: fakeclock.New()})
+		}, Config[string]{Clock: timeshim.NewFake(time.Unix(0, 0))})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1549,38 +1577,28 @@ func TestTCPClosesOnPanic(t *testing.T) {
 }
 
 type admissionClock struct {
-	*fakeclock.Clock
+	*timeshim.Fake
 	beforeProbe func()
 }
-type admissionContext struct {
-	context.Context //nolint:containedctx // this test context delegates its deadline and cancellation to the fake clock
-	beforeProbe     func()
-}
 
-func (c *admissionContext) Err() error {
-	err := c.Context.Err()
-	if c.beforeProbe != nil {
-		f := c.beforeProbe
-		c.beforeProbe = nil
-		f()
+func (c *admissionClock) AfterFunc(d time.Duration, f func()) timeshim.Timer {
+	timer := c.Fake.AfterFunc(d, f)
+	if d == time.Minute {
+		c.beforeProbe()
 	}
-	return err
-}
-func (c *admissionClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	child, cancel := c.Clock.WithTimeout(ctx, d)
-	return &admissionContext{child, c.beforeProbe}, cancel
+	return timer
 }
 func TestRemovalDuringProbeAdmission(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := &admissionClock{Clock: fakeclock.New()}
-		c := New[string, int](t.Context(), Config[string]{Clock: clk})
+		clk := &admissionClock{Fake: timeshim.NewFake(time.Unix(0, 0))}
+		c := New[string, int](t.Context(), Config[string]{Clock: clk, Options: Options{Timeout: time.Minute}})
 		defer c.Close()
 		clk.beforeProbe = func() { c.Remove("a") }
 		c.Put("a", Target{Probe: func(context.Context, Target) (Observation, error) {
 			t.Error("probe after removal")
 			return Observation{}, nil
 		}})
-		synctest.Wait()
+		runDue(clk.Fake)
 		if c.Len() != 0 {
 			t.Fatal("removal did not run")
 		}

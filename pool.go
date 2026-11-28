@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // Errors returned by Pool.
@@ -139,8 +141,8 @@ type Config struct {
 	// Balancer chooses backends. Nil means WeightedRoundRobin.
 	Balancer Balancer
 
-	// Clock is the time source. Nil means SystemClock.
-	Clock Clock
+	// Clock is the time source. Nil means timeshim.Real.
+	Clock timeshim.Clock
 
 	// Equal reports whether two target values mean the same backend, so
 	// that Sync and Put keep a member whose weight and value did not
@@ -251,7 +253,7 @@ type Pool[T any] struct {
 	retry        atomic.Pointer[retryParams]
 	equalVersion uint64 // changes when SetConfig installs a comparator
 	guard        ejectionGuard
-	clock        Clock
+	clock        timeshim.Clock
 
 	mu       sync.Mutex
 	cfg      settings[T]
@@ -277,8 +279,8 @@ type Pool[T any] struct {
 	qmu   sync.Mutex
 	queue []delivery[T]
 
-	rampMu   sync.Mutex
-	rampStop func() bool
+	rampMu    sync.Mutex
+	rampTimer timeshim.Timer
 
 	closedCh chan struct{} // closed by Close
 }
@@ -565,7 +567,7 @@ func diffLists[T any](a, b []*Backend[T]) *Delta {
 // New returns an empty pool.
 func New[T any](cfg Config) *Pool[T] {
 	p := &Pool[T]{
-		clock:    clockOrSystem(cfg.Clock),
+		clock:    timeshim.Or(cfg.Clock),
 		closedCh: make(chan struct{}),
 	}
 	epoch := p.clock.Now()
@@ -1466,17 +1468,17 @@ func (p *Pool[T]) armRamp(d time.Duration) {
 	if p.isClosed.Load() || !p.rampArmed.CompareAndSwap(false, true) {
 		return
 	}
-	stop := p.clock.AfterFunc(d, func() {
+	timer := p.clock.AfterFunc(d, func() {
 		p.rampArmed.Store(false)
 		p.refresh()
 	})
 	p.rampMu.Lock()
 	if p.isClosed.Load() {
 		p.rampMu.Unlock()
-		stop()
+		timer.Stop()
 		return
 	}
-	p.rampStop = stop
+	p.rampTimer = timer
 	p.rampMu.Unlock()
 }
 
@@ -1776,7 +1778,7 @@ func (p *Pool[T]) Status() []Status {
 
 // Clock returns the pool's time source, for packages that measure the
 // latencies they observe on its leases.
-func (p *Pool[T]) Clock() Clock { return p.clock }
+func (p *Pool[T]) Clock() timeshim.Clock { return p.clock }
 
 // Done returns a channel that is closed when Close is called. The pool
 // starts no goroutines but the short-lived one that finishes a rebuild a
@@ -1814,10 +1816,10 @@ func (p *Pool[T]) Close() {
 		b.core.det.Close()
 	}
 	p.rampMu.Lock()
-	stop := p.rampStop
-	p.rampStop = nil
+	timer := p.rampTimer
+	p.rampTimer = nil
 	p.rampMu.Unlock()
-	if stop != nil {
-		stop()
+	if timer != nil {
+		timer.Stop()
 	}
 }

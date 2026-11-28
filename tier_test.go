@@ -11,7 +11,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 // tiers returns targets for ids with the given priorities.
@@ -363,7 +363,7 @@ func TestTierPickerReuse(t *testing.T) {
 // TestTierSlowStart checks that slow start ramps a member within its tier.
 func TestTierSlowStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		rec := &buildRecorder{}
 		p := New[string](Config{Clock: clk, Balancer: rec, SlowStart: time.Minute})
 		defer p.Close()
@@ -559,7 +559,7 @@ func TestOfflineInPanicMode(t *testing.T) {
 // up like one that recovers.
 func TestOfflineSlowStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		rec := &buildRecorder{}
 		p := New[string](Config{Clock: clk, Balancer: rec, SlowStart: time.Minute})
 		defer p.Close()

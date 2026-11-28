@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 	"github.com/djylb/upstream/internal/dialresult"
-	"github.com/djylb/upstream/internal/fakeclock"
 )
 
 var errRefused = errors.New("refused")
@@ -287,7 +287,7 @@ func TestDialClosesConnWithError(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	pd := &pipeDialer{served: make(chan string, 1)}
 	defer pd.wg.Wait()
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newPool(t, upstream.Config{Clock: clk, Retry: upstream.RetryConfig{Attempts: 2}},
 		upstream.Target[string]{ID: "a", Value: "half"}, upstream.Target[string]{ID: "b", Value: "b", Priority: 1})
 	d := &Dialer[string]{Pool: p, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -337,7 +337,7 @@ func TestDialAddresser(t *testing.T) {
 func TestDialLatencyUsesPoolClock(t *testing.T) {
 	pd := &pipeDialer{served: make(chan string, 1)}
 	defer pd.wg.Wait()
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newPool(t, upstream.Config{Clock: clk}, upstream.Target[string]{ID: "a", Value: "a"})
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 		clk.Advance(7 * time.Millisecond)

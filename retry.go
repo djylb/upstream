@@ -6,6 +6,8 @@ import (
 	"math"
 	"slices"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // Errors returned by Request.Next when it declines a retry.
@@ -50,14 +52,14 @@ type RetryConfig struct {
 type retryParams struct {
 	counts   *window
 	epoch    time.Time
-	clock    Clock
+	clock    timeshim.Clock
 	window   time.Duration
 	budget   float64 // 0 means no budget
 	min      float64
 	attempts int
 }
 
-func newRetryParams(c RetryConfig, clock Clock, epoch time.Time) *retryParams {
+func newRetryParams(c RetryConfig, clock timeshim.Clock, epoch time.Time) *retryParams {
 	p := &retryParams{counts: new(window), clock: clock, window: c.Window, attempts: max(c.Attempts, 1), epoch: epoch}
 	if c.Budget > 0 && !math.IsInf(c.Budget, 1) {
 		p.budget = c.Budget

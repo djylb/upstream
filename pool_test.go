@@ -13,7 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 func targets(ids ...string) []Target[string] {
@@ -717,7 +717,7 @@ func TestBalancerMayCallPool(t *testing.T) {
 
 // ejectToHalfOpen ejects backend id with failures and waits for its
 // ejection to end.
-func ejectToHalfOpen(t *testing.T, p *Pool[string], clk *fakeclock.Clock, id string) {
+func ejectToHalfOpen(t *testing.T, p *Pool[string], clk *timeshim.Fake, id string) {
 	t.Helper()
 	b, _ := p.Backend(id)
 	for b.Status().Outlier.State == OutlierOK {
@@ -737,7 +737,7 @@ func ejectToHalfOpen(t *testing.T, p *Pool[string], clk *fakeclock.Clock, id str
 
 func pickHalfOpenTrial(t *testing.T) (*Pool[string], Lease[string]) {
 	t.Helper()
-	clk := fakeclock.New()
+	clk := timeshim.NewFake(time.Unix(0, 0))
 	p := newOrderedPool(t, Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}}, "a", "b")
 	ejectToHalfOpen(t, p, clk, "a")
 	trial := mustPick(t, p)
@@ -750,7 +750,7 @@ func pickHalfOpenTrial(t *testing.T) (*Pool[string], Lease[string]) {
 
 func TestPickFallsBackWhenBalancerInsists(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := New[string](Config{Clock: clk, Outlier: OutlierConfig{ConsecutiveFailures: 1}})
 		defer p.Close()
 		if err := p.Sync([]Target[string]{{ID: "heavy", Weight: 50}, {ID: "light"}}); err != nil {
@@ -925,7 +925,7 @@ func TestDrainNeverClosesEarly(t *testing.T) {
 // slots, as after an ejection of the whole pool ends.
 func TestFallbackAllWhenEligibleRefuse(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newTestPool(t, Config{
 			Clock:    clk,
 			Fallback: FallbackAll,
@@ -1092,7 +1092,7 @@ func TestRebuildsCoalesce(t *testing.T) {
 // share of members out within the cap, and ejects more once one recovers.
 func TestMaxEjectionPercent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newTestPool(t, Config{Clock: clk, Outlier: OutlierConfig{
 			ConsecutiveFailures: 1, BaseEjection: time.Second, MaxEjectionPercent: 50,
 		}}, "a", "b", "c", "d")
@@ -1164,7 +1164,7 @@ func TestPanicThreshold(t *testing.T) {
 // keeps its members' state.
 func TestSetConfig(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newTestPool(t, Config{Clock: clk, Balancer: inOrder{}}, "a", "b")
 		a, _ := p.Backend("a")
 		l := mustPick(t, p)
@@ -1681,7 +1681,7 @@ func TestRetiredReservationRefund(t *testing.T) {
 
 func TestRendezvousSkipsExhaustedTrials(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		p := newTestPool(t, Config{Clock: clk, Balancer: Rendezvous(RendezvousConfig{}), Outlier: OutlierConfig{ConsecutiveFailures: 1}}, "a", "b", "c", "d")
 		for _, id := range []string{"a", "b", "c"} {
 			l, err := p.Acquire(id)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 )
 
@@ -58,7 +59,7 @@ type Options struct {
 
 	// Timeout bounds each check. The default is the smaller of 5s and
 	// Interval. The probe's context comes from the Checker's
-	// Clock.WithTimeout, so its Deadline reports when the check ends; the
+	// timeshim.WithTimeout, so its Deadline reports when the check ends; the
 	// error of a probe that fails after that wraps
 	// context.DeadlineExceeded, so it reads as ReasonTimeout.
 	Timeout time.Duration
@@ -133,10 +134,10 @@ func (o Options) withDefaults() Options {
 // fixed when the Checker is created; SetConfig changes the rest.
 type Config[K comparable] struct {
 	// Clock schedules checks and timestamps results. Nil means
-	// upstream.SystemClock. It is the Checker's only time source: check
+	// timeshim.Real. It is the Checker's only time source: check
 	// timeouts and the latency the default TCP check measures use it too,
 	// whatever TCP.Clock says.
-	Clock upstream.Clock
+	Clock timeshim.Clock
 
 	// OnResult, if not nil, is called after every check, and when a
 	// target's health becomes upstream.HealthUnknown because its checks

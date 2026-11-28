@@ -27,9 +27,8 @@ the state of every backend.
   fallback change on a running pool without losing state.
 - Slow start for backends that join or recover, explicit all-down behaviour,
   edge-triggered events.
-- Standard library only. Each piece works on its own: balancers without the
-  pool, the outlier detector for a single target, the health checker for any
-  set of addresses.
+- Each piece works on its own: balancers without the pool, the outlier
+  detector for a single target, the health checker for any set of addresses.
 
 ## Install
 
@@ -39,13 +38,14 @@ go get github.com/djylb/upstream
 
 | Package    | Contents                                                                         |
 |------------|----------------------------------------------------------------------------------|
-| `upstream` | `Pool`, balancers, retries, `OutlierDetector`, `Clock`                           |
+| `upstream` | `Pool`, balancers, retries, `OutlierDetector`                                    |
 | `health`   | `Checker` for active health checks, TCP check, `Watch` and `Attach` to drive pools |
 | `uphttp`   | HTTP health check, per-backend `http.Transport` cache, `RoundTripper` over a pool |
 | `upnet`    | `Dialer` that connects to a pool's backends                                      |
 
-The root package does not import `net` or `net/http`; `upnet` does not
-import `net/http`.
+The shared clock is the only dependency outside the standard library. The
+root package does not import `net` or `net/http`; `upnet` does not import
+`net/http`.
 
 ## Picking backends
 
@@ -477,8 +477,8 @@ checker.RemoveGroup(7) // tunnel deleted: its checks stop at once
   at once, without writing or reading application data. Host names are
   resolved by every check; the result names the address that answered. The
   latency covers the connection to that address only, not name resolution,
-  and is measured on the checker's `Clock`, which also runs check timeouts: the
-  probe's context carries the check's deadline.
+  and is measured on the checker's `timeshim.Clock`. The same clock drives
+  check timeouts, and the probe's context carries the check's deadline.
   The normal close leaves a short-lived TIME_WAIT entry on the checking host;
   `TCPOptions.Reset` closes with a reset instead, which avoids that but may be
   logged by the target. `TCPOptions.Dial` plugs in your own dialer or
@@ -600,8 +600,11 @@ a member's value, weight, priority, in-flight cap or cost changes.
   itself.
 - A watcher started with `Watch` belongs to its pool and closes with it; a
   pool attached with `Attach` leaves its checker when it closes.
-- Time comes from an injectable `Clock`, so behaviour over time can be tested
-  without waiting.
+- The pool, health checker, TCP probe and transport cache take a
+  [`timeshim.Clock`](https://pkg.go.dev/github.com/djylb/timeshim#Clock).
+  Leave `Clock` unset to use the system clock. Pass a `timeshim.NewFake` clock
+  and advance it explicitly to test timing without waiting. The standalone
+  outlier detector takes the same clock as a constructor argument.
 
 ## Limits
 

@@ -6,13 +6,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/djylb/upstream"
+	"github.com/djylb/timeshim"
 )
 
 // TransportCacheConfig configures a TransportCache.
 type TransportCacheConfig struct {
-	// Clock is the time source. Nil means upstream.SystemClock.
-	Clock upstream.Clock
+	// Clock is the time source. Nil means timeshim.Real.
+	Clock timeshim.Clock
 
 	// IdleTTL drops a transport that has not been returned by Get for this
 	// long. Zero keeps transports until they are evicted or removed.
@@ -45,7 +45,7 @@ type TransportCacheConfig struct {
 // when a member's value, weight, priority, in-flight cap or cost changes.
 type TransportCache[K comparable] struct {
 	newTransport func(K) *http.Transport
-	clock        upstream.Clock
+	clock        timeshim.Clock
 	ttl          time.Duration
 	maxEntries   int
 
@@ -69,18 +69,14 @@ type cacheEntry[K comparable] struct {
 // any lock held and may be called twice for one key when two Gets race;
 // the loser's transport is discarded unused.
 func NewTransportCache[K comparable](newTransport func(K) *http.Transport, cfg TransportCacheConfig) *TransportCache[K] {
-	c := &TransportCache[K]{
+	return &TransportCache[K]{
 		newTransport: newTransport,
-		clock:        cfg.Clock,
+		clock:        timeshim.Or(cfg.Clock),
 		ttl:          max(cfg.IdleTTL, 0),
 		maxEntries:   max(cfg.MaxEntries, 0),
 		building:     make(map[K]*transportBuild),
 		entries:      make(map[K]*list.Element),
 	}
-	if c.clock == nil {
-		c.clock = upstream.SystemClock()
-	}
-	return c
 }
 
 // Get returns the transport for key, creating it if needed.

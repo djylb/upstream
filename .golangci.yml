@@ -37,7 +37,7 @@ linters:
     # are returned as they are, so that callers see the same errors as
     # without it.
     - wrapcheck
-    # Balancer, Picker and Clock are the package's interfaces: constructors
+    # Balancer, Picker and timeshim.Clock are interfaces: constructors
     # and views return them.
     - ireturn
     # Named results document what a function returns and let deferred
@@ -46,7 +46,7 @@ linters:
     # Constants are explained where they are used: hash seeds, bit widths
     # and percentages.
     - mnd
-    # No import rules: the module has no dependencies.
+    # TestDependencies checks the module and package dependencies.
     - depguard
     # Deprecated, replaced by gomodguard_v2.
     - gomodguard

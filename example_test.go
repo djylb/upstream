@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 )
 
@@ -228,7 +230,11 @@ func ExamplePool_Subscribe() {
 func ExampleOutlierDetector() {
 	// Passive health checking for a single connection target, without a
 	// pool.
-	d := upstream.NewOutlierDetector(upstream.OutlierConfig{ConsecutiveFailures: 2}, nil, nil)
+	clock := timeshim.NewFake(time.Unix(0, 0))
+	d := upstream.NewOutlierDetector(upstream.OutlierConfig{
+		ConsecutiveFailures: 2,
+		BaseEjection:        time.Second,
+	}, clock, nil)
 	defer d.Close()
 	dial := func() error {
 		t, ok := d.Admit()
@@ -243,7 +249,11 @@ func ExampleOutlierDetector() {
 		_ = dial()
 	}
 	fmt.Println(d.State(), d.Status().Ejections)
-	// Output: ejected 1
+	clock.Advance(time.Second)
+	fmt.Println(d.State())
+	// Output:
+	// ejected 1
+	// half-open
 }
 
 func ExampleConsistentHash() {

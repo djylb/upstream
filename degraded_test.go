@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/djylb/upstream/internal/fakeclock"
+	"github.com/djylb/timeshim"
 )
 
 // record admits n requests and records o for each.
@@ -27,7 +27,7 @@ func record(t *testing.T, d *OutlierDetector, o Outcome, n int) {
 // resets the consecutive run, and never ejects below MinRequests.
 func TestDegradedCountsInRateOnly(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		d := NewOutlierDetector(OutlierConfig{
 			ConsecutiveFailures: 3,
 			FailurePercent:      50,
@@ -56,7 +56,7 @@ func TestDegradedCountsInRateOnly(t *testing.T) {
 
 func TestDegradedReachesMinRequests(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clk := fakeclock.New()
+		clk := timeshim.NewFake(time.Unix(0, 0))
 		d := NewOutlierDetector(OutlierConfig{
 			ConsecutiveFailures: 1,
 			FailurePercent:      50,

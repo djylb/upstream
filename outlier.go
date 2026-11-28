@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // Causes recorded when an OutlierDetector ejects its backend.
@@ -91,7 +93,7 @@ func (c OutlierConfig) Enabled() bool {
 type outlierParams struct {
 	counts     *window        // private to one detector once installed
 	streak     *atomic.Uint32 // consecutive failures in this reset generation
-	clock      Clock
+	clock      timeshim.Clock
 	epoch      time.Time
 	window     time.Duration
 	base       time.Duration
@@ -107,9 +109,9 @@ type outlierParams struct {
 
 // newOutlierParams normalizes c. epoch is the origin of the failure-rate
 // window. The caller sets seq.
-func newOutlierParams(c OutlierConfig, clock Clock, epoch time.Time) *outlierParams {
+func newOutlierParams(c OutlierConfig, clock timeshim.Clock, epoch time.Time) *outlierParams {
 	p := &outlierParams{
-		clock:    clockOrSystem(clock),
+		clock:    timeshim.Or(clock),
 		window:   c.Window,
 		base:     c.BaseEjection,
 		max:      c.MaxEjection,
@@ -242,12 +244,12 @@ type OutlierDetector struct {
 	guard     *ejectionGuard // the pool's cap on ejections, or nil
 
 	mu     sync.Mutex
-	until  time.Time   // guarded by mu
-	stop   func() bool // ends the pending reopen timer; guarded by mu
-	cause  error       // guarded by mu
-	level  uint        // ejections without recovery; guarded by mu
-	held   bool        // holds one of guard's ejections; guarded by mu
-	closed bool        // guarded by mu
+	until  time.Time      // guarded by mu
+	timer  timeshim.Timer // pending reopen timer; guarded by mu
+	cause  error          // guarded by mu
+	level  uint           // ejections without recovery; guarded by mu
+	held   bool           // holds one of guard's ejections; guarded by mu
+	closed bool           // guarded by mu
 
 	enabled atomic.Bool // params.enabled(); set with params under mu
 }
@@ -277,16 +279,17 @@ func (g *ejectionGuard) acquire(percent int32) bool {
 func (g *ejectionGuard) release() { g.held.Add(-1) }
 
 // NewOutlierDetector returns a detector for one backend that reads time
-// from clock; nil means SystemClock. onChange, if not nil, is called after every state transition, without any lock held, from
-// the goroutine that caused the transition: one calling Record, Reset or
+// from clock. A nil clock uses timeshim.Real. onChange, if set, runs after
+// every state transition without a lock, from the goroutine that caused
+// the transition: one calling Record, Reset or
 // Close, or the detector's timer goroutine. Calls may overlap, so onChange
 // should read State instead of assuming an order.
 //
 // A detector whose configuration is not Enabled admits everything and never
 // ejects.
-func NewOutlierDetector(cfg OutlierConfig, clock Clock, onChange func()) *OutlierDetector {
+func NewOutlierDetector(cfg OutlierConfig, clock timeshim.Clock, onChange func()) *OutlierDetector {
 	d := new(OutlierDetector)
-	clock = clockOrSystem(clock)
+	clock = timeshim.Or(clock)
 	d.init(newOutlierParams(cfg, clock, clock.Now()), onChange, nil)
 	return d
 }
@@ -333,17 +336,17 @@ func (d *OutlierDetector) setParams(p *outlierParams) {
 	p = &params
 	d.params.Store(p)
 	d.enabled.Store(p.enabled())
-	var stop func() bool
+	var timer timeshim.Timer
 	changed := false
 	if !p.enabled() && !d.closed {
 		changed = d.State() != OutlierOK
 		d.gen.Add(1)
 		d.resetLocked()
-		stop, d.stop = d.stop, nil
+		timer, d.timer = d.timer, nil
 	}
 	d.mu.Unlock()
-	if stop != nil {
-		stop()
+	if timer != nil {
+		timer.Stop()
 	}
 	if changed {
 		d.notify()
@@ -523,22 +526,22 @@ func (d *OutlierDetector) eject(p *outlierParams, gen uint32, cause error, rule 
 	d.until = now.Add(wait)
 	d.ejections.Add(1)
 	d.state.Store(uint32(OutlierEjected))
-	old := d.stop
-	d.stop = nil
+	old := d.timer
+	d.timer = nil
 	d.mu.Unlock()
 	if old != nil {
-		old()
+		old.Stop()
 	}
 
 	// The clock is called without the lock; the generation check below
 	// handles a timer that fires, or a Close that runs, in between.
-	stop := p.clock.AfterFunc(wait, func() { d.reopen(ejectGen) })
+	timer := p.clock.AfterFunc(wait, func() { d.reopen(ejectGen) })
 	d.mu.Lock()
 	if d.closed || d.gen.Load() != ejectGen {
 		d.mu.Unlock()
-		stop()
+		timer.Stop()
 	} else {
-		d.stop = stop
+		d.timer = timer
 		d.mu.Unlock()
 	}
 	d.notify()
@@ -551,7 +554,7 @@ func (d *OutlierDetector) reopen(gen uint32) {
 		return
 	}
 	d.gen.Add(1)
-	d.stop = nil
+	d.timer = nil
 	d.until = time.Time{}
 	d.state.Store(uint32(OutlierHalfOpen))
 	d.mu.Unlock()
@@ -603,11 +606,11 @@ func (d *OutlierDetector) Reset() {
 	changed := OutlierState(d.state.Load()) != OutlierOK
 	d.gen.Add(1)
 	d.resetLocked()
-	stop := d.stop
-	d.stop = nil
+	timer := d.timer
+	d.timer = nil
 	d.mu.Unlock()
-	if stop != nil {
-		stop()
+	if timer != nil {
+		timer.Stop()
 	}
 	if changed {
 		d.notify()
@@ -621,11 +624,11 @@ func (d *OutlierDetector) Close() {
 	d.mu.Lock()
 	d.closed = true
 	d.releaseGuardLocked()
-	stop := d.stop
-	d.stop = nil
+	timer := d.timer
+	d.timer = nil
 	d.mu.Unlock()
-	if stop != nil {
-		stop()
+	if timer != nil {
+		timer.Stop()
 	}
 }
 

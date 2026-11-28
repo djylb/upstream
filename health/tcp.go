@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/djylb/upstream"
 	"github.com/djylb/upstream/internal/dialresult"
 )
@@ -28,10 +29,10 @@ type TCPOptions struct {
 	// connection.
 	Reset bool
 
-	// Clock measures Latency. Nil means upstream.SystemClock. A Checker
+	// Clock measures Latency. Nil means timeshim.Real. A Checker
 	// passes its own Clock to the TCP check it uses for targets without a
 	// Probe, replacing this field.
-	Clock upstream.Clock
+	Clock timeshim.Clock
 }
 
 // TCP returns the TCP check: it connects to the target's address and
@@ -44,10 +45,7 @@ type TCPOptions struct {
 // addresses, they are tried as net.Dialer does, and the Observation names
 // the one that answered.
 func TCP(o TCPOptions) Probe {
-	clock := o.Clock
-	if clock == nil {
-		clock = upstream.SystemClock()
-	}
+	clock := timeshim.Or(o.Clock)
 	return func(ctx context.Context, t Target) (Observation, error) {
 		if t.Address == "" {
 			return Observation{}, upstream.ErrNoAddress
